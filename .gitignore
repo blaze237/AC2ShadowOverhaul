@@ -1,0 +1,23 @@
+# Game executable and third-party / reference material
+/AssassinsCreedIIGame.exe
+/OldAttempt/
+/EaglePatchPlus-master/
+
+# Generated disassembly, toolchain, downloaded sources, scratch builds
+/re/*.asm
+/re/tools/
+/re/reshade/
+/re/build/
+/re/orig/
+__pycache__/
+
+# Build outputs, binaries and runtime output
+/AC2Graphics/dist/
+*.exe
+*.dll
+*.asi
+*.addon32
+*.obj
+*.log
+*.png
+AC2Graphics_FrameDump_*.txt
