@@ -21,6 +21,7 @@ const char* IniPath();
 const char* ModuleDir();           // directory of the .asi, with trailing backslash
 float IniFloat(const char* section, const char* key, float def);
 int IniInt(const char* section, const char* key, int def); // accepts decimal or 0x hex
+bool IniWrite(const char* section, const char* key, const char* value); // keeps comments and other keys
 
 // ---- Patching --------------------------------------------------------------------------------
 enum { PATCH_CALL = 0xE8, PATCH_JUMP = 0xE9 };
@@ -51,6 +52,7 @@ float Shadows_GetSetting(int which);
 void Shadows_SetSetting(int which, float value);
 // Debug menu (number keys select a setting, arrows change it, drawn top right).
 bool Tuning_Init();
+void Tuning_Flush(); // writes unsaved debug menu changes to the ini
 bool Tuning_Enabled();
 struct IDirect3DDevice9;
 void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned backBufferWidth, unsigned backBufferHeight);

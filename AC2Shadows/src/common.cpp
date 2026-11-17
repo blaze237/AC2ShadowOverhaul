@@ -111,6 +111,11 @@ int IniInt(const char* section, const char* key, int def)
 	return (end == buf) ? def : (int)v;
 }
 
+bool IniWrite(const char* section, const char* key, const char* value)
+{
+	return WritePrivateProfileStringA(section, key, value, g_iniPath) != 0;
+}
+
 // ---- Patching --------------------------------------------------------------------------------
 
 bool WriteMemory(uintptr_t address, const void* data, size_t size)

@@ -17,7 +17,7 @@ Key features
   shadow distances crashed it. The lists are enlarged, and anything that still doesn't fit is
   skipped instead of corrupting memory.
 - Live tuning: an optional in-game menu (top right) changes every setting on the fly. Number
-  keys select a setting and the arrow keys change it.
+  keys select a setting and the arrow keys change it; changes are saved to the ini.
 - Before/after hotkeys: F7 switches the distance tweaks between your settings and vanilla; F6
   switches soft shadows on and off.
 - Safe by design: every patch is found by byte signature and is skipped if the exe doesn't

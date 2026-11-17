@@ -2,9 +2,9 @@
 //
 // When [DebugMenu] Enabled=1, a list of settings is drawn in the top-right corner of the screen.
 // Number keys 1..7 select a setting (drawn in red), Up/Down change it: scales by 0.5, whole-number
-// settings by 1, on/off settings switch. Holding an arrow repeats. Every change is written to
-// AC2Shadows.log so the values can be copied into the ini. The menu key hides/shows the menu
-// (and stops it from reacting to keys while hidden).
+// settings by 1, on/off settings switch. Holding an arrow repeats. Changes are saved to the ini a
+// second after the last key press (and at exit), unless [DebugMenu] SaveChanges=0, and logged.
+// The menu key hides/shows the menu (and stops it from reacting to keys while hidden).
 //
 // Text is drawn with ID3DXFont from the d3dx9_42.dll the game already loads, just before Present.
 
@@ -72,10 +72,58 @@ static const char* const kNames[ITEM_COUNT] = {
 	"Shadow distance", "Cascade splits", "Caster distance", "Detail draw distance", "Soft shadow width", "Soft shadows",
 	"Shadow tweaks (F7)",
 };
-static const char* const kIniKeys[ITEM_COUNT] = {
-	"[Shadows] ShadowDistanceScale", "[Shadows] ShadowCascadeSplitScale", "[Shadows] ShadowCasterDistanceScale",
-	"[Shadows] DetailDrawDistanceScale", "[SoftShadows] FilterWidth", "[SoftShadows] StartEnabled", "[Shadows] StartEnabled",
+static const char* const kIniSections[ITEM_COUNT] = {
+	"Shadows", "Shadows", "Shadows", "Shadows", "SoftShadows", "SoftShadows", "Shadows",
 };
+static const char* const kIniKeys[ITEM_COUNT] = {
+	"ShadowDistanceScale", "ShadowCascadeSplitScale", "ShadowCasterDistanceScale", "DetailDrawDistanceScale", "FilterWidth",
+	"StartEnabled", "StartEnabled",
+};
+
+// Saving: changes are written to the ini a second after the last key press, so holding an arrow
+// doesn't rewrite the file on every repeat.
+static bool g_save = true;
+static unsigned g_dirty; // bit per item
+static DWORD g_lastChange;
+
+static void IniValue(int item, char* buf, size_t n)
+{
+	switch (item)
+	{
+	case ITEM_DISTANCE:
+	case ITEM_SPLIT:
+	case ITEM_CASTER:
+	case ITEM_DRAW:
+		snprintf(buf, n, "%.1f", Shadows_GetSetting(item));
+		break;
+	case ITEM_SOFT_WIDTH:
+		snprintf(buf, n, "%d", SoftShadows_LiveWidth());
+		break;
+	case ITEM_SOFT_ON:
+		snprintf(buf, n, "%d", SoftShadows_Active() ? 1 : 0);
+		break;
+	default:
+		snprintf(buf, n, "%d", Shadows_TweaksOn() ? 1 : 0);
+		break;
+	}
+}
+
+static void SaveDirty()
+{
+	for (int i = 0; i < ITEM_COUNT; i++)
+	{
+		if (!(g_dirty & (1u << i)))
+			continue;
+		char v[32];
+		IniValue(i, v, sizeof(v));
+		if (IniWrite(kIniSections[i], kIniKeys[i], v))
+			LogInfo("Tuning: saved [%s] %s=%s", kIniSections[i], kIniKeys[i], v);
+		else
+			LogWarn("Tuning: could not write [%s] %s=%s to %s (error %lu)", kIniSections[i], kIniKeys[i], v, IniPath(),
+				GetLastError());
+	}
+	g_dirty = 0;
+}
 
 static void FormatValue(int item, char* buf, size_t n)
 {
@@ -139,7 +187,12 @@ static void Change(int item, int dir)
 	}
 	char value[48];
 	FormatValue(item, value, sizeof(value));
-	LogInfo("Tuning: %s = %s   (ini: %s)", kNames[item], value, kIniKeys[item]);
+	LogInfo("Tuning: %s = %s   (ini: [%s] %s)", kNames[item], value, kIniSections[item], kIniKeys[item]);
+	if (g_save)
+	{
+		g_dirty |= 1u << item;
+		g_lastChange = GetTickCount();
+	}
 }
 
 // ---- Input -------------------------------------------------------------------------------------
@@ -152,6 +205,8 @@ static void PollInput()
 	static bool numWas[ITEM_COUNT] = {};
 	static int heldDir = 0;
 	static DWORD heldSince = 0, lastRepeat = 0;
+	if (g_dirty && GetTickCount() - g_lastChange > 1000)
+		SaveDirty();
 	if (!GameHasFocus())
 	{
 		heldDir = 0;
@@ -298,6 +353,12 @@ void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight
 
 bool Tuning_Enabled() { return g_enabled; }
 
+void Tuning_Flush()
+{
+	if (g_dirty)
+		SaveDirty();
+}
+
 bool Tuning_Init()
 {
 	g_enabled = IniInt("DebugMenu", "Enabled", 0) != 0;
@@ -305,7 +366,9 @@ bool Tuning_Init()
 		return false;
 	g_menuKey = IniInt("DebugMenu", "ToggleKey", VK_F9);
 	g_visible = IniInt("DebugMenu", "StartVisible", 1) != 0;
+	g_save = IniInt("DebugMenu", "SaveChanges", 1) != 0;
 	SoftShadows_SetBuildAllWidths(true);
-	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-7 select, Up/Down change).", g_menuKey);
+	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-7 select, Up/Down change; changes %s).", g_menuKey,
+		g_save ? "saved to the ini" : "not saved");
 	return true;
 }

@@ -230,6 +230,19 @@ int main()
 		printf("debug menu width 3 again: device has the game's shader: %s\n", cur == gp ? "yes" : "NO");
 		press('1');
 		press(VK_UP);
+
+		// Saving: width 3 -> 2, then the ini is written a second after the last key press.
+		char ini[MAX_PATH];
+		GetFullPathNameA("scripts\\AC2Shadows.ini", MAX_PATH, ini, nullptr);
+		press('5');
+		press(VK_DOWN);
+		int before = GetPrivateProfileIntA("SoftShadows", "FilterWidth", -1, ini);
+		Sleep(1200);
+		dev->Present(NULL, NULL, NULL, NULL);
+		int after = GetPrivateProfileIntA("SoftShadows", "FilterWidth", -1, ini);
+		printf("debug menu save: FilterWidth %d right after the key, %d a second later: %s\n", before, after,
+			before == 3 && after == 2 ? "yes" : "NO");
+		WritePrivateProfileStringA("SoftShadows", "FilterWidth", "3", ini); // leave the test ini as it was
 	}
 	autoDs->Release();
 	hr = dev->Reset(&pp);

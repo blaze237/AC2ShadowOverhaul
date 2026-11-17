@@ -8,7 +8,10 @@
 BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 {
 	if (reason == DLL_PROCESS_DETACH)
+	{
+		Tuning_Flush();
 		CrashLog_Detach(reserved != NULL);
+	}
 	if (reason != DLL_PROCESS_ATTACH)
 		return TRUE;
 	DisableThreadLibraryCalls(self);
