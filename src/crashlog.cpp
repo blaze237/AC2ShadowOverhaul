@@ -1,5 +1,5 @@
 // Crash logger: writes the faulting address, registers, likely call stack and the state of the
-// 32-bit address space to AC2Shadows.log when the game crashes, so a crash report can be
+// 32-bit address space to AC2ShadowOverhaul.log when the game crashes, so a crash report can be
 // traced back to game code (addresses are printed as game VAs, i.e. relative to 0x400000).
 #include "common.h"
 #include <stdio.h>
@@ -209,7 +209,7 @@ template <typename T> static void HookImport(const char* dll, const char* func, 
 
 void CrashLog_Detach(bool processExit)
 {
-	LogInfo("AC2Shadows unloading (%s).", processExit ? "process exit" : "FreeLibrary");
+	LogInfo("AC2ShadowOverhaul unloading (%s).", processExit ? "process exit" : "FreeLibrary");
 	LogMemoryState("exit");
 }
 

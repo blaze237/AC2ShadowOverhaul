@@ -1,18 +1,5 @@
-# Game executable and third-party / reference material
-/AssassinsCreedIIGame.exe
-/OldAttempt/
-/EaglePatchPlus-master/
-
-# Generated disassembly, toolchain, downloaded sources, scratch builds
-/re/*.asm
-/re/tools/
-/re/reshade/
-/re/build/
-/re/orig/
-__pycache__/
-
-# Build outputs, binaries and runtime output
-/AC2Shadows/dist/
+# Build outputs and runtime output
+/dist/
 *.exe
 *.dll
 *.asi
@@ -20,6 +7,20 @@ __pycache__/
 *.obj
 *.log
 *.png
-AC2Shadows_FrameDump_*.txt
-AC2Shadows_FrameDump_*_shaders/
+AC2ShadowOverhaul_FrameDump_*
+AC2Shadows_FrameDump_*
 softshadow_*_w*.txt
+__pycache__/
+
+# Local-only material: the game itself, disassembly and data extracted from it, toolchains,
+# downloaded sources, scratch builds. None of this belongs in the repo.
+/AssassinsCreedIIGame.exe
+/AC2Shadows/
+/OldAttempt/
+/EaglePatchPlus-master/
+/re/*.asm
+/re/shaders/
+/re/tools/
+/re/reshade/
+/re/build/
+/re/orig/

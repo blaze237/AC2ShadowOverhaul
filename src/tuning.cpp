@@ -315,7 +315,7 @@ void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight
 		int right = (int)bbWidth - (int)g_fontHeight;
 		int y = (int)g_fontHeight / 2;
 		int step = (int)(g_fontHeight * 1.25f);
-		DrawLine(y, right, "AC2Shadows tuning  (1-6 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
+		DrawLine(y, right, "AC2 Shadow Overhaul  (1-6 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
 		y += step;
 		for (int i = 0; i < ITEM_COUNT; i++)
 		{

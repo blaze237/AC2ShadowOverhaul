@@ -1,5 +1,5 @@
 // End-to-end test for the frame dump: built as AssassinsCreedIIGame.exe, statically imports
-// d3d9!Direct3DCreate9 like the game, loads AC2Shadows.asi, renders a few frames with extra
+// d3d9!Direct3DCreate9 like the game, loads AC2ShadowOverhaul.asi, renders a few frames with extra
 // render targets / depth buffers, and taps the hotkey (F8) via SendInput.
 #include <windows.h>
 #include <d3d9.h>
@@ -64,7 +64,7 @@ static void Tap(WORD, bool down)
 
 int main()
 {
-	HMODULE asi = LoadLibraryA("scripts\\AC2Shadows.asi");
+	HMODULE asi = LoadLibraryA("scripts\\AC2ShadowOverhaul.asi");
 	printf("asi %p\n", (void*)asi);
 	if (!asi)
 		return 1;
@@ -179,12 +179,18 @@ int main()
 	depth2->Release();
 	bb->Release();
 	// Soft shadows: a real game shader goes through the hooked CreatePixelShader.
+	do
 	{
-		FILE* f = fopen("../../shaders/AC2Shadows_FrameDump_20261117_000314_shaders/81DFCBE3.cso", "rb");
+		FILE* f = fopen("../../re/shaders/dump/81DFCBE3.cso", "rb");
 		std::vector<DWORD> game(4096, 0);
 		size_t bytes = f ? fread(game.data(), 1, game.size() * 4, f) : 0;
 		if (f)
 			fclose(f);
+		if (!bytes)
+		{
+			printf("soft shadows: skipped (put an exported shadow shader at re/shaders/dump/81DFCBE3.cso)\n");
+			break;
+		}
 		IDirect3DPixelShader9 *gp = nullptr, *cur = nullptr;
 		dev->CreatePixelShader(game.data(), &gp);
 		UINT got = 0;
@@ -233,7 +239,7 @@ int main()
 
 		// Saving: width 3 -> 2, then the ini is written a second after the last key press.
 		char ini[MAX_PATH];
-		GetFullPathNameA("scripts\\AC2Shadows.ini", MAX_PATH, ini, nullptr);
+		GetFullPathNameA("scripts\\AC2ShadowOverhaul.ini", MAX_PATH, ini, nullptr);
 		press('5');
 		press(VK_SUBTRACT);
 		int before = GetPrivateProfileIntA("SoftShadows", "FilterWidth", -1, ini);
@@ -243,7 +249,7 @@ int main()
 		printf("debug menu save: FilterWidth %d right after the key, %d a second later: %s\n", before, after,
 			before == 3 && after == 2 ? "yes" : "NO");
 		WritePrivateProfileStringA("SoftShadows", "FilterWidth", "3", ini); // leave the test ini as it was
-	}
+	} while (0);
 	autoDs->Release();
 	hr = dev->Reset(&pp);
 	printf("Reset 0x%08lX\n", hr);

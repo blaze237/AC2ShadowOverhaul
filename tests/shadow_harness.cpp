@@ -1,8 +1,8 @@
 // Offline test: maps the real AssassinsCreedIIGame.exe (UPlay) into this 32-bit process without
 // running it, installs the shadow hooks via the real signature scanner, and calls the game's own
 // cascade builder / visibility-distance setter with synthetic inputs, patched vs. unpatched.
-#include "../../AC2Shadows/src/common.cpp"
-#include "../../AC2Shadows/src/shadows.cpp"
+#include "../src/common.cpp"
+#include "../src/shadows.cpp"
 #include <stdio.h>
 #include <string.h>
 #include <malloc.h>
