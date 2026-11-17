@@ -35,7 +35,25 @@ blocky, and past a point the game crashes. AC2 Shadow Overhaul fixes all three.
    `scripts` folder.
 3. If you used this mod under an older name (`AC2Graphics` or `AC2Shadows`), delete the old `.asi`
    and `.ini`. The new one stays inactive while an old copy is present, and says so in its log.
-4. It works alongside EaglePatch+ but doesn't depend on it.
+4. It works alongside EaglePatch+ but doesn't depend on it. EaglePatch+ is strongly recommended
+   for the shadow resolution boost below.
+
+## Recommended: raise the shadow resolution with EaglePatch+
+
+Stretching the shadows over a longer distance spreads the same shadow map over a larger area, so
+they get blurrier and blockier. The vanilla shadow map is only 1024x1024, which isn't enough for
+the larger distances. EaglePatch+ can raise it to 4096x4096, which is 4x the detail in each
+direction and makes the longer distances look right.
+
+In EaglePatch+'s ini (`EaglePatchAC2.ini`), set:
+
+```
+ImproveShadowMapResolution=1
+```
+
+This mod doesn't change the shadow map size itself; it leaves that to EaglePatch+ so the two don't
+fight over the same setting. Without it, the shipped **High** preset still works, but shadows look
+softer and blurrier.
 
 ## Presets
 
@@ -50,8 +68,8 @@ Copy a row's values into `AC2ShadowOverhaul.ini`. The shipped values are **High*
 Distance = `ShadowDistanceScale`, Splits = `ShadowCascadeSplitScale`, Casters =
 `ShadowCasterDistanceScale`, Detail = `DetailDrawDistanceScale`, Width = `[SoftShadows] FilterWidth`.
 
-- Set `ImproveShadowMapResolution=1` in EaglePatch+'s ini. It gives the shadow map 4x the
-  resolution, which the larger distances need to stay sharp.
+- Use EaglePatch+'s `ImproveShadowMapResolution=1` (see above) with all of these presets, so the
+  larger distances stay sharp.
 - If the log shows "Render lists full", some distant shadows are being skipped; lower Casters/Detail
   a little.
 
