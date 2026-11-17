@@ -92,8 +92,16 @@ static MockSurface* NewSurface(UINT w, UINT h, D3DFORMAT f, DWORD usage, D3DMULT
 
 struct MockPS : Gen_IDirect3DPixelShader9
 {
+	std::vector<DWORD> code;
 	STDMETHOD_(ULONG, AddRef)() override { return 1; }
 	STDMETHOD_(ULONG, Release)() override { return 0; }
+	STDMETHOD(GetFunction)(void* data, UINT* size) override
+	{
+		*size = (UINT)(code.size() * 4);
+		if (data)
+			memcpy(data, code.data(), code.size() * 4);
+		return S_OK;
+	}
 };
 
 struct MockDevice : Gen_IDirect3DDevice9
@@ -176,9 +184,27 @@ struct MockDevice : Gen_IDirect3DDevice9
 		*v = st == D3DRS_COLORWRITEENABLE ? 0xF : 1;
 		return S_OK;
 	}
-	STDMETHOD(CreatePixelShader)(const DWORD*, IDirect3DPixelShader9** out) override
+	IDirect3DPixelShader9* curPs = nullptr;
+	STDMETHOD(SetPixelShader)(IDirect3DPixelShader9* ps) override
 	{
-		*out = new MockPS;
+		curPs = ps;
+		return S_OK;
+	}
+	STDMETHOD(GetPixelShader)(IDirect3DPixelShader9** ps) override
+	{
+		*ps = curPs;
+		return S_OK;
+	}
+	STDMETHOD(CreatePixelShader)(const DWORD* code, IDirect3DPixelShader9** out) override
+	{
+		auto ps = new MockPS;
+		for (size_t i = 0; code; i++)
+		{
+			ps->code.push_back(code[i]);
+			if (code[i] == 0x0000FFFF)
+				break;
+		}
+		*out = ps;
 		return S_OK;
 	}
 };

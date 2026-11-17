@@ -42,7 +42,7 @@ bool GameHasFocus();
 
 // ---- Features --------------------------------------------------------------------------------
 void Shadows_Init(HMODULE patternModule);
-void FrameDump_Init();
+void FrameDump_Init(bool deviceHooksNeeded);
 void CrashLog_Init();
 void CrashLog_Detach(bool processExit);
 void LogMemoryState(const char* when);

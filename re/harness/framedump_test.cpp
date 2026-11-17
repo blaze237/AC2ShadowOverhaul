@@ -4,14 +4,16 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
+#include <vector>
 #include <string.h>
 #include <stdint.h>
 
 // No interactive desktop here, so fake the hotkey by replacing the asi's GetAsyncKeyState import.
 static bool g_keyDown = false;
+static volatile bool g_f6Down = false;
 static SHORT WINAPI FakeGetAsyncKeyState(int vk)
 {
-	return (vk == VK_F8 && g_keyDown) ? (SHORT)0x8000 : 0;
+	return ((vk == VK_F8 && g_keyDown) || (vk == VK_F6 && g_f6Down)) ? (SHORT)0x8000 : 0;
 }
 
 static bool PatchAsiImport(HMODULE mod, const char* func, void* repl)
@@ -98,6 +100,29 @@ int main()
 	IDirect3DPixelShader9* ps = nullptr;
 	dev->CreatePixelShader(psCode, &ps);
 
+	// A shadow atlas (4 cascades wide) and a real ps_3_0 shader sampling it at s15.
+	IDirect3DTexture9* atlas = nullptr;
+	dev->CreateTexture(1024, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &atlas, NULL);
+	IDirect3DPixelShader9* shadowPs = nullptr;
+	{
+		typedef HRESULT(WINAPI * PFN_Compile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT,
+			void**, void**);
+		struct Blob { struct { void* q; void* a; ULONG(__stdcall* Release)(void*); void*(__stdcall* Ptr)(void*); SIZE_T(__stdcall* Size)(void*); }* vt; };
+		HMODULE c = LoadLibraryA("D3DCompiler_43.dll");
+		auto compile = c ? (PFN_Compile)GetProcAddress(c, "D3DCompile") : nullptr;
+		const char* src =
+			"sampler2D g_ShadowMap : register(s15);\n"
+			"float4 g_ShadowCascadesRangesMax : register(c40);\n"
+			"float4 main(float4 uv : TEXCOORD0) : COLOR {\n"
+			"  float d = tex2D(g_ShadowMap, uv.xy).r;\n"
+			"  float lit = uv.z <= d ? 1.0 : 0.3;\n"
+			"  return float4(lit * g_ShadowCascadesRangesMax.xyz, 1); }\n";
+		Blob* code = nullptr;
+		if (compile && SUCCEEDED(compile(src, strlen(src), "test", nullptr, nullptr, "main", "ps_3_0", 0, 0, (void**)&code, nullptr)))
+			dev->CreatePixelShader((const DWORD*)code->vt->Ptr(code), &shadowPs);
+		printf("shadow test shader compiled: %s\n", shadowPs ? "yes" : "NO");
+	}
+
 	for (int frame = 0; frame < 6; frame++)
 	{
 		if (frame == 1)
@@ -120,10 +145,16 @@ int main()
 		dev->SetTexture(0, scene);
 		dev->SetTexture(1, depthTex);
 		dev->SetTexture(8, linDepth);
+		dev->SetTexture(15, atlas);
 		dev->SetPixelShader(ps);
 		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
 		dev->SetTexture(0, NULL);
 		dev->SetTexture(1, NULL);
+		dev->SetTexture(15, atlas);
+		dev->SetPixelShader(shadowPs);
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+		dev->SetTexture(15, NULL);
 		dev->SetPixelShader(NULL);
 		dev->StretchRect(sceneSurf, NULL, bb, NULL, D3DTEXF_LINEAR);
 		dev->EndScene();
@@ -136,6 +167,32 @@ int main()
 	depthTex->Release();
 	depth2->Release();
 	bb->Release();
+	// Soft shadows: a real game shader goes through the hooked CreatePixelShader.
+	{
+		FILE* f = fopen("../../shaders/AC2Graphics_FrameDump_20261117_000314_shaders/81DFCBE3.cso", "rb");
+		std::vector<DWORD> game(4096, 0);
+		size_t bytes = f ? fread(game.data(), 1, game.size() * 4, f) : 0;
+		if (f)
+			fclose(f);
+		IDirect3DPixelShader9 *gp = nullptr, *cur = nullptr;
+		dev->CreatePixelShader(game.data(), &gp);
+		UINT got = 0;
+		gp->GetFunction(nullptr, &got);
+		printf("soft shadows: game shader %u bytes, driver received %u bytes (%s)\n", (unsigned)bytes, got, got > bytes ? "rewritten" : "NOT rewritten");
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		printf("soft shadows on : device has the shader the game set: %s\n", cur == gp ? "yes" : "NO");
+		g_f6Down = true;
+		Sleep(150);
+		g_f6Down = false;
+		Sleep(100);
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		UINT curSize = 0;
+		if (cur)
+			cur->GetFunction(nullptr, &curSize);
+		printf("soft shadows off: device has the original (%u bytes): %s\n", curSize, cur != gp && curSize == bytes ? "yes" : "NO");
+	}
 	autoDs->Release();
 	hr = dev->Reset(&pp);
 	printf("Reset 0x%08lX\n", hr);

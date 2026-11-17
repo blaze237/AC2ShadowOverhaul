@@ -1,6 +1,7 @@
 // AC2Graphics.asi - graphics tweaks for Assassin's Creed II (loaded by Ultimate ASI Loader).
 // Works alongside EaglePatch+; does not depend on it.
 #include "common.h"
+#include "softshadows.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -30,6 +31,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 
 	CrashLog_Init();
 	Shadows_Init(NULL);
-	FrameDump_Init();
+	bool soft = SoftShadows_Init();
+	FrameDump_Init(soft);
 	return TRUE;
 }

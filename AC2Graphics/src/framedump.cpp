@@ -8,6 +8,7 @@
 // calls exactly as the game makes them, and the return addresses point into the game exe.
 
 #include "common.h"
+#include "softshadows.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -259,6 +260,11 @@ static std::string SurfName(IDirect3DSurface9* s, bool full)
 // ---- Shader hashes -----------------------------------------------------------------------------
 
 static std::unordered_map<void*, uint32_t> g_psHash;
+// Soft shadows: shader handed to the game (rewritten) -> the game's original shader, used when
+// soft shadows are toggled off and for exporting the original bytecode.
+static std::unordered_map<void*, IDirect3DPixelShader9*> g_softOriginal;
+static volatile bool g_softAny = false;
+static LONG g_softRewritten = 0, g_softSkipped = 0, g_softFailed = 0;
 
 static uint32_t HashShader(const DWORD* code)
 {
@@ -314,6 +320,20 @@ struct Segment
 	std::vector<void*> ps;
 	std::vector<std::pair<void*, int>> reads; // RT texture, stage
 } g_seg;
+
+// Pixel shaders that sample the sun shadow atlas this capture, with the sampler stage and draw count.
+struct ShadowPs
+{
+	void* ps;
+	int stage, draws;
+};
+static std::vector<ShadowPs> g_shadowPs;
+
+// The sun shadow atlas: a render-target texture four cascades wide (e.g. 16384x4096 R32F).
+static bool IsShadowAtlas(const Res& r)
+{
+	return r.isTexture && r.h >= 256 && r.w == 4 * r.h;
+}
 
 static void Out(const char* fmt, ...)
 {
@@ -416,6 +436,14 @@ static void OnDraw(IDirect3DDevice9* dev, UINT prims)
 		std::pair<void*, int> key(g_tex[i], i);
 		if (std::find(g_seg.reads.begin(), g_seg.reads.end(), key) == g_seg.reads.end())
 			g_seg.reads.push_back(key);
+		if (g_ps && i < 16 && IsShadowAtlas(it->second))
+		{
+			auto sp = std::find_if(g_shadowPs.begin(), g_shadowPs.end(), [&](const ShadowPs& x) { return x.ps == g_ps && x.stage == i; });
+			if (sp == g_shadowPs.end())
+				g_shadowPs.push_back({ g_ps, i, 1 });
+			else
+				sp->draws++;
+		}
 	}
 }
 
@@ -429,6 +457,7 @@ static void BeginCapture()
 	g_event = 0;
 	g_seg = Segment();
 	g_capTex.clear();
+	g_shadowPs.clear();
 	g_framesLeft = g_framesToCapture;
 
 	SYSTEMTIME t;
@@ -635,6 +664,176 @@ static std::string ReadbackFloatTarget(IDirect3DDevice9* dev, IDirect3DTexture9*
 	return result;
 }
 
+// ---- Shadow shader export ----------------------------------------------------------------------
+// Writes every pixel shader that sampled the shadow atlas: raw bytecode as <hash>.cso (for offline
+// work) and a D3DX disassembly into one text file. D3DX comes from the d3dx9_42.dll the game
+// already loads; only the one function and ID3DXBuffer's vtable are declared here.
+
+struct D3DXBufferVtbl
+{
+	void* qi;
+	void* addRef;
+	ULONG(__stdcall* Release)(void*);
+	void*(__stdcall* GetBufferPointer)(void*);
+	DWORD(__stdcall* GetBufferSize)(void*);
+};
+struct D3DXBuffer
+{
+	D3DXBufferVtbl* vt;
+};
+typedef HRESULT(WINAPI* PFN_D3DXDisassembleShader)(const DWORD*, BOOL, LPCSTR, D3DXBuffer**);
+
+typedef HRESULT(WINAPI* PFN_D3DDisassemble)(const void*, SIZE_T, UINT, LPCSTR, D3DXBuffer**); // ID3DBlob = same vtable
+
+static std::string DisassembleShader(const DWORD* code, UINT size)
+{
+	// The game's d3dx9_42.dll first; D3DCompiler (also handles SM3 bytecode) as a fallback.
+	static PFN_D3DXDisassembleShader d3dx = nullptr;
+	static PFN_D3DDisassemble compiler = nullptr;
+	static bool looked = false;
+	if (!looked)
+	{
+		looked = true;
+		for (const char* d : { "d3dx9_42.dll", "d3dx9_43.dll" })
+		{
+			HMODULE m = GetModuleHandleA(d);
+			if (!m)
+				m = LoadLibraryA(d);
+			if (m && (d3dx = (PFN_D3DXDisassembleShader)GetProcAddress(m, "D3DXDisassembleShader")) != nullptr)
+				break;
+		}
+		if (!d3dx)
+			for (const char* d : { "D3DCompiler_43.dll", "D3DCompiler_47.dll" })
+			{
+				HMODULE m = LoadLibraryA(d);
+				if (m && (compiler = (PFN_D3DDisassemble)GetProcAddress(m, "D3DDisassemble")) != nullptr)
+					break;
+			}
+	}
+	D3DXBuffer* buf = nullptr;
+	HRESULT hr = E_FAIL;
+	if (d3dx)
+		hr = d3dx(code, FALSE, nullptr, &buf);
+	else if (compiler)
+		hr = compiler(code, size, 0, nullptr, &buf);
+	else
+		return "(no shader disassembler available)\n";
+	if (FAILED(hr) || !buf)
+		return "(disassembly failed)\n";
+	std::string text((const char*)buf->vt->GetBufferPointer(buf), buf->vt->GetBufferSize(buf));
+	buf->vt->Release(buf);
+	while (!text.empty() && text.back() == '\0')
+		text.pop_back();
+	return text;
+}
+
+// True if SM2/SM3 bytecode declares sampler register `stage` (a "dcl_* sN" instruction). The game
+// leaves the atlas bound for the whole frame, so being bound doesn't mean a shader samples it.
+static bool ShaderDeclaresSampler(const DWORD* code, size_t count, int stage)
+{
+	if (count < 2 || (code[0] & 0xFFFF0000) != 0xFFFF0000 || ((code[0] >> 8) & 0xFF) < 2)
+		return false;
+	for (size_t i = 1; i < count;)
+	{
+		DWORD tok = code[i];
+		if (tok == 0x0000FFFF) // end
+			break;
+		if ((tok & 0xFFFF) == 0xFFFE) // comment: length in bits 16..30
+		{
+			i += 1 + ((tok >> 16) & 0x7FFF);
+			continue;
+		}
+		size_t len = (tok >> 24) & 0xF; // SM2+: instruction length in tokens
+		if ((tok & 0xFFFF) == 0x1F && len >= 2 && i + 2 < count) // dcl usage, dest
+		{
+			DWORD dst = code[i + 2];
+			int type = (int)(((dst >> 28) & 7) | ((dst >> 8) & 0x18));
+			if (type == 10 /* D3DSPR_SAMPLER */ && (int)(dst & 0x7FF) == stage)
+				return true;
+		}
+		i += 1 + len;
+	}
+	return false;
+}
+
+static void ExportShadowShaders(const char* base)
+{
+	std::vector<ShadowPs> list;
+	{
+		Lock l;
+		list = g_shadowPs;
+	}
+	std::sort(list.begin(), list.end(), [](const ShadowPs& a, const ShadowPs& b) { return a.draws > b.draws; });
+
+	struct Found
+	{
+		ShadowPs sp;
+		std::vector<DWORD> code;
+		UINT size;
+		uint32_t hash;
+	};
+	std::vector<Found> found;
+	for (const ShadowPs& sp : list)
+	{
+		auto ps = (IDirect3DPixelShader9*)sp.ps;
+		{
+			Lock l;
+			auto it = g_softOriginal.find(sp.ps);
+			if (it != g_softOriginal.end())
+				ps = it->second; // export the game's original, not our rewrite
+		}
+		UINT size = 0;
+		if (FAILED(ps->GetFunction(nullptr, &size)) || !size || size > (1u << 20))
+			continue;
+		std::vector<DWORD> code((size + 3) / 4);
+		if (FAILED(ps->GetFunction(code.data(), &size)) || !ShaderDeclaresSampler(code.data(), code.size(), sp.stage))
+			continue;
+		uint32_t h = HashShader(code.data());
+		found.push_back({ sp, std::move(code), size, h });
+	}
+	Out("");
+	Out("Pixel shaders sampling the shadow atlas: %d of %d drawn with it bound (disassembly in %s_shaders.txt)", (int)found.size(),
+		(int)list.size(), strrchr(base, '\\') ? strrchr(base, '\\') + 1 : base);
+	if (found.empty())
+		return;
+
+	char dir[MAX_PATH];
+	snprintf(dir, sizeof(dir), "%s_shaders", base);
+	CreateDirectoryA(dir, nullptr);
+	std::string text;
+	int written = 0;
+	for (Found& fd : found)
+	{
+		const ShadowPs& sp = fd.sp;
+		std::vector<DWORD>& code = fd.code;
+		UINT size = fd.size;
+		uint32_t h = fd.hash;
+		Out("  PS %08X  atlas at s%d  %d draws  %u bytes", h, sp.stage, sp.draws, size);
+
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s\\%08X.cso", dir, h);
+		if (FILE* f = fopen(path, "wb"))
+		{
+			fwrite(code.data(), 1, size, f);
+			fclose(f);
+		}
+		char head[160];
+		snprintf(head, sizeof(head), "==== PS %08X | shadow atlas at s%d | %d draws | %u bytes ====\n", h, sp.stage, sp.draws, size);
+		text += head;
+		text += DisassembleShader(code.data(), size);
+		text += "\n\n";
+		written++;
+	}
+	char path[MAX_PATH];
+	snprintf(path, sizeof(path), "%s_shaders.txt", base);
+	if (FILE* f = fopen(path, "w"))
+	{
+		fwrite(text.data(), 1, text.size(), f);
+		fclose(f);
+	}
+	LogInfo("Exported %d shadow-sampling pixel shaders to %s_shaders.txt / %s.", written, base, dir);
+}
+
 static void EndCapture(IDirect3DDevice9* dev)
 {
 	SYSTEMTIME t;
@@ -669,6 +868,7 @@ static void EndCapture(IDirect3DDevice9* dev)
 		}
 		if (!n)
 			Out("  (none)");
+		ExportShadowShaders(base);
 		text.swap(g_out);
 	}
 	char path[MAX_PATH];
@@ -765,7 +965,7 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 	HRESULT hr = o_Present(dev, a, b, w, r);
 
 	static bool wasDown = false;
-	bool down = (GetAsyncKeyState(g_hotkey) & 0x8000) != 0;
+	bool down = g_hotkey && (GetAsyncKeyState(g_hotkey) & 0x8000) != 0;
 	if (down && !wasDown && !g_capturing && GameHasFocus())
 		BeginCapture();
 	wasDown = down;
@@ -968,12 +1168,60 @@ static HRESULT __stdcall h_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIM
 
 static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out)
 {
-	HRESULT hr = o_CreatePixelShader(dev, code, out);
+	IDirect3DPixelShader9* original = nullptr;
+	HRESULT hr = E_FAIL;
+	if (SoftShadows_Enabled() && code && out)
+	{
+		std::vector<DWORD> soft;
+		std::string reason;
+		if (SoftShadows_Rewrite(code, SoftShadows_Width(), soft, reason))
+		{
+			hr = o_CreatePixelShader(dev, soft.data(), out);
+			if (SUCCEEDED(hr) && FAILED(o_CreatePixelShader(dev, code, &original)))
+				original = nullptr;
+			if (FAILED(hr))
+			{
+				LONG n = InterlockedIncrement(&g_softFailed);
+				if (n <= 10)
+					LogWarn("Soft shadows: the driver rejected rewritten shader %08X (0x%08lX); using the original.", HashShader(code), hr);
+			}
+			else
+			{
+				LONG n = InterlockedIncrement(&g_softRewritten);
+				if (n == 1 || n % 50 == 0)
+					LogInfo("Soft shadows: %ld shadow shaders rewritten so far.", n);
+			}
+		}
+		else if (reason != "no shadow sampler" && reason != "not ps_3_0")
+		{
+			LONG n = InterlockedIncrement(&g_softSkipped);
+			if (n <= 20)
+				LogInfo("Soft shadows: shader %08X left unchanged (%s).", HashShader(code), reason.c_str());
+		}
+	}
+	if (FAILED(hr))
+		hr = o_CreatePixelShader(dev, code, out);
 	if (SUCCEEDED(hr) && out && *out)
 	{
 		uint32_t h = HashShader(code);
 		Lock l;
 		g_psHash[*out] = h;
+		// The address may belong to a shader the game released earlier: drop its stale pairing.
+		auto it = g_softOriginal.find(*out);
+		if (it != g_softOriginal.end())
+		{
+			it->second->Release();
+			g_softOriginal.erase(it);
+		}
+		if (original)
+		{
+			g_softOriginal[*out] = original;
+			g_softAny = true;
+		}
+	}
+	else if (original)
+	{
+		original->Release();
 	}
 	return hr;
 }
@@ -981,6 +1229,13 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 static HRESULT __stdcall h_SetPixelShader(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
 {
 	g_ps = ps;
+	if (ps && g_softAny && !SoftShadows_Active())
+	{
+		Lock l;
+		auto it = g_softOriginal.find(ps);
+		if (it != g_softOriginal.end())
+			ps = it->second;
+	}
 	return o_SetPixelShader(dev, ps);
 }
 
@@ -1070,14 +1325,16 @@ static void LogD3D9Module()
 		LogInfo("ReShade32.dll is loaded.");
 }
 
-void FrameDump_Init()
+void FrameDump_Init(bool deviceHooksNeeded)
 {
-	if (!IniInt("Debug", "FrameDump", 1))
+	bool dump = IniInt("Debug", "FrameDump", 1) != 0;
+	if (!dump)
 	{
 		LogInfo("Frame dump disabled.");
-		return;
+		if (!deviceHooksNeeded)
+			return;
 	}
-	g_hotkey = IniInt("Debug", "FrameDumpKey", VK_F8);
+	g_hotkey = dump ? IniInt("Debug", "FrameDumpKey", VK_F8) : 0;
 	g_framesToCapture = IniInt("Debug", "FrameDumpFrames", 1);
 	if (g_framesToCapture < 1)
 		g_framesToCapture = 1;
@@ -1090,9 +1347,12 @@ void FrameDump_Init()
 	void* prev = PatchImport(NULL, "d3d9.dll", "Direct3DCreate9", (void*)h_Direct3DCreate9);
 	if (!prev)
 	{
-		LogWarn("Frame dump: could not hook the game's Direct3DCreate9 import.");
+		LogWarn("Could not hook the game's Direct3DCreate9 import (frame dump and soft shadows unavailable).");
 		return;
 	}
 	o_Direct3DCreate9 = (PFN_Direct3DCreate9)prev;
-	LogInfo("Frame dump ready: press key 0x%02X in game to write AC2Graphics_FrameDump_*.txt (%d frame(s)).", g_hotkey, g_framesToCapture);
+	if (dump)
+		LogInfo("Frame dump ready: press key 0x%02X in game to write AC2Graphics_FrameDump_*.txt (%d frame(s)).", g_hotkey, g_framesToCapture);
+	else
+		LogInfo("Direct3D hooks installed (needed by soft shadows).");
 }

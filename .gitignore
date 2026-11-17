@@ -21,3 +21,5 @@ __pycache__/
 *.log
 *.png
 AC2Graphics_FrameDump_*.txt
+AC2Graphics_FrameDump_*_shaders/
+softshadow_*_w*.txt

@@ -9,7 +9,10 @@ Features
   enlarged, and any overflow is now skipped (and noted in the log) instead of corrupting memory.
 - Crash logging: if the game crashes, AC2Graphics.log records where (for bug reports).
 - Hotkey (F7) to switch the shadow tweaks between your settings and vanilla for comparisons.
-- Frame dump hotkey (diagnostic): writes a text description of how one frame is rendered.
+- Soft shadows: widens the game's 1-texel shadow edge blend (FilterWidth, 1-4 texels) by rewriting
+  the shadow-receiving pixel shaders as they load. F6 switches between soft and the game's filter.
+- Frame dump hotkey (diagnostic): writes a text description of how one frame is rendered, plus
+  the disassembly and bytecode of every pixel shader that samples the sun shadow map.
 
 Install
 1. Needs an ASI loader (Ultimate ASI Loader as dinput8.dll, as used by EaglePatch+).
