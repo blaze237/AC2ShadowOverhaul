@@ -50,7 +50,7 @@ bool Shadows_TweaksOn();
 void Shadows_SetTweaksOn(bool on);
 float Shadows_GetSetting(int which);
 void Shadows_SetSetting(int which, float value);
-// Debug menu (number keys select a setting, arrows change it, drawn top right).
+// Debug menu (number keys select a setting, +/- change it, drawn top right).
 bool Tuning_Init();
 void Tuning_Flush(); // writes unsaved debug menu changes to the ini
 bool Tuning_Enabled();

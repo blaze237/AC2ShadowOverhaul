@@ -1,8 +1,8 @@
 // Debug menu: live tuning of the shadow settings.
 //
 // When [DebugMenu] Enabled=1, a list of settings is drawn in the top-right corner of the screen.
-// Number keys 1..7 select a setting (drawn in red), Up/Down change it: scales by 0.5, whole-number
-// settings by 1, on/off settings switch. Holding an arrow repeats. Changes are saved to the ini a
+// Number keys 1..7 select a setting (drawn in red), +/- change it: scales by 0.5, whole-number
+// settings by 1, on/off settings switch. Holding +/- repeats. Changes are saved to the ini a
 // second after the last key press (and at exit), unless [DebugMenu] SaveChanges=0, and logged.
 // The menu key hides/shows the menu (and stops it from reacting to keys while hidden).
 //
@@ -80,7 +80,7 @@ static const char* const kIniKeys[ITEM_COUNT] = {
 	"StartEnabled", "StartEnabled",
 };
 
-// Saving: changes are written to the ini a second after the last key press, so holding an arrow
+// Saving: changes are written to the ini a second after the last key press, so holding +/-
 // doesn't rewrite the file on every repeat.
 static bool g_save = true;
 static unsigned g_dirty; // bit per item
@@ -228,7 +228,8 @@ static void PollInput()
 			g_selected = i;
 		numWas[i] = down;
 	}
-	int dir = KeyDown(VK_UP) ? 1 : KeyDown(VK_DOWN) ? -1 : 0;
+	// + and - on the main keyboard (the =/+ key, no Shift needed) or the numpad.
+	int dir = (KeyDown(VK_OEM_PLUS) || KeyDown(VK_ADD)) ? 1 : (KeyDown(VK_OEM_MINUS) || KeyDown(VK_SUBTRACT)) ? -1 : 0;
 	DWORD now = GetTickCount();
 	if (dir != heldDir)
 	{
@@ -330,7 +331,7 @@ void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight
 		int right = (int)bbWidth - (int)g_fontHeight;
 		int y = (int)g_fontHeight / 2;
 		int step = (int)(g_fontHeight * 1.25f);
-		DrawLine(y, right, "AC2Shadows tuning  (1-7 select, Up/Down change)", D3DCOLOR_XRGB(200, 200, 200));
+		DrawLine(y, right, "AC2Shadows tuning  (1-7 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
 		y += step;
 		for (int i = 0; i < ITEM_COUNT; i++)
 		{
@@ -368,7 +369,7 @@ bool Tuning_Init()
 	g_visible = IniInt("DebugMenu", "StartVisible", 1) != 0;
 	g_save = IniInt("DebugMenu", "SaveChanges", 1) != 0;
 	SoftShadows_SetBuildAllWidths(true);
-	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-7 select, Up/Down change; changes %s).", g_menuKey,
+	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-7 select, +/- change; changes %s).", g_menuKey,
 		g_save ? "saved to the ini" : "not saved");
 	return true;
 }

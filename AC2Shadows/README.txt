@@ -17,7 +17,7 @@ Key features
   shadow distances crashed it. The lists are enlarged, and anything that still doesn't fit is
   skipped instead of corrupting memory.
 - Live tuning: an optional in-game menu (top right) changes every setting on the fly. Number
-  keys select a setting and the arrow keys change it; changes are saved to the ini.
+  keys select a setting and + / - change it; changes are saved to the ini.
 - Before/after hotkeys: F7 switches the distance tweaks between your settings and vanilla; F6
   switches soft shadows on and off.
 - Safe by design: every patch is found by byte signature and is skipped if the exe doesn't
@@ -47,7 +47,7 @@ Install
 
 Hotkeys (all configurable in the ini)
   F7  distance tweaks: your settings / vanilla      F6  soft shadows: on / game filter
-  F9  show/hide the tuning menu ([DebugMenu] Enabled=1); 1-7 select, Up/Down change
+  F9  show/hide the tuning menu ([DebugMenu] Enabled=1); 1-7 select, +/- change
   F8  frame dump (diagnostic, [Debug] FrameDump=1)
 
 AC2Depth.addon32 (optional, for ReShade with add-on support)

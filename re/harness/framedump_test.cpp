@@ -216,7 +216,7 @@ int main()
 			dev->Present(NULL, NULL, NULL, NULL);
 		};
 		press('5');
-		press(VK_DOWN);
+		press(VK_SUBTRACT);
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		UINT w2 = 0;
@@ -224,18 +224,18 @@ int main()
 			cur->GetFunction(nullptr, &w2);
 		printf("debug menu width 2: device has another variant (%u bytes; width 3 %u, original %u): %s\n", w2, got, curSize,
 			cur != gp && w2 != got && w2 > curSize ? "yes" : "NO");
-		press(VK_UP);
+		press(VK_OEM_PLUS);
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		printf("debug menu width 3 again: device has the game's shader: %s\n", cur == gp ? "yes" : "NO");
 		press('1');
-		press(VK_UP);
+		press(VK_OEM_PLUS);
 
 		// Saving: width 3 -> 2, then the ini is written a second after the last key press.
 		char ini[MAX_PATH];
 		GetFullPathNameA("scripts\\AC2Shadows.ini", MAX_PATH, ini, nullptr);
 		press('5');
-		press(VK_DOWN);
+		press(VK_SUBTRACT);
 		int before = GetPrivateProfileIntA("SoftShadows", "FilterWidth", -1, ini);
 		Sleep(1200);
 		dev->Present(NULL, NULL, NULL, NULL);
