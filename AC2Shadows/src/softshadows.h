@@ -6,9 +6,9 @@
 #include <string>
 #include <vector>
 
-// Reads [SoftShadows] from the ini and starts the toggle hotkey. Returns true when enabled.
+// Reads [SoftShadows] from the ini and starts the toggle hotkey. Soft shadows are always on
+// (the toggle key switches to the game's filter for comparisons); returns true.
 bool SoftShadows_Init();
-bool SoftShadows_Enabled(); // configured on (shaders get rewritten at creation)
 bool SoftShadows_Active();  // currently toggled on (rewritten shaders are used)
 
 // Rewrites ps_3_0 bytecode that does AC2's 4-tap shadow filter so it uses a wider filter of
@@ -18,7 +18,6 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& out, 
 int SoftShadows_Width();         // configured FilterWidth (the variant handed to the game)
 int SoftShadows_LiveWidth();     // width currently selected (debug menu); shaders switch on the fly
 void SoftShadows_SetLiveWidth(int width);
-void SoftShadows_SetActive(bool on);
 void SoftShadows_SetBuildAllWidths(bool all); // create every width variant up front (debug menu)
 bool SoftShadows_BuildAllWidths();
 

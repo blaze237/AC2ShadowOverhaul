@@ -1,7 +1,7 @@
 // Debug menu: live tuning of the shadow settings.
 //
 // When [DebugMenu] Enabled=1, a list of settings is drawn in the top-right corner of the screen.
-// Number keys 1..7 select a setting (drawn in red), +/- change it: scales by 0.5, whole-number
+// Number keys 1..6 select a setting (drawn in red), +/- change it: scales by 0.5, whole-number
 // settings by 1, on/off settings switch. Holding +/- repeats. Changes are saved to the ini a
 // second after the last key press (and at exit), unless [DebugMenu] SaveChanges=0, and logged.
 // The menu key hides/shows the menu (and stops it from reacting to keys while hidden).
@@ -64,20 +64,19 @@ enum
 	ITEM_CASTER,
 	ITEM_DRAW,
 	ITEM_SOFT_WIDTH,
-	ITEM_SOFT_ON,
 	ITEM_TWEAKS_ON,
 	ITEM_COUNT
 };
 static const char* const kNames[ITEM_COUNT] = {
-	"Shadow distance", "Cascade splits", "Caster distance", "Detail draw distance", "Soft shadow width", "Soft shadows",
+	"Shadow distance", "Cascade splits", "Caster distance", "Detail draw distance", "Soft shadow width",
 	"Shadow tweaks (F7)",
 };
 static const char* const kIniSections[ITEM_COUNT] = {
-	"Shadows", "Shadows", "Shadows", "Shadows", "SoftShadows", "SoftShadows", "Shadows",
+	"Shadows", "Shadows", "Shadows", "Shadows", "SoftShadows", "Shadows",
 };
 static const char* const kIniKeys[ITEM_COUNT] = {
 	"ShadowDistanceScale", "ShadowCascadeSplitScale", "ShadowCasterDistanceScale", "DetailDrawDistanceScale", "FilterWidth",
-	"StartEnabled", "StartEnabled",
+	"StartEnabled",
 };
 
 // Saving: changes are written to the ini a second after the last key press, so holding +/-
@@ -98,9 +97,6 @@ static void IniValue(int item, char* buf, size_t n)
 		break;
 	case ITEM_SOFT_WIDTH:
 		snprintf(buf, n, "%d", SoftShadows_LiveWidth());
-		break;
-	case ITEM_SOFT_ON:
-		snprintf(buf, n, "%d", SoftShadows_Active() ? 1 : 0);
 		break;
 	default:
 		snprintf(buf, n, "%d", Shadows_TweaksOn() ? 1 : 0);
@@ -139,13 +135,8 @@ static void FormatValue(int item, char* buf, size_t n)
 			snprintf(buf, n, "x%.1f", Shadows_GetSetting(item));
 		break;
 	case ITEM_SOFT_WIDTH:
-		if (!SoftShadows_Enabled())
-			snprintf(buf, n, "off in ini");
-		else
-			snprintf(buf, n, "%d (%d taps)", SoftShadows_LiveWidth(), (SoftShadows_LiveWidth() + 1) * (SoftShadows_LiveWidth() + 1));
-		break;
-	case ITEM_SOFT_ON:
-		snprintf(buf, n, "%s", !SoftShadows_Enabled() ? "off in ini" : SoftShadows_Active() ? "ON" : "OFF");
+		snprintf(buf, n, "%d (%d taps)%s", SoftShadows_LiveWidth(), (SoftShadows_LiveWidth() + 1) * (SoftShadows_LiveWidth() + 1),
+			SoftShadows_Active() ? "" : "  [off: F6]");
 		break;
 	default:
 		snprintf(buf, n, "%s", !Shadows_Installed() ? "n/a" : Shadows_TweaksOn() ? "ON" : "OFF");
@@ -170,14 +161,7 @@ static void Change(int item, int dir)
 		break;
 	}
 	case ITEM_SOFT_WIDTH:
-		if (!SoftShadows_Enabled())
-			return;
 		SoftShadows_SetLiveWidth(SoftShadows_LiveWidth() + dir); // clamped to 1..4
-		break;
-	case ITEM_SOFT_ON:
-		if (!SoftShadows_Enabled())
-			return;
-		SoftShadows_SetActive(dir > 0);
 		break;
 	default:
 		if (!Shadows_Installed())
@@ -331,7 +315,7 @@ void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight
 		int right = (int)bbWidth - (int)g_fontHeight;
 		int y = (int)g_fontHeight / 2;
 		int step = (int)(g_fontHeight * 1.25f);
-		DrawLine(y, right, "AC2Shadows tuning  (1-7 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
+		DrawLine(y, right, "AC2Shadows tuning  (1-6 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
 		y += step;
 		for (int i = 0; i < ITEM_COUNT; i++)
 		{
@@ -369,7 +353,7 @@ bool Tuning_Init()
 	g_visible = IniInt("DebugMenu", "StartVisible", 1) != 0;
 	g_save = IniInt("DebugMenu", "SaveChanges", 1) != 0;
 	SoftShadows_SetBuildAllWidths(true);
-	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-7 select, +/- change; changes %s).", g_menuKey,
+	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-6 select, +/- change; changes %s).", g_menuKey,
 		g_save ? "saved to the ini" : "not saved");
 	return true;
 }

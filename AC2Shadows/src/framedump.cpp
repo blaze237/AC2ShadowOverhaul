@@ -1191,7 +1191,7 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 	SoftSet set;
 	bool haveSet = false;
 	HRESULT hr = E_FAIL;
-	if (SoftShadows_Enabled() && code && out)
+	if (code && out)
 	{
 		const int width = SoftShadows_Width();
 		std::vector<DWORD> soft;
