@@ -58,9 +58,23 @@ AC2Depth.addon32 (optional, for ReShade with add-on support)
 - In the ReShade overlay, Add-ons tab: untick "Generic Depth" (this add-on replaces it).
 - Depth settings (ReShade "Edit global preprocessor definitions"):
     RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN=0
-    RESHADE_DEPTH_INPUT_IS_REVERSED=0
+    RESHADE_DEPTH_INPUT_IS_REVERSED=1      (the add-on stores reversed depth, see below)
     RESHADE_DEPTH_INPUT_IS_LOGARITHMIC=0
     RESHADE_DEPTH_LINEARIZATION_FAR_PLANE - tune with DisplayDepth.fx (start at 1000)
-- ReShade.log shows "AC2 Depth: using scene depth texture" and "rendering effects before the HUD"
-  when it is working. Without HUD (menus, loading) ReShade renders at the end of the frame as usual.
+  The game keeps depth in a 32-bit float texture, which many GPUs can't filter in D3D9 (ReShade
+  then reads it as black). The add-on copies it every frame into a 16-bit float texture as
+  1 - depth, which every GPU can filter and which keeps distant depth precise.
+- RenoDX HDR: with RenoDX's HDR output on, the image before the HUD is not yet in the HDR format
+  ReShade's effects expect, and comes out washed out. Set this in ReShade.ini (the add-on adds it
+  on first run) to render at the end of the frame instead; depth still works, but effects then
+  also apply under the HUD:
+    [AC2Depth]
+    RenderBeforeHUD=0
+  The setting is re-read when you press Reload in the ReShade overlay.
+- ReShade.log shows, when it is working:
+    "AC2 Depth: using scene depth texture ..."
+    "AC2 Depth: created ... reversed depth copy."
+    "AC2 Depth: rendering effects before the HUD ..." (only with RenderBeforeHUD=1)
+  It also logs the GPU, whether it can filter float textures, and the back buffer format.
+  Without HUD (menus, loading) ReShade renders at the end of the frame as usual.
 - Uses the ReShade add-on API headers (BSD-3-Clause, see ReShade-API-LICENSE.md).
