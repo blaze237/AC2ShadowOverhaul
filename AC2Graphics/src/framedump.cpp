@@ -262,7 +262,21 @@ static std::string SurfName(IDirect3DSurface9* s, bool full)
 static std::unordered_map<void*, uint32_t> g_psHash;
 // Soft shadows: shader handed to the game (rewritten) -> the game's original shader, used when
 // soft shadows are toggled off and for exporting the original bytecode.
-static std::unordered_map<void*, IDirect3DPixelShader9*> g_softOriginal;
+struct SoftSet
+{
+	IDirect3DPixelShader9* original = nullptr; // owned
+	IDirect3DPixelShader9* byWidth[5] = {};    // owned, except byWidth[returned] (the game's)
+	int returned = 0;                          // width of the shader handed to the game
+	void Release()
+	{
+		if (original)
+			original->Release();
+		for (int w = 1; w <= 4; w++)
+			if (byWidth[w] && w != returned)
+				byWidth[w]->Release();
+	}
+};
+static std::unordered_map<void*, SoftSet> g_softOriginal;
 static volatile bool g_softAny = false;
 static LONG g_softRewritten = 0, g_softSkipped = 0, g_softFailed = 0;
 
@@ -779,8 +793,8 @@ static void ExportShadowShaders(const char* base)
 		{
 			Lock l;
 			auto it = g_softOriginal.find(sp.ps);
-			if (it != g_softOriginal.end())
-				ps = it->second; // export the game's original, not our rewrite
+			if (it != g_softOriginal.end() && it->second.original)
+				ps = it->second.original; // export the game's original, not our rewrite
 		}
 		UINT size = 0;
 		if (FAILED(ps->GetFunction(nullptr, &size)) || !size || size > (1u << 20))
@@ -934,9 +948,13 @@ static void AfterDeviceReady(IDirect3DDevice9* dev)
 static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
 {
 	LogInfo("Device Reset: %s", DescribePresent(pp).c_str());
+	Tuning_OnLostDevice();
 	HRESULT hr = o_Reset(dev, pp);
 	if (SUCCEEDED(hr))
+	{
 		AfterDeviceReady(dev);
+		Tuning_OnResetDevice();
+	}
 	else
 		LogWarn("Device Reset failed: 0x%08lX", hr);
 	return hr;
@@ -962,6 +980,8 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 			EndCapture(dev);
 	}
 
+	if (!g_capturing && Tuning_Enabled())
+		Tuning_OnPresent(dev, g_bbW, g_bbH);
 	HRESULT hr = o_Present(dev, a, b, w, r);
 
 	static bool wasDown = false;
@@ -1168,17 +1188,17 @@ static HRESULT __stdcall h_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIM
 
 static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out)
 {
-	IDirect3DPixelShader9* original = nullptr;
+	SoftSet set;
+	bool haveSet = false;
 	HRESULT hr = E_FAIL;
 	if (SoftShadows_Enabled() && code && out)
 	{
+		const int width = SoftShadows_Width();
 		std::vector<DWORD> soft;
 		std::string reason;
-		if (SoftShadows_Rewrite(code, SoftShadows_Width(), soft, reason))
+		if (SoftShadows_Rewrite(code, width, soft, reason))
 		{
 			hr = o_CreatePixelShader(dev, soft.data(), out);
-			if (SUCCEEDED(hr) && FAILED(o_CreatePixelShader(dev, code, &original)))
-				original = nullptr;
 			if (FAILED(hr))
 			{
 				LONG n = InterlockedIncrement(&g_softFailed);
@@ -1187,6 +1207,21 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 			}
 			else
 			{
+				haveSet = true;
+				set.returned = width;
+				set.byWidth[width] = *out;
+				if (FAILED(o_CreatePixelShader(dev, code, &set.original)))
+					set.original = nullptr;
+				// Debug menu: every width ready to switch to.
+				for (int w = 1; w <= 4 && SoftShadows_BuildAllWidths(); w++)
+				{
+					if (w == width)
+						continue;
+					std::vector<DWORD> v;
+					std::string why;
+					if (SoftShadows_Rewrite(code, w, v, why) && FAILED(o_CreatePixelShader(dev, v.data(), &set.byWidth[w])))
+						set.byWidth[w] = nullptr;
+				}
 				LONG n = InterlockedIncrement(&g_softRewritten);
 				if (n == 1 || n % 50 == 0)
 					LogInfo("Soft shadows: %ld shadow shaders rewritten so far.", n);
@@ -1206,22 +1241,18 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 		uint32_t h = HashShader(code);
 		Lock l;
 		g_psHash[*out] = h;
-		// The address may belong to a shader the game released earlier: drop its stale pairing.
+		// The address may belong to a shader the game released earlier: drop its stale set.
 		auto it = g_softOriginal.find(*out);
 		if (it != g_softOriginal.end())
 		{
-			it->second->Release();
+			it->second.Release();
 			g_softOriginal.erase(it);
 		}
-		if (original)
+		if (haveSet)
 		{
-			g_softOriginal[*out] = original;
+			g_softOriginal[*out] = set;
 			g_softAny = true;
 		}
-	}
-	else if (original)
-	{
-		original->Release();
 	}
 	return hr;
 }
@@ -1229,12 +1260,21 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 static HRESULT __stdcall h_SetPixelShader(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
 {
 	g_ps = ps;
-	if (ps && g_softAny && !SoftShadows_Active())
+	if (ps && g_softAny)
 	{
-		Lock l;
-		auto it = g_softOriginal.find(ps);
-		if (it != g_softOriginal.end())
-			ps = it->second;
+		bool active = SoftShadows_Active();
+		int width = SoftShadows_LiveWidth();
+		if (!active || width != SoftShadows_Width())
+		{
+			Lock l;
+			auto it = g_softOriginal.find(ps);
+			if (it != g_softOriginal.end())
+			{
+				IDirect3DPixelShader9* sub = active ? it->second.byWidth[width] : it->second.original;
+				if (sub)
+					ps = sub;
+			}
+		}
 	}
 	return o_SetPixelShader(dev, ps);
 }

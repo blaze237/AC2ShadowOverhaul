@@ -542,13 +542,19 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& resul
 
 // ---- Settings and toggle -----------------------------------------------------------------------
 
-static bool g_enabled = false;
+static bool g_enabled = false, g_allWidths = false;
 static volatile bool g_active = true;
+static volatile int g_liveWidth = 3;
 static int g_width = 3, g_toggleKey = 0;
 
 bool SoftShadows_Enabled() { return g_enabled; }
 bool SoftShadows_Active() { return g_active; }
 int SoftShadows_Width() { return g_width; }
+int SoftShadows_LiveWidth() { return g_liveWidth; }
+void SoftShadows_SetLiveWidth(int width) { g_liveWidth = width < 1 ? 1 : width > 4 ? 4 : width; }
+void SoftShadows_SetActive(bool on) { g_active = on; }
+void SoftShadows_SetBuildAllWidths(bool all) { g_allWidths = all; }
+bool SoftShadows_BuildAllWidths() { return g_allWidths; }
 
 static DWORD WINAPI SoftShadowsToggleThread(void*)
 {
@@ -577,6 +583,7 @@ bool SoftShadows_Init()
 		g_width = 1;
 	if (g_width > 4)
 		g_width = 4;
+	g_liveWidth = g_width;
 	if (!g_enabled)
 	{
 		LogInfo("Soft shadows disabled.");

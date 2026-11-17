@@ -12,7 +12,7 @@ mkdir -p dist/scripts
 "$CXX" -shared -O2 -std=c++17 -fms-extensions -fasm-blocks -Wall -Wno-unused-function \
 	-DWIN32_LEAN_AND_MEAN -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS \
 	-fuse-ld=lld -static -static-libgcc -static-libstdc++ -s \
-	-o dist/scripts/AC2Graphics.asi src/main.cpp src/common.cpp src/shadows.cpp src/framedump.cpp src/crashlog.cpp src/softshadows.cpp
+	-o dist/scripts/AC2Graphics.asi src/main.cpp src/common.cpp src/shadows.cpp src/framedump.cpp src/crashlog.cpp src/softshadows.cpp src/tuning.cpp
 "$CXX" -shared -O2 -std=c++17 -fms-extensions -Wall -Wno-unused-function -Wno-ignored-attributes -Wno-missing-braces 	-DWIN32_LEAN_AND_MEAN -DNOMINMAX -fuse-ld=lld -static -static-libgcc -static-libstdc++ -s 	-o dist/AC2Depth.addon32 addon/ac2_depth.cpp
 cp addon/reshade/LICENSE.md dist/ReShade-API-LICENSE.md
 cp AC2Graphics.ini dist/scripts/

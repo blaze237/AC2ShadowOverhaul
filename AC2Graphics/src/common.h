@@ -41,7 +41,21 @@ void* PatchImport(HMODULE module, const char* dll, const char* func, void* repla
 bool GameHasFocus();
 
 // ---- Features --------------------------------------------------------------------------------
-void Shadows_Init(HMODULE patternModule);
+void Shadows_Init(HMODULE patternModule, bool forceInstall = false);
+// Live tuning: settings 0 = far cascade distance, 1 = inner cascade splits, 2 = caster distance,
+// 3 = detail draw distance (the configured values; the F7 toggle switches them against vanilla).
+bool Shadows_Installed();
+bool Shadows_TweaksOn();
+void Shadows_SetTweaksOn(bool on);
+float Shadows_GetSetting(int which);
+void Shadows_SetSetting(int which, float value);
+// Debug menu (number keys select a setting, arrows change it, drawn top right).
+bool Tuning_Init();
+bool Tuning_Enabled();
+struct IDirect3DDevice9;
+void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned backBufferWidth, unsigned backBufferHeight);
+void Tuning_OnLostDevice();
+void Tuning_OnResetDevice();
 void FrameDump_Init(bool deviceHooksNeeded);
 void CrashLog_Init();
 void CrashLog_Detach(bool processExit);

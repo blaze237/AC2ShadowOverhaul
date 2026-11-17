@@ -11,8 +11,18 @@
 // No interactive desktop here, so fake the hotkey by replacing the asi's GetAsyncKeyState import.
 static bool g_keyDown = false;
 static volatile bool g_f6Down = false;
+// The mock device can't back a real D3DX font, so hide D3DXCreateFontA from the asi.
+static FARPROC WINAPI FakeGetProcAddress(HMODULE m, LPCSTR name)
+{
+	if ((uintptr_t)name > 0xFFFF && strcmp(name, "D3DXCreateFontA") == 0)
+		return nullptr;
+	return GetProcAddress(m, name);
+}
+static volatile bool g_keys[256];
 static SHORT WINAPI FakeGetAsyncKeyState(int vk)
 {
+	if (vk > 0 && vk < 256 && g_keys[vk])
+		return (SHORT)0x8000;
 	return ((vk == VK_F8 && g_keyDown) || (vk == VK_F6 && g_f6Down)) ? (SHORT)0x8000 : 0;
 }
 
@@ -59,6 +69,7 @@ int main()
 	if (!asi)
 		return 1;
 	printf("key hook %d\n", PatchAsiImport(asi, "GetAsyncKeyState", (void*)FakeGetAsyncKeyState));
+	printf("font hook %d\n", PatchAsiImport(asi, "GetProcAddress", (void*)FakeGetProcAddress));
 
 	HWND wnd = CreateWindowA("STATIC", "fd", WS_OVERLAPPEDWINDOW, 0, 0, 320, 240, NULL, NULL, NULL, NULL);
 	g_wnd = wnd;
@@ -192,6 +203,33 @@ int main()
 		if (cur)
 			cur->GetFunction(nullptr, &curSize);
 		printf("soft shadows off: device has the original (%u bytes): %s\n", curSize, cur != gp && curSize == bytes ? "yes" : "NO");
+
+		// Debug menu: F6 back on, then select "5 Soft shadow width" and press Down (3 -> 2).
+		g_f6Down = true;
+		Sleep(150);
+		g_f6Down = false;
+		Sleep(100);
+		auto press = [&](int vk) {
+			g_keys[vk] = true;
+			dev->Present(NULL, NULL, NULL, NULL);
+			g_keys[vk] = false;
+			dev->Present(NULL, NULL, NULL, NULL);
+		};
+		press('5');
+		press(VK_DOWN);
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		UINT w2 = 0;
+		if (cur)
+			cur->GetFunction(nullptr, &w2);
+		printf("debug menu width 2: device has another variant (%u bytes; width 3 %u, original %u): %s\n", w2, got, curSize,
+			cur != gp && w2 != got && w2 > curSize ? "yes" : "NO");
+		press(VK_UP);
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		printf("debug menu width 3 again: device has the game's shader: %s\n", cur == gp ? "yes" : "NO");
+		press('1');
+		press(VK_UP);
 	}
 	autoDs->Release();
 	hr = dev->Reset(&pp);

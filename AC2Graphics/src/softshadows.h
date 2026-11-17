@@ -15,7 +15,12 @@ bool SoftShadows_Active();  // currently toggled on (rewritten shaders are used)
 // `width` texels (1 = same footprint as the game). Returns false (with a reason) if the shader
 // doesn't sample the shadow map or doesn't have the expected structure; `out` is then untouched.
 bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& out, std::string& reason);
-int SoftShadows_Width();
+int SoftShadows_Width();         // configured FilterWidth (the variant handed to the game)
+int SoftShadows_LiveWidth();     // width currently selected (debug menu); shaders switch on the fly
+void SoftShadows_SetLiveWidth(int width);
+void SoftShadows_SetActive(bool on);
+void SoftShadows_SetBuildAllWidths(bool all); // create every width variant up front (debug menu)
+bool SoftShadows_BuildAllWidths();
 
 // Where the rewrite put things, for tests.
 struct SoftShadowsLayout

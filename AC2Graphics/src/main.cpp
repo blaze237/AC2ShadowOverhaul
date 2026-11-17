@@ -30,8 +30,9 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 	}
 
 	CrashLog_Init();
-	Shadows_Init(NULL);
+	bool tuning = Tuning_Init();
+	Shadows_Init(NULL, tuning);
 	bool soft = SoftShadows_Init();
-	FrameDump_Init(soft);
+	FrameDump_Init(soft || tuning);
 	return TRUE;
 }

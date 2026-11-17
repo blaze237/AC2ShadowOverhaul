@@ -11,6 +11,8 @@ Features
 - Hotkey (F7) to switch the shadow tweaks between your settings and vanilla for comparisons.
 - Soft shadows: widens the game's 1-texel shadow edge blend (FilterWidth, 1-4 texels) by rewriting
   the shadow-receiving pixel shaders as they load. F6 switches between soft and the game's filter.
+- Debug menu ([DebugMenu] Enabled=1): live tuning of all the shadow settings in game; number keys
+  select, Up/Down change, values drawn top right and logged with their ini keys.
 - Frame dump hotkey (diagnostic): writes a text description of how one frame is rendered, plus
   the disassembly and bytecode of every pixel shader that samples the sun shadow map.
 

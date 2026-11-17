@@ -394,7 +394,39 @@ static void PatchRenderLists(HMODULE patternModule)
 		LogWarn("Shadow caster list enlargement skipped (signature not found).");
 }
 
-void Shadows_Init(HMODULE patternModule)
+// ---- Live tuning (debug menu) ------------------------------------------------------------------
+
+static bool g_shadowHooksInstalled = false;
+
+bool Shadows_Installed() { return g_shadowHooksInstalled; }
+bool Shadows_TweaksOn() { return g_shadowTweaksOn; }
+void Shadows_SetTweaksOn(bool on) { ApplyShadowTweaks(on); }
+
+float Shadows_GetSetting(int which)
+{
+	switch (which)
+	{
+	case 0: return g_cfgDistance;
+	case 1: return g_cfgSplit;
+	case 2: return g_cfgCaster;
+	default: return g_cfgDraw;
+	}
+}
+
+void Shadows_SetSetting(int which, float value)
+{
+	value = ClampScale(value, 1.0f);
+	switch (which)
+	{
+	case 0: g_cfgDistance = value; break;
+	case 1: g_cfgSplit = value; break;
+	case 2: g_cfgCaster = value; break;
+	default: g_cfgDraw = value; break;
+	}
+	ApplyShadowTweaks(g_shadowTweaksOn); // the hooks read the globals every frame
+}
+
+void Shadows_Init(HMODULE patternModule, bool forceInstall)
 {
 	const char* S = "Shadows";
 	float master = ClampScale(IniFloat(S, "ShadowDistanceScale", 3.0f), 1.0f);
@@ -405,7 +437,8 @@ void Shadows_Init(HMODULE patternModule)
 	g_ShadowSplitScale = (split > 0.0f) ? ClampScale(split, master) : master;
 	g_ShadowCasterScale = (caster > 0.0f) ? ClampScale(caster, master) : master;
 
-	if (g_ShadowDistanceScale == 1.0f && g_ShadowSplitScale == 1.0f && g_ShadowCasterScale == 1.0f && g_DetailDrawScale == 1.0f)
+	if (!forceInstall && g_ShadowDistanceScale == 1.0f && g_ShadowSplitScale == 1.0f && g_ShadowCasterScale == 1.0f &&
+		g_DetailDrawScale == 1.0f)
 	{
 		LogInfo("Shadow distance patches disabled (all scales are 1.0).");
 		return;
@@ -467,6 +500,7 @@ void Shadows_Init(HMODULE patternModule)
 		LogWarn("Detail object distance patch skipped (signature not found - already patched by another mod?).");
 	}
 
+	g_shadowHooksInstalled = (cascades && fade && bias) || visDist;
 	g_cfgDistance = g_ShadowDistanceScale;
 	g_cfgSplit = g_ShadowSplitScale;
 	g_cfgCaster = g_ShadowCasterScale;
