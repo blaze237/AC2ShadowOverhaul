@@ -25,7 +25,8 @@ blocky, and past a point the game crashes. AC2 Shadow Overhaul fixes all three.
   switches soft shadows on and off.
 - **Safe by design.** Every patch is found by byte signature and is skipped if the exe doesn't
   match. Shaders it doesn't recognise are left untouched. If the game crashes,
-  `AC2ShadowOverhaul.log` records where.
+  `AC2ShadowOverhaul.log` records where (logging is off by default: set `[Debug] EnableLogging=1`
+  when reporting a problem).
 
 ## Install
 
@@ -38,23 +39,21 @@ blocky, and past a point the game crashes. AC2 Shadow Overhaul fixes all three.
 
 ## Presets
 
-Copy a row's values into `AC2ShadowOverhaul.ini`. The shipped values are **Balanced**.
+Copy a row's values into `AC2ShadowOverhaul.ini`. The shipped values are **High**.
 
-| Preset | Distance | Splits | Casters | Detail | Width | Good for |
-|---|---|---|---|---|---|---|
-| Light | 2.0 | 1.0 | 2.0 | 1.0 | 2 | fixing the pop-in line at almost no cost |
-| **Balanced** | 3.0 | 1.5 | 4.0 | 2.0 | 3 | everyday play: no pop-in, soft but tidy |
-| Crisp | 4.0 | 1.0 | 4.0 | 2.0 | 2 | sharp shadows near you, long far shadows |
-| Long View | 6.0 | 6.0 | 10.0 | 10.0 | 4 | rooftops: shadows to the horizon, very soft |
-| Max | 10.0 | 4.0 | 20.0 | 15.0 | 4 | screenshots; heavy on the CPU |
+| Preset | Distance | Splits | Casters | Detail | Width |
+|---|---|---|---|---|---|
+| Light | 2.0 | 1.0 | 10.0 | 10.0 | 2 |
+| Balanced | 3.0 | 2.0 | 10.0 | 10.0 | 4 |
+| **High** | 6.0 | 6.0 | 10.0 | 10.0 | 4 |
 
 Distance = `ShadowDistanceScale`, Splits = `ShadowCascadeSplitScale`, Casters =
 `ShadowCasterDistanceScale`, Detail = `DetailDrawDistanceScale`, Width = `[SoftShadows] FilterWidth`.
 
-- For every preset except Light, set `ImproveShadowMapResolution=1` in EaglePatch+'s ini. It gives
-  the shadow map 4x the resolution, which the larger distances need to stay sharp.
-- With Max, check the log for "Render lists full". If it appears, some distant shadows are being
-  skipped; lower Casters/Detail a little.
+- Set `ImproveShadowMapResolution=1` in EaglePatch+'s ini. It gives the shadow map 4x the
+  resolution, which the larger distances need to stay sharp.
+- If the log shows "Render lists full", some distant shadows are being skipped; lower Casters/Detail
+  a little.
 
 ## Hotkeys
 
