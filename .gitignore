@@ -24,3 +24,8 @@ __pycache__/
 /re/reshade/
 /re/build/
 /re/orig/
+
+# ReShade depth add-on: kept locally, not part of the repo
+/addon/
+/tests/abi/
+/tools/gen_depthcopy_ps.c

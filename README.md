@@ -66,40 +66,6 @@ All configurable in the ini.
 | F9 | show/hide the tuning menu (needs `[DebugMenu] Enabled=1`); 1-6 select, `+`/`-` change |
 | F8 | frame dump (diagnostic, `[Debug] FrameDump=1`) |
 
-## AC2Depth.addon32 (optional, for ReShade with add-on support)
-
-A separate companion add-on, not needed for the shadow mod.
-
-- Gives ReShade the game's own scene depth (includes the player; no flickering between depth
-  buffers) and renders ReShade effects after the game's post-processing but before the HUD, so
-  ambient occlusion and other effects don't draw over the HUD.
-- Install: put `AC2Depth.addon32` next to the game exe (the same folder as ReShade's `d3d9.dll`).
-- In the ReShade overlay, Add-ons tab: untick "Generic Depth" (this add-on replaces it).
-- Depth settings (ReShade "Edit global preprocessor definitions"):
-  ```
-  RESHADE_DEPTH_INPUT_IS_UPSIDE_DOWN=0
-  RESHADE_DEPTH_INPUT_IS_REVERSED=1      (the add-on stores reversed depth, see below)
-  RESHADE_DEPTH_INPUT_IS_LOGARITHMIC=0
-  RESHADE_DEPTH_LINEARIZATION_FAR_PLANE  (tune with DisplayDepth.fx, start at 1000)
-  ```
-  The game keeps depth in a 32-bit float texture, which many GPUs can't filter in D3D9 (ReShade
-  then reads it as black). The add-on copies it every frame into a 16-bit float texture as
-  `1 - depth`, which every GPU can filter and which keeps distant depth precise.
-- **RenoDX HDR:** with RenoDX's HDR output on, the image before the HUD is not yet in the HDR
-  format ReShade's effects expect, and comes out washed out. Set this in `ReShade.ini` (the
-  add-on adds it on first run) to render at the end of the frame instead; depth still works, but
-  effects then also apply under the HUD:
-  ```
-  [AC2Depth]
-  RenderBeforeHUD=0
-  ```
-  The setting is re-read when you press Reload in the ReShade overlay.
-- `ReShade.log` shows, when it is working: `AC2 Depth: using scene depth texture ...`,
-  `AC2 Depth: created ... reversed depth copy.` and (only with `RenderBeforeHUD=1`)
-  `AC2 Depth: rendering effects before the HUD ...`. It also logs the GPU, whether it can filter
-  float textures, and the back buffer format. Without HUD (menus, loading) ReShade renders at the
-  end of the frame as usual.
-
 ## Building
 
 A 32-bit build is needed. The project uses [llvm-mingw](https://github.com/mstorsjo/llvm-mingw)
@@ -109,7 +75,7 @@ A 32-bit build is needed. The project uses [llvm-mingw](https://github.com/mstor
 ./build.sh /path/to/llvm-mingw/bin     # or set LLVM_MINGW, or put the toolchain on PATH
 ```
 
-This writes `dist/scripts/AC2ShadowOverhaul.asi` (+ ini) and `dist/AC2Depth.addon32`.
+This writes `dist/scripts/AC2ShadowOverhaul.asi` (+ ini).
 
 ## Tests
 
