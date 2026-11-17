@@ -1,5 +1,5 @@
 // End-to-end test for the frame dump: built as AssassinsCreedIIGame.exe, statically imports
-// d3d9!Direct3DCreate9 like the game, loads AC2Graphics.asi, renders a few frames with extra
+// d3d9!Direct3DCreate9 like the game, loads AC2Shadows.asi, renders a few frames with extra
 // render targets / depth buffers, and taps the hotkey (F8) via SendInput.
 #include <windows.h>
 #include <d3d9.h>
@@ -64,7 +64,7 @@ static void Tap(WORD, bool down)
 
 int main()
 {
-	HMODULE asi = LoadLibraryA("scripts\\AC2Graphics.asi");
+	HMODULE asi = LoadLibraryA("scripts\\AC2Shadows.asi");
 	printf("asi %p\n", (void*)asi);
 	if (!asi)
 		return 1;
@@ -180,7 +180,7 @@ int main()
 	bb->Release();
 	// Soft shadows: a real game shader goes through the hooked CreatePixelShader.
 	{
-		FILE* f = fopen("../../shaders/AC2Graphics_FrameDump_20261117_000314_shaders/81DFCBE3.cso", "rb");
+		FILE* f = fopen("../../shaders/AC2Shadows_FrameDump_20261117_000314_shaders/81DFCBE3.cso", "rb");
 		std::vector<DWORD> game(4096, 0);
 		size_t bytes = f ? fread(game.data(), 1, game.size() * 4, f) : 0;
 		if (f)

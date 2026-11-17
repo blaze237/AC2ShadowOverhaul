@@ -1,4 +1,4 @@
-// AC2Graphics - shared helpers (logging, ini, memory patching, signature scanning)
+// AC2Shadows - shared helpers (logging, ini, memory patching, signature scanning)
 #pragma once
 
 #include <windows.h>
@@ -14,7 +14,7 @@ void LogInfo(const char* fmt, ...);
 void LogWarn(const char* fmt, ...);
 
 // ---- INI -------------------------------------------------------------------------------------
-// The ini lives next to the .asi with the same base name (AC2Graphics.ini).
+// The ini lives next to the .asi with the same base name (AC2Shadows.ini).
 void IniInit(HMODULE self);
 void IniSetPath(const char* path); // tests only
 const char* IniPath();

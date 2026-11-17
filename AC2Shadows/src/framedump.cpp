@@ -476,7 +476,7 @@ static void BeginCapture()
 
 	SYSTEMTIME t;
 	GetLocalTime(&t);
-	Out("AC2Graphics frame dump %04d-%02d-%02d %02d:%02d:%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+	Out("AC2Shadows frame dump %04d-%02d-%02d %02d:%02d:%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
 	Out("%s", g_deviceInfo.c_str());
 	Out("");
 	Out("Render target / depth resources (name, size, format, created by):");
@@ -853,7 +853,7 @@ static void EndCapture(IDirect3DDevice9* dev)
 	SYSTEMTIME t;
 	GetLocalTime(&t);
 	char base[MAX_PATH];
-	snprintf(base, sizeof(base), "%sAC2Graphics_FrameDump_%04d%02d%02d_%02d%02d%02d", ModuleDir(), t.wYear, t.wMonth, t.wDay,
+	snprintf(base, sizeof(base), "%sAC2Shadows_FrameDump_%04d%02d%02d_%02d%02d%02d", ModuleDir(), t.wYear, t.wMonth, t.wDay,
 		t.wHour, t.wMinute, t.wSecond);
 
 	std::string text;
@@ -1392,7 +1392,7 @@ void FrameDump_Init(bool deviceHooksNeeded)
 	}
 	o_Direct3DCreate9 = (PFN_Direct3DCreate9)prev;
 	if (dump)
-		LogInfo("Frame dump ready: press key 0x%02X in game to write AC2Graphics_FrameDump_*.txt (%d frame(s)).", g_hotkey, g_framesToCapture);
+		LogInfo("Frame dump ready: press key 0x%02X in game to write AC2Shadows_FrameDump_*.txt (%d frame(s)).", g_hotkey, g_framesToCapture);
 	else
 		LogInfo("Direct3D hooks installed (needed by soft shadows).");
 }

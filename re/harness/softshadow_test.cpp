@@ -5,8 +5,8 @@
 //  3. the shadow section (first tap .. our result) is executed by a small ps_3_0 interpreter
 //     against a random point-sampled shadow atlas: at width 1 our filter must reproduce the game's
 //     own filter result, and at every width it must match a C reference box filter.
-#include "../../AC2Graphics/src/common.cpp"
-#include "../../AC2Graphics/src/softshadows.cpp"
+#include "../../AC2Shadows/src/common.cpp"
+#include "../../AC2Shadows/src/softshadows.cpp"
 #include <stdio.h>
 #include <math.h>
 #include <string>
@@ -167,7 +167,7 @@ static float Rand() { return (g_rng = g_rng * 1664525u + 1013904223u) / 42949672
 
 int main(int argc, char** argv)
 {
-	const char* dir = argc > 1 ? argv[1] : "../shaders/AC2Graphics_FrameDump_20261117_000314_shaders";
+	const char* dir = argc > 1 ? argv[1] : "../shaders/AC2Shadows_FrameDump_20261117_000314_shaders";
 	LogInit("softshadow_test.log", true);
 	HMODULE dc = LoadLibraryA("D3DCompiler_43.dll");
 	g_disasm = dc ? (PFN_Disasm)GetProcAddress(dc, "D3DDisassemble") : nullptr;

@@ -1,8 +1,8 @@
 // Offline test: maps the real AssassinsCreedIIGame.exe (UPlay) into this 32-bit process without
 // running it, installs the shadow hooks via the real signature scanner, and calls the game's own
 // cascade builder / visibility-distance setter with synthetic inputs, patched vs. unpatched.
-#include "../../AC2Graphics/src/common.cpp"
-#include "../../AC2Graphics/src/shadows.cpp"
+#include "../../AC2Shadows/src/common.cpp"
+#include "../../AC2Shadows/src/shadows.cpp"
 #include <stdio.h>
 #include <string.h>
 #include <malloc.h>
@@ -245,11 +245,14 @@ int main(int argc, char** argv)
 	printf("toggle off == vanilla, on == patched: %s\n", toggleOk ? "PASS" : "FAIL");
 
 	bool ok = toggleOk && listsOk;
+	// Defaults (no ini): far cascade edge x3 (ShadowDistanceScale), inner splits x1.5
+	// (ShadowCascadeSplitScale). RangesMax = far, s1, s2, s3; RangesMin = s1, s2, s3, 0.
 	for (int i = 0; i < 4; i++)
 	{
-		if (fabsf(after.rmax[i] - before.rmax[i] * 3.0f) > 0.01f || fabsf(after.rmin[i] - before.rmin[i] * 3.0f) > 0.01f)
+		float maxScale = i == 0 ? 3.0f : 1.5f;
+		if (fabsf(after.rmax[i] - before.rmax[i] * maxScale) > 0.01f || fabsf(after.rmin[i] - before.rmin[i] * 1.5f) > 0.01f)
 			ok = false;
 	}
-	printf("cascade ranges scaled 3x: %s\n", ok ? "PASS" : "FAIL");
+	printf("cascade ranges scaled (far x3, inner splits x1.5): %s\n", ok ? "PASS" : "FAIL");
 	return ok ? 0 : 3;
 }

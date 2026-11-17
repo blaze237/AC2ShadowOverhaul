@@ -1,4 +1,4 @@
-// Fake d3d9.dll for testing AC2Graphics' frame dump on a machine without a display adapter.
+// Fake d3d9.dll for testing AC2Shadows' frame dump on a machine without a display adapter.
 // Sits next to the test exe exactly like a ReShade d3d9.dll proxy would.
 #include "mock_gen.h"
 #include <stdio.h>

@@ -3,7 +3,7 @@
 // When [DebugMenu] Enabled=1, a list of settings is drawn in the top-right corner of the screen.
 // Number keys 1..7 select a setting (drawn in red), Up/Down change it: scales by 0.5, whole-number
 // settings by 1, on/off settings switch. Holding an arrow repeats. Every change is written to
-// AC2Graphics.log so the values can be copied into the ini. The menu key hides/shows the menu
+// AC2Shadows.log so the values can be copied into the ini. The menu key hides/shows the menu
 // (and stops it from reacting to keys while hidden).
 //
 // Text is drawn with ID3DXFont from the d3dx9_42.dll the game already loads, just before Present.
@@ -275,7 +275,7 @@ void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight
 		int right = (int)bbWidth - (int)g_fontHeight;
 		int y = (int)g_fontHeight / 2;
 		int step = (int)(g_fontHeight * 1.25f);
-		DrawLine(y, right, "AC2Graphics tuning  (1-7 select, Up/Down change)", D3DCOLOR_XRGB(200, 200, 200));
+		DrawLine(y, right, "AC2Shadows tuning  (1-7 select, Up/Down change)", D3DCOLOR_XRGB(200, 200, 200));
 		y += step;
 		for (int i = 0; i < ITEM_COUNT; i++)
 		{

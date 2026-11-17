@@ -12,7 +12,7 @@
 __pycache__/
 
 # Build outputs, binaries and runtime output
-/AC2Graphics/dist/
+/AC2Shadows/dist/
 *.exe
 *.dll
 *.asi
@@ -20,6 +20,6 @@ __pycache__/
 *.obj
 *.log
 *.png
-AC2Graphics_FrameDump_*.txt
-AC2Graphics_FrameDump_*_shaders/
+AC2Shadows_FrameDump_*.txt
+AC2Shadows_FrameDump_*_shaders/
 softshadow_*_w*.txt

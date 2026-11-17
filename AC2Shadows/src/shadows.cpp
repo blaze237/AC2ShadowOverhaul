@@ -430,8 +430,8 @@ void Shadows_Init(HMODULE patternModule, bool forceInstall)
 {
 	const char* S = "Shadows";
 	float master = ClampScale(IniFloat(S, "ShadowDistanceScale", 3.0f), 1.0f);
-	float split = IniFloat(S, "ShadowCascadeSplitScale", 0.0f);
-	float caster = IniFloat(S, "ShadowCasterDistanceScale", 0.0f);
+	float split = IniFloat(S, "ShadowCascadeSplitScale", 1.5f);
+	float caster = IniFloat(S, "ShadowCasterDistanceScale", 4.0f);
 	g_DetailDrawScale = ClampScale(IniFloat(S, "DetailDrawDistanceScale", 2.0f), 1.0f);
 	g_ShadowDistanceScale = master;
 	g_ShadowSplitScale = (split > 0.0f) ? ClampScale(split, master) : master;

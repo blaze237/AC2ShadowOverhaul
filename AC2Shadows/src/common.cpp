@@ -61,7 +61,7 @@ void IniInit(HMODULE self)
 	char path[MAX_PATH];
 	DWORD n = GetModuleFileNameA(self, path, MAX_PATH);
 	if (!n || n >= MAX_PATH)
-		strcpy(path, "AC2Graphics.asi");
+		strcpy(path, "AC2Shadows.asi");
 	strcpy(g_moduleDir, path);
 	char* slash = strrchr(g_moduleDir, '\\');
 	if (slash)
