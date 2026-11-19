@@ -7,6 +7,54 @@
 #include <vector>
 #include <string.h>
 #include <stdint.h>
+#include <string>
+#include "../src/shaders_gen.h"
+#include <math.h>
+
+// D3DCompiler (any version with D3DCompile / D3DDisassemble) for test shaders.
+struct Blob { struct { void* q; void* a; ULONG(__stdcall* Release)(void*); void*(__stdcall* Ptr)(void*); SIZE_T(__stdcall* Size)(void*); }* vt; };
+typedef HRESULT(WINAPI* PFN_Compile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT, Blob**, Blob**);
+typedef HRESULT(WINAPI* PFN_Disasm)(const void*, SIZE_T, UINT, const char*, Blob**);
+static HMODULE Compiler()
+{
+	static HMODULE c = LoadLibraryA("D3DCompiler_43.dll");
+	if (!c)
+		c = LoadLibraryA("D3DCompiler_47.dll");
+	return c;
+}
+static Blob* Compile(const char* src, const char* target)
+{
+	auto compile = Compiler() ? (PFN_Compile)GetProcAddress(Compiler(), "D3DCompile") : nullptr;
+	Blob* code = nullptr;
+	if (!compile || FAILED(compile(src, strlen(src), "test", nullptr, nullptr, "main", target, 0, 0, &code, nullptr)))
+		return nullptr;
+	return code;
+}
+
+// Text of the newest file in scripts\ matching `pattern`.
+static std::string ReadDump(const char* pattern)
+{
+	WIN32_FIND_DATAA fd;
+	HANDLE h = FindFirstFileA(pattern, &fd);
+	std::string best;
+	if (h == INVALID_HANDLE_VALUE)
+		return "";
+	do
+		if (best.empty() || strcmp(fd.cFileName, best.c_str()) > 0)
+			best = fd.cFileName;
+	while (FindNextFileA(h, &fd));
+	FindClose(h);
+	std::string text;
+	FILE* f = fopen(("scripts\\" + best).c_str(), "rb");
+	if (!f)
+		return "";
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+		text.append(buf, n);
+	fclose(f);
+	return text;
+}
 
 // No interactive desktop here, so fake the hotkey by replacing the asi's GetAsyncKeyState import.
 static bool g_keyDown = false;
@@ -116,11 +164,6 @@ int main()
 	dev->CreateTexture(1024, 256, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &atlas, NULL);
 	IDirect3DPixelShader9* shadowPs = nullptr;
 	{
-		typedef HRESULT(WINAPI * PFN_Compile)(const void*, SIZE_T, const char*, const void*, void*, const char*, const char*, UINT, UINT,
-			void**, void**);
-		struct Blob { struct { void* q; void* a; ULONG(__stdcall* Release)(void*); void*(__stdcall* Ptr)(void*); SIZE_T(__stdcall* Size)(void*); }* vt; };
-		HMODULE c = LoadLibraryA("D3DCompiler_43.dll");
-		auto compile = c ? (PFN_Compile)GetProcAddress(c, "D3DCompile") : nullptr;
 		const char* src =
 			"sampler2D g_ShadowMap : register(s15);\n"
 			"float4 g_ShadowCascadesRangesMax : register(c40);\n"
@@ -128,10 +171,34 @@ int main()
 			"  float d = tex2D(g_ShadowMap, uv.xy).r;\n"
 			"  float lit = uv.z <= d ? 1.0 : 0.3;\n"
 			"  return float4(lit * g_ShadowCascadesRangesMax.xyz, 1); }\n";
-		Blob* code = nullptr;
-		if (compile && SUCCEEDED(compile(src, strlen(src), "test", nullptr, nullptr, "main", "ps_3_0", 0, 0, (void**)&code, nullptr)))
+		if (Blob* code = Compile(src, "ps_3_0"))
 			dev->CreatePixelShader((const DWORD*)code->vt->Ptr(code), &shadowPs);
 		printf("shadow test shader compiled: %s\n", shadowPs ? "yes" : "NO");
+	}
+	// A vertex shader with a named camera matrix, for the dump's constant export.
+	IDirect3DVertexShader9* vs = nullptr;
+	if (Blob* code = Compile("float4x4 g_ViewProj : register(c0);\nfloat4 g_EyePosition : register(c8);\n"
+							 "float4 main(float4 p : POSITION) : POSITION { return mul(p, g_ViewProj) + g_EyePosition; }\n",
+			"vs_3_0"))
+		dev->CreateVertexShader((const DWORD*)code->vt->Ptr(code), &vs);
+	const float viewProj[16] = { 1, 2, 3, 4, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 }, eye[4] = { 10, 20, 30, 1 };
+	dev->SetVertexShaderConstantF(0, viewProj, 4);
+	dev->SetVertexShaderConstantF(8, eye, 1);
+	printf("vertex shader compiled: %s\n", vs ? "yes" : "NO");
+
+	// The compiled depth copy shader must be ps_2_0 and do what it says.
+	{
+		auto disasm = Compiler() ? (PFN_Disasm)GetProcAddress(Compiler(), "D3DDisassemble") : nullptr;
+		Blob* text = nullptr;
+		std::string t;
+		if (disasm && SUCCEEDED(disasm(kDepthToColourPs, sizeof(kDepthToColourPs), 0, nullptr, &text)) && text)
+			t.assign((const char*)text->vt->Ptr(text), text->vt->Size(text));
+		bool ok = t.find("ps_2_0") != std::string::npos && t.find("dcl t0.xy") != std::string::npos &&
+				  t.find("dcl_2d s0") != std::string::npos && t.find("texld r0, t0, s0") != std::string::npos &&
+				  t.find("mov oC0, r0") != std::string::npos;
+		printf("depth copy shader disassembles as expected: %s\n", ok ? "yes" : "NO");
+		if (!ok)
+			printf("%s\n", t.c_str());
 	}
 
 	for (int frame = 0; frame < 6; frame++)
@@ -141,6 +208,7 @@ int main()
 		if (frame == 2)
 			Tap(VK_F8, false);
 		dev->BeginScene();
+		dev->SetVertexShader(vs);
 		dev->SetRenderTarget(0, sceneSurf);
 		dev->SetDepthStencilSurface(depth2);
 		dev->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0, 1.0f, 0);
@@ -172,6 +240,170 @@ int main()
 		dev->Present(NULL, NULL, NULL, NULL);
 		Sleep(30);
 	}
+	// Frame dump: depth buffer readback compared with the R32F "T6" target, and the constant export.
+	{
+		std::string main = ReadDump("scripts\\AC2ShadowOverhaul_FrameDump_????????_??????.txt");
+		size_t at = main.find("vs T");
+		size_t miss = main.find("MISSING from the depth buffer ", at == std::string::npos ? 0 : at);
+		float missing = miss == std::string::npos ? -1 : (float)atof(main.c_str() + miss + strlen("MISSING from the depth buffer "));
+		// The mock hides a quarter-by-quarter box from the depth copy: 6.25% of the image, 9.4% of the geometry (lower 2/3).
+		printf("frame dump: depth buffer compared with T6, %.1f%% missing (expected ~9.4%%): %s\n", missing,
+			missing > 8.0f && missing < 11.0f ? "yes" : "NO");
+		std::string vsText = ReadDump("scripts\\AC2ShadowOverhaul_FrameDump_*_vs.txt");
+		printf("frame dump: vertex shader constants exported (g_ViewProj = 1, 2, 3, 4): %s\n",
+			vsText.find("g_ViewProj") != std::string::npos && vsText.find("c0   = (1, 2, 3, 4)") != std::string::npos ? "yes" : "NO");
+		printf("frame dump: GPU capabilities logged: %s\n", main.find("INTZ depth textures: yes") != std::string::npos ? "yes" : "NO");
+	}
+
+	// Ambient occlusion: one opaque pass (scene colour + R32F z/w as render target 1) drawn with a
+	// lit shader in the game's style and a vertex shader carrying g_WorldViewProj / g_World.
+	{
+		struct MockAoStats
+		{
+			int draws, colorFills, stateCaptures, stateApplies;
+			IDirect3DSurface9* lastRt0;
+			DWORD lastBlendOp, lastAlphaBlend;
+			IDirect3DPixelShader9* lastPs;
+		};
+		typedef MockAoStats*(WINAPI * PFN_Stats)();
+		HMODULE mock = GetModuleHandleA("d3d9.dll");
+		PFN_Stats getStats = (PFN_Stats)GetProcAddress(mock, "MockGetStats");
+		if (!getStats)
+			getStats = (PFN_Stats)GetProcAddress(mock, "MockGetStats@0");
+		MockAoStats* stats = getStats();
+		const char* litSrc =
+			"float4 g_FogColor : register(c16);\n"
+			"float4 g_AmbientCube[6] : register(c24);\n"
+			"float4 g_SunColor : register(c53);\n"
+			"sampler2D g_Diffuse : register(s1);\n"
+			"sampler2D g_WorldLightMapSampler : register(s12);\n"
+			"sampler2D g_ShadowSampler : register(s15);\n"
+			"struct Out { float4 c0 : COLOR0; float4 c1 : COLOR1; };\n"
+			"Out main(float2 uv : TEXCOORD0, float3 n : TEXCOORD1, float4 sh : TEXCOORD2, float fog : TEXCOORD3, float2 zw : TEXCOORD4) {\n"
+			"  float3 albedo = tex2D(g_Diffuse, uv).rgb;\n"
+			"  float shadow = tex2D(g_ShadowSampler, sh.xy).x >= sh.z ? 1 : 0;\n"
+			"  float3 amb = n.x * n.x * g_AmbientCube[0].rgb + n.y * n.y * g_AmbientCube[2].rgb + n.z * n.z * g_AmbientCube[4].rgb;\n"
+			"  float3 lm = tex2D(g_WorldLightMapSampler, uv * 0.5).rgb;\n"
+			"  float3 indirect = lerp(amb, lm, 0.3) * albedo * n.x;\n" // the game scales indirect albedo by a vertex AO term
+			"  float3 sun = saturate(dot(n, float3(0, 0, 1))) * g_SunColor.rgb * albedo;\n"
+			"  float3 lit = sun * shadow + indirect;\n"
+			"  Out o; o.c0 = float4(lerp(lit, g_FogColor.rgb, fog), 1); o.c1 = float4(zw.x / zw.y, 0, 0, 1); return o; }\n";
+		Blob* litCode = Compile(litSrc, "ps_3_0");
+		IDirect3DPixelShader9* litPs = nullptr;
+		UINT litGot = 0;
+		if (litCode)
+		{
+			dev->CreatePixelShader((const DWORD*)litCode->vt->Ptr(litCode), &litPs);
+			litPs->GetFunction(nullptr, &litGot);
+		}
+		std::string logNow;
+		if (FILE* f = fopen("scripts\\AC2ShadowOverhaul.log", "rb"))
+		{
+			char b[4096];
+			size_t k;
+			while ((k = fread(b, 1, sizeof(b), f)) > 0)
+				logNow.append(b, k);
+			fclose(f);
+		}
+		bool litMatched = logNow.find("1 opaque shaders given the indirect light output") != std::string::npos;
+		printf("ao: lit shader given the indirect light output (%u -> %u bytes): %s\n", litCode ? (unsigned)litCode->vt->Size(litCode) : 0,
+			litGot, litCode && litGot > litCode->vt->Size(litCode) && litMatched ? "yes" : "NO");
+		IDirect3DVertexShader9* aoVs = nullptr;
+		if (Blob* code = Compile("float4x4 g_WorldViewProj : register(c0);\nfloat4x4 g_World : register(c8);\n"
+								 "float4 main(float4 p : POSITION) : POSITION { return mul(p, g_WorldViewProj) + mul(p, g_World); }\n",
+				"vs_3_0"))
+			dev->CreateVertexShader((const DWORD*)code->vt->Ptr(code), &aoVs);
+		// Camera: near 0.1, far 1000, 90 degree horizontal fov (P00 = 1), 4:3, looking down +z from the
+		// origin; the object is at (5, 6, 7). Registers hold matrix rows.
+		const float n_ = 0.1f, f_ = 1000.0f, A = f_ / (f_ - n_), B = -n_ * f_ / (f_ - n_);
+		const float world[16] = { 1, 0, 0, 5, 0, 1, 0, 6, 0, 0, 1, 7, 0, 0, 0, 1 };
+		const float P[16] = { 1, 0, 0, 0, 0, 4.0f / 3, 0, 0, 0, 0, A, B, 0, 0, 1, 0 };
+		float wvp[16];
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				wvp[r * 4 + c] = P[r * 4 + 0] * world[0 * 4 + c] + P[r * 4 + 1] * world[1 * 4 + c] + P[r * 4 + 2] * world[2 * 4 + c] +
+								 P[r * 4 + 3] * world[3 * 4 + c];
+		IDirect3DTexture9* zTex = nullptr;
+		IDirect3DSurface9 *zSurf = nullptr, *rt2 = nullptr, *cur = nullptr;
+		dev->CreateTexture(320, 240, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &zTex, NULL);
+		zTex->GetSurfaceLevel(0, &zSurf);
+
+		dev->BeginScene();
+		dev->SetRenderTarget(0, sceneSurf);
+		dev->SetRenderTarget(1, zSurf);
+		bool bound = SUCCEEDED(dev->GetRenderTarget(2, &rt2)) && rt2;
+		dev->SetVertexShader(aoVs);
+		dev->SetVertexShaderConstantF(0, wvp, 4);
+		dev->SetVertexShaderConstantF(8, world, 4);
+		dev->SetPixelShader(litPs);
+		for (int i = 0; i < 3; i++)
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+		// Between batches the game unbinds render target 1, resets 2 and 3, and rebinds 1: the pass
+		// goes on (AO must not run here, and our target must stay bound).
+		dev->SetRenderTarget(1, NULL);
+		dev->SetRenderTarget(2, NULL);
+		dev->SetRenderTarget(3, NULL);
+		int midBefore = stats->draws;
+		dev->SetRenderTarget(1, zSurf);
+		bool rebound = SUCCEEDED(dev->GetRenderTarget(2, &cur)) && cur == rt2;
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+		printf("ao: pass continues across the game's render target resets between batches: %s\n",
+			rebound && stats->draws - midBefore == 1 ? "yes" : "NO");
+		dev->SetRenderTarget(1, NULL);
+		bool unbound = FAILED(dev->GetRenderTarget(2, &cur)) || !cur;
+		int before = stats->draws;
+		dev->SetPixelShader(ps);
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V)); // the sky: AO runs first
+		int aoDraws = stats->draws - before - 1;
+		printf("ao: indirect light target bound as render target 2 during the pass: %s\n", bound && unbound ? "yes" : "NO");
+		printf("ao: 4 passes drawn before the sky (%d): %s\n", aoDraws, aoDraws == 4 ? "yes" : "NO");
+		IDirect3DSurface9* back = nullptr;
+		dev->GetRenderTarget(0, &back);
+		printf("ao: game's render target and state restored after the passes: %s\n",
+			back == sceneSurf && stats->stateCaptures == 1 && stats->stateApplies == 1 && stats->lastPs == ps ? "yes" : "NO");
+		dev->EndScene();
+		dev->Present(NULL, NULL, NULL, NULL);
+		std::string log;
+		if (FILE* f = fopen("scripts\\AC2ShadowOverhaul.log", "rb"))
+		{
+			char buf[4096];
+			size_t n;
+			while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+				log.append(buf, n);
+			fclose(f);
+		}
+		bool camera = log.find("camera found (near 0.100 m, far 1000 m, horizontal fov 90.0 deg)") != std::string::npos;
+		printf("ao: camera read from g_WorldViewProj / g_World: %s\n", camera ? "yes" : "NO");
+		if (!camera)
+		{
+			size_t at = log.find("Ambient occlusion: c");
+			printf("%s\n", at == std::string::npos ? "(no camera line)" : log.substr(at, 160).c_str());
+		}
+		printf("ao: first frame applied (logged): %s\n", log.find("Ambient occlusion: first frame applied") != std::string::npos ? "yes" : "NO");
+
+		// F5 turns AO off: next frame nothing is bound or drawn.
+		g_keys[VK_F5] = true;
+		Sleep(150);
+		g_keys[VK_F5] = false;
+		Sleep(50);
+		dev->BeginScene();
+		dev->SetRenderTarget(0, sceneSurf);
+		dev->SetRenderTarget(1, zSurf);
+		bool boundOff = SUCCEEDED(dev->GetRenderTarget(2, &cur)) && cur;
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+		dev->SetRenderTarget(1, NULL);
+		before = stats->draws;
+		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+		dev->EndScene();
+		dev->Present(NULL, NULL, NULL, NULL);
+		printf("ao: F5 off: nothing bound or drawn: %s\n", !boundOff && stats->draws - before == 1 ? "yes" : "NO");
+		g_keys[VK_F5] = true;
+		Sleep(150);
+		g_keys[VK_F5] = false;
+		Sleep(50);
+		dev->SetRenderTarget(0, bb);
+	}
+
 	pp.BackBufferWidth = 400;
 	sceneSurf->Release();
 	scene->Release();
@@ -208,7 +440,8 @@ int main()
 		UINT curSize = 0;
 		if (cur)
 			cur->GetFunction(nullptr, &curSize);
-		printf("soft shadows off: device has the original (%u bytes): %s\n", curSize, cur != gp && curSize == bytes ? "yes" : "NO");
+		printf("soft shadows off: device has the game's filter (%u bytes, AO output added; soft %u): %s\n", curSize, got,
+			cur != gp && curSize > bytes && curSize < got ? "yes" : "NO");
 
 		// Debug menu: F6 back on, then select "5 Soft shadow width" and press Down (3 -> 2).
 		g_f6Down = true;

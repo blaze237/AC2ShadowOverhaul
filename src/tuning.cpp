@@ -10,6 +10,7 @@
 
 #include "common.h"
 #include "softshadows.h"
+#include "ao.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <string.h>
@@ -65,19 +66,26 @@ enum
 	ITEM_DRAW,
 	ITEM_SOFT_WIDTH,
 	ITEM_TWEAKS_ON,
+	ITEM_AO_MODE,
+	ITEM_AO_RADIUS,
+	ITEM_AO_STRENGTH,
 	ITEM_COUNT
 };
 static const char* const kNames[ITEM_COUNT] = {
 	"Shadow distance", "Cascade splits", "Caster distance", "Detail draw distance", "Soft shadow width",
-	"Shadow tweaks (F7)",
+	"Shadow tweaks (F7)", "Ambient occlusion", "AO radius", "AO strength",
 };
 static const char* const kIniSections[ITEM_COUNT] = {
-	"Shadows", "Shadows", "Shadows", "Shadows", "SoftShadows", "Shadows",
+	"Shadows", "Shadows", "Shadows", "Shadows", "SoftShadows", "Shadows", "AmbientOcclusion", "AmbientOcclusion", "AmbientOcclusion",
 };
 static const char* const kIniKeys[ITEM_COUNT] = {
 	"ShadowDistanceScale", "ShadowCascadeSplitScale", "ShadowCasterDistanceScale", "DetailDrawDistanceScale", "FilterWidth",
-	"StartEnabled",
+	"StartEnabled", "DebugView", "Radius", "Strength",
 };
+
+// Ambient occlusion menu modes: off, on, show AO, show the indirect light buffer.
+static const char* const kAoModes[] = { "OFF", "ON", "show AO only", "show indirect light" };
+static int AoMode() { return AO_View() ? AO_View() + 1 : AO_Active() ? 1 : 0; }
 
 // Saving: changes are written to the ini a second after the last key press, so holding +/-
 // doesn't rewrite the file on every repeat.
@@ -98,6 +106,15 @@ static void IniValue(int item, char* buf, size_t n)
 	case ITEM_SOFT_WIDTH:
 		snprintf(buf, n, "%d", SoftShadows_LiveWidth());
 		break;
+	case ITEM_AO_MODE:
+		snprintf(buf, n, "%d", AO_View());
+		break;
+	case ITEM_AO_RADIUS:
+		snprintf(buf, n, "%.2f", AO_Radius());
+		break;
+	case ITEM_AO_STRENGTH:
+		snprintf(buf, n, "%.2f", AO_Strength());
+		break;
 	default:
 		snprintf(buf, n, "%d", Shadows_TweaksOn() ? 1 : 0);
 		break;
@@ -117,6 +134,8 @@ static void SaveDirty()
 		else
 			LogWarn("Tuning: could not write [%s] %s=%s to %s (error %lu)", kIniSections[i], kIniKeys[i], v, IniPath(),
 				GetLastError());
+		if (i == ITEM_AO_MODE)
+			IniWrite("AmbientOcclusion", "StartEnabled", AO_Active() ? "1" : "0");
 	}
 	g_dirty = 0;
 }
@@ -137,6 +156,15 @@ static void FormatValue(int item, char* buf, size_t n)
 	case ITEM_SOFT_WIDTH:
 		snprintf(buf, n, "%d (%d taps)%s", SoftShadows_LiveWidth(), (SoftShadows_LiveWidth() + 1) * (SoftShadows_LiveWidth() + 1),
 			SoftShadows_Active() ? "" : "  [off: F6]");
+		break;
+	case ITEM_AO_MODE:
+		snprintf(buf, n, "%s", !AO_Enabled() ? "n/a (Enabled=0)" : kAoModes[AoMode()]);
+		break;
+	case ITEM_AO_RADIUS:
+		snprintf(buf, n, "%.2f m", AO_Radius());
+		break;
+	case ITEM_AO_STRENGTH:
+		snprintf(buf, n, "%.2f", AO_Strength());
 		break;
 	default:
 		snprintf(buf, n, "%s", !Shadows_Installed() ? "n/a" : Shadows_TweaksOn() ? "ON" : "OFF");
@@ -162,6 +190,22 @@ static void Change(int item, int dir)
 	}
 	case ITEM_SOFT_WIDTH:
 		SoftShadows_SetLiveWidth(SoftShadows_LiveWidth() + dir); // clamped to 1..4
+		break;
+	case ITEM_AO_MODE:
+	{
+		if (!AO_Enabled())
+			return;
+		int mode = AoMode() + dir;
+		mode = mode < 0 ? 0 : mode > 3 ? 3 : mode;
+		AO_SetOn(mode >= 1);
+		AO_SetView(mode >= 2 ? mode - 1 : 0);
+		break;
+	}
+	case ITEM_AO_RADIUS:
+		AO_SetRadius(AO_Radius() + 0.25f * dir);
+		break;
+	case ITEM_AO_STRENGTH:
+		AO_SetStrength(AO_Strength() + 0.25f * dir);
 		break;
 	default:
 		if (!Shadows_Installed())
@@ -315,7 +359,7 @@ void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight
 		int right = (int)bbWidth - (int)g_fontHeight;
 		int y = (int)g_fontHeight / 2;
 		int step = (int)(g_fontHeight * 1.25f);
-		DrawLine(y, right, "AC2 Shadow Overhaul  (1-6 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
+		DrawLine(y, right, "AC2 Shadow Overhaul  (1-9 select, +/- change)", D3DCOLOR_XRGB(200, 200, 200));
 		y += step;
 		for (int i = 0; i < ITEM_COUNT; i++)
 		{
@@ -353,7 +397,7 @@ bool Tuning_Init()
 	g_visible = IniInt("DebugMenu", "StartVisible", 1) != 0;
 	g_save = IniInt("DebugMenu", "SaveChanges", 1) != 0;
 	SoftShadows_SetBuildAllWidths(true);
-	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-6 select, +/- change; changes %s).", g_menuKey,
+	LogInfo("Debug menu enabled (key 0x%02X shows/hides it; 1-9 select, +/- change; changes %s).", g_menuKey,
 		g_save ? "saved to the ini" : "not saved");
 	return true;
 }

@@ -14,6 +14,7 @@ struct MockSurface : Gen_IDirect3DSurface9
 	LONG ref = 1;
 	D3DSURFACE_DESC desc = {};
 	MockTexture* container = nullptr;
+	bool depthCopy = false; // an INTZ texture was drawn into this target (see DrawPrimitiveUP)
 	std::vector<unsigned char> data;
 	UINT Bpp() const { return desc.Format == D3DFMT_R32F || desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8 ? 4 : desc.Format == D3DFMT_R16F ? 2 : 8; }
 	void Alloc()
@@ -104,8 +105,232 @@ struct MockPS : Gen_IDirect3DPixelShader9
 	}
 };
 
+struct MockVS : IDirect3DVertexShader9
+{
+	std::vector<DWORD> code;
+	STDMETHOD(QueryInterface)(REFIID, void** out) override
+	{
+		*out = nullptr;
+		return E_NOINTERFACE;
+	}
+	STDMETHOD_(ULONG, AddRef)() override { return 1; }
+	STDMETHOD_(ULONG, Release)() override { return 0; }
+	STDMETHOD(GetDevice)(IDirect3DDevice9** out) override
+	{
+		*out = nullptr;
+		return E_NOTIMPL;
+	}
+	STDMETHOD(GetFunction)(void* data, UINT* size) override
+	{
+		*size = (UINT)(code.size() * 4);
+		if (data)
+			memcpy(data, code.data(), code.size() * 4);
+		return S_OK;
+	}
+};
+
+static const D3DFORMAT kINTZ = (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z');
+
+struct MockStateBlock : IDirect3DStateBlock9
+{
+	int captures = 0, applies = 0;
+	IDirect3DPixelShader9** livePs = nullptr; // the device's current pixel shader (saved and restored)
+	IDirect3DPixelShader9* savedPs = nullptr;
+	STDMETHOD(QueryInterface)(REFIID, void** out) override
+	{
+		*out = nullptr;
+		return E_NOINTERFACE;
+	}
+	STDMETHOD_(ULONG, AddRef)() override { return 1; }
+	STDMETHOD_(ULONG, Release)() override { return 0; }
+	STDMETHOD(GetDevice)(IDirect3DDevice9** out) override
+	{
+		*out = nullptr;
+		return E_NOTIMPL;
+	}
+	STDMETHOD(Capture)() override
+	{
+		captures++;
+		savedPs = *livePs;
+		return S_OK;
+	}
+	STDMETHOD(Apply)() override
+	{
+		applies++;
+		*livePs = savedPs;
+		return S_OK;
+	}
+};
+
+struct MockDecl : IDirect3DVertexDeclaration9
+{
+	STDMETHOD(QueryInterface)(REFIID, void** out) override
+	{
+		*out = nullptr;
+		return E_NOINTERFACE;
+	}
+	STDMETHOD_(ULONG, AddRef)() override { return 1; }
+	STDMETHOD_(ULONG, Release)() override { return 0; }
+	STDMETHOD(GetDevice)(IDirect3DDevice9** out) override
+	{
+		*out = nullptr;
+		return E_NOTIMPL;
+	}
+	STDMETHOD(GetDeclaration)(D3DVERTEXELEMENT9*, UINT* n) override
+	{
+		*n = 0;
+		return S_OK;
+	}
+};
+
+// What the AO passes did, for the test exe (GetProcAddress(d3d9, "MockAoStats")).
+struct MockAoStats
+{
+	int draws;                 // DrawPrimitiveUP / DrawIndexedPrimitive calls
+	int colorFills;
+	int stateCaptures, stateApplies;
+	IDirect3DSurface9* lastRt0; // target of the last draw
+	DWORD lastBlendOp, lastAlphaBlend;
+	IDirect3DPixelShader9* lastPs;
+};
+static MockAoStats g_stats;
+extern "C" __declspec(dllexport) MockAoStats* WINAPI MockGetStats() { return &g_stats; }
+
 struct MockDevice : Gen_IDirect3DDevice9
 {
+	float vsConst[256 * 4] = {}, psConst[224 * 4] = {};
+	IDirect3DPixelShader9* curPs = nullptr;
+	IDirect3DSurface9* rt0 = nullptr;
+	IDirect3DSurface9* rts[4] = {};
+	IDirect3DBaseTexture9* tex0 = nullptr;
+	DWORD blendOp = D3DBLENDOP_ADD, alphaBlend = FALSE;
+	MockStateBlock* sb = nullptr;
+	STDMETHOD(SetRenderTarget)(DWORD i, IDirect3DSurface9* s) override
+	{
+		if (i >= 4 || (i == 0 && !s))
+			return D3DERR_INVALIDCALL;
+		if (i == 0)
+			rt0 = s;
+		rts[i] = s;
+		return S_OK;
+	}
+	STDMETHOD(GetRenderTarget)(DWORD i, IDirect3DSurface9** out) override
+	{
+		*out = i < 4 ? rts[i] : nullptr;
+		if (!*out)
+			return D3DERR_NOTFOUND;
+		(*out)->AddRef();
+		return S_OK;
+	}
+	STDMETHOD(SetRenderState)(D3DRENDERSTATETYPE st, DWORD v) override
+	{
+		if (st == D3DRS_BLENDOP)
+			blendOp = v;
+		if (st == D3DRS_ALPHABLENDENABLE)
+			alphaBlend = v;
+		return S_OK;
+	}
+	STDMETHOD(GetDeviceCaps)(D3DCAPS9* caps) override
+	{
+		memset(caps, 0, sizeof(*caps));
+		caps->NumSimultaneousRTs = 4;
+		caps->PrimitiveMiscCaps = D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS | D3DPMISCCAPS_MRTPOSTPIXELSHADERBLENDING;
+		caps->PixelShaderVersion = D3DPS_VERSION(3, 0);
+		caps->VertexShaderVersion = D3DVS_VERSION(3, 0);
+		caps->MaxPixelShader30InstructionSlots = 32768;
+		caps->MaxPShaderInstructionsExecuted = 65535;
+		return S_OK;
+	}
+	STDMETHOD(CreateStateBlock)(D3DSTATEBLOCKTYPE, IDirect3DStateBlock9** out) override
+	{
+		sb = new MockStateBlock;
+		sb->livePs = &curPs;
+		sb->savedPs = curPs;
+		*out = sb;
+		return S_OK;
+	}
+	STDMETHOD(CreateVertexDeclaration)(const D3DVERTEXELEMENT9*, IDirect3DVertexDeclaration9** out) override
+	{
+		*out = new MockDecl;
+		return S_OK;
+	}
+	STDMETHOD(ColorFill)(IDirect3DSurface9*, const RECT*, D3DCOLOR) override
+	{
+		g_stats.colorFills++;
+		return S_OK;
+	}
+	void NoteDraw()
+	{
+		g_stats.draws++;
+		g_stats.lastRt0 = rt0;
+		g_stats.lastBlendOp = blendOp;
+		g_stats.lastAlphaBlend = alphaBlend;
+		g_stats.lastPs = curPs;
+		if (sb)
+		{
+			g_stats.stateCaptures = sb->captures;
+			g_stats.stateApplies = sb->applies;
+		}
+	}
+	STDMETHOD(DrawIndexedPrimitive)(D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT) override
+	{
+		NoteDraw();
+		return S_OK;
+	}
+	STDMETHOD(SetTexture)(DWORD stage, IDirect3DBaseTexture9* t) override
+	{
+		if (stage == 0)
+			tex0 = t;
+		return S_OK;
+	}
+	// Drawing an INTZ texture into a target marks it as a depth copy, which GetRenderTargetData then
+	// fills with the fake depth minus an "object" (to test the dump's depth comparison).
+	STDMETHOD(DrawPrimitiveUP)(D3DPRIMITIVETYPE, UINT, const void*, UINT) override
+	{
+		NoteDraw();
+		auto t = static_cast<MockTexture*>(static_cast<IDirect3DTexture9*>(tex0));
+		if (t && rt0 && t->count && t->levels[0]->desc.Format == kINTZ)
+			static_cast<MockSurface*>(rt0)->depthCopy = true;
+		return S_OK;
+	}
+	STDMETHOD(SetVertexShaderConstantF)(UINT r, const float* v, UINT n) override
+	{
+		if (r + n <= 256)
+			memcpy(&vsConst[r * 4], v, n * 16);
+		return S_OK;
+	}
+	STDMETHOD(GetVertexShaderConstantF)(UINT r, float* v, UINT n) override
+	{
+		if (r + n > 256)
+			return D3DERR_INVALIDCALL;
+		memcpy(v, &vsConst[r * 4], n * 16);
+		return S_OK;
+	}
+	STDMETHOD(SetPixelShaderConstantF)(UINT r, const float* v, UINT n) override
+	{
+		if (r + n <= 224)
+			memcpy(&psConst[r * 4], v, n * 16);
+		return S_OK;
+	}
+	STDMETHOD(GetPixelShaderConstantF)(UINT r, float* v, UINT n) override
+	{
+		if (r + n > 224)
+			return D3DERR_INVALIDCALL;
+		memcpy(v, &psConst[r * 4], n * 16);
+		return S_OK;
+	}
+	STDMETHOD(CreateVertexShader)(const DWORD* code, IDirect3DVertexShader9** out) override
+	{
+		auto vs = new MockVS;
+		for (size_t i = 0; code; i++)
+		{
+			vs->code.push_back(code[i]);
+			if (code[i] == 0x0000FFFF)
+				break;
+		}
+		*out = vs;
+		return S_OK;
+	}
 	MockSurface* bb;
 	MockSurface* ds;
 	int presents = 0;
@@ -113,6 +338,7 @@ struct MockDevice : Gen_IDirect3DDevice9
 	{
 		bb = NewSurface(pp->BackBufferWidth, pp->BackBufferHeight, pp->BackBufferFormat, D3DUSAGE_RENDERTARGET, pp->MultiSampleType);
 		ds = NewSurface(pp->BackBufferWidth, pp->BackBufferHeight, pp->AutoDepthStencilFormat, D3DUSAGE_DEPTHSTENCIL, pp->MultiSampleType);
+		rt0 = rts[0] = bb;
 	}
 	STDMETHOD_(ULONG, AddRef)() override { return 1; }
 	STDMETHOD_(ULONG, Release)() override { return 0; }
@@ -175,7 +401,13 @@ struct MockDevice : Gen_IDirect3DDevice9
 		if (s->desc.Format == D3DFMT_R32F)
 			for (UINT y = 0; y < s->desc.Height; y++)
 				for (UINT x = 0; x < s->desc.Width; x++)
-					((float*)s->data.data())[y * s->desc.Width + x] = y < s->desc.Height / 3 ? 1.0f : 0.5f * (1.0f - (float)y / s->desc.Height) + 0.001f * x / s->desc.Width;
+				{
+					float v = y < s->desc.Height / 3 ? 1.0f : 0.5f * (1.0f - (float)y / s->desc.Height) + 0.001f * x / s->desc.Width;
+					bool hole = x >= s->desc.Width / 4 && x < s->desc.Width / 2 && y >= s->desc.Height / 2 && y < s->desc.Height * 3 / 4;
+					if (s->depthCopy && hole)
+						v = 1.0f - (1.0f - v) * 0.5f; // the depth buffer sees twice as far here
+					((float*)s->data.data())[y * s->desc.Width + x] = v;
+				}
 		d->data = s->data;
 		return S_OK;
 	}
@@ -184,7 +416,6 @@ struct MockDevice : Gen_IDirect3DDevice9
 		*v = st == D3DRS_COLORWRITEENABLE ? 0xF : 1;
 		return S_OK;
 	}
-	IDirect3DPixelShader9* curPs = nullptr;
 	STDMETHOD(SetPixelShader)(IDirect3DPixelShader9* ps) override
 	{
 		curPs = ps;

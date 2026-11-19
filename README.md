@@ -16,13 +16,18 @@ blocky, and past a point the game crashes. AC2 Shadow Overhaul fixes all three.
 - **Soft shadows.** The game blends shadow edges across a single shadow-map texel, which looks
   blocky once the shadows are stretched. This widens that blend to 2-4 texels (up to 25 samples)
   by rewriting the game's shadow shaders as they load. The cascades stay seam-free.
+- **Ambient occlusion.** Darkens the game's ambient and bounce light in corners, creases, under
+  ledges and around characters, worked out from the scene depth every frame (GTAO, at half
+  resolution). It is applied inside the game's own lighting, so sunlight, fog, the sky and
+  transparent effects are left alone - unlike a post-process AO, which darkens all of them.
+  Radius and strength are in the ini and the tuning menu; F5 switches it on and off.
 - **Crash fix.** The game keeps shadow casters in fixed-size lists with no bounds check, so long
   shadow distances crashed it. The lists are enlarged, and anything that still doesn't fit is
   skipped instead of corrupting memory.
 - **Live tuning.** An optional in-game menu (top right) changes every setting on the fly. Number
   keys select a setting and `+` / `-` change it; changes are saved to the ini.
 - **Before/after hotkeys.** F7 switches the distance tweaks between your settings and vanilla; F6
-  switches soft shadows on and off.
+  switches soft shadows on and off; F5 switches ambient occlusion on and off.
 - **Safe by design.** Every patch is found by byte signature and is skipped if the exe doesn't
   match. Shaders it doesn't recognise are left untouched. If the game crashes,
   `AC2ShadowOverhaul.log` records where (logging is off by default: set `[Debug] EnableLogging=1`
@@ -81,7 +86,8 @@ All configurable in the ini.
 |---|---|
 | F7 | distance tweaks: your settings / vanilla |
 | F6 | soft shadows: on / the game's filter |
-| F9 | show/hide the tuning menu (needs `[DebugMenu] Enabled=1`); 1-6 select, `+`/`-` change |
+| F5 | ambient occlusion: on / off |
+| F9 | show/hide the tuning menu (needs `[DebugMenu] Enabled=1`); 1-9 select, `+`/`-` change |
 | F8 | frame dump (diagnostic, `[Debug] FrameDump=1`) |
 
 ## Building
@@ -99,8 +105,10 @@ This writes `dist/scripts/AC2ShadowOverhaul.asi` (+ ini).
 
 `tests/run_tests.sh [path-to-llvm-mingw/bin]` builds the mod and runs the offline tests, which need
 neither the game nor a GPU: an end-to-end test with a fake `d3d9.dll` (shader rewrite, hotkeys, menu,
-ini saving) and, if you have exported shaders, a test that runs the soft shadow rewriter over real
-game shaders. See the comments at the top of each file in `tests/` for the others.
+ini saving, the AO passes), the AO shaders run on Windows' software renderer (WARP) over a synthetic
+scene, and, if you have exported shaders, tests that run the soft shadow and AO rewriters over real
+game shaders. After editing `src/shaders/ao.hlsl`, regenerate `src/shaders_gen.h` with
+`tools/gen_shaders.c` (instructions at its top). See the comments at the top of each file in `tests/` for the others.
 
 `re/` holds the small scripts used to find the hook sites in the exe. They work on a disassembly you
 generate yourself from your own copy of the game; none of the game's code or data is in this repo.
@@ -111,6 +119,11 @@ generate yourself from your own copy of the game; none of the game's code or dat
   visibility-distance setter; the render list capacity patch and its guards are in `src/shadows.cpp`.
 - Soft shadows (`src/softshadows.cpp`) rewrite the SM3 pixel shaders that sample the shadow atlas,
   replacing the game's 4-tap bilinear filter with an N x N box filter clamped to each cascade's tile.
+- Ambient occlusion (`src/aoshader.cpp`, `src/ao.cpp`, `src/shaders/ao.hlsl`): each shader of the
+  main opaque pass gets an extra output holding its indirect light (traced through the shader from
+  the ambient cube and the world lightmap to where the sun term is added). After the opaque pass,
+  GTAO is computed from the game's own z/w target, blurred, and the occluded share of that indirect
+  light is subtracted from the scene, before the sky and transparents are drawn.
 - `src/framedump.cpp` hooks D3D9 (through `Direct3DCreate9`, so it works under ReShade) to rewrite
   shaders as they are created and to produce the F8 frame dump.
 - `src/crashlog.cpp` logs the faulting address, stack and address-space use when the game crashes.

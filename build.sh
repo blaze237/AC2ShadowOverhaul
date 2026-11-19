@@ -14,7 +14,7 @@ mkdir -p dist/scripts
 "$CXX" -shared -O2 -std=c++17 -fms-extensions -fasm-blocks -Wall -Wno-unused-function \
 	-DWIN32_LEAN_AND_MEAN -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS \
 	-fuse-ld=lld -static -static-libgcc -static-libstdc++ -s \
-	-o dist/scripts/AC2ShadowOverhaul.asi src/main.cpp src/common.cpp src/shadows.cpp src/framedump.cpp src/crashlog.cpp src/softshadows.cpp src/tuning.cpp
+	-o dist/scripts/AC2ShadowOverhaul.asi src/main.cpp src/common.cpp src/shadows.cpp src/framedump.cpp src/crashlog.cpp src/softshadows.cpp src/tuning.cpp src/ao.cpp src/aoshader.cpp
 cp AC2ShadowOverhaul.ini dist/scripts/
 cp README.md LICENSE dist/
 ls -l dist dist/scripts

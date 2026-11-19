@@ -25,5 +25,7 @@ SLOT(IDirect3DDevice9Vtbl, DrawPrimitive, 81);
 SLOT(IDirect3DDevice9Vtbl, DrawIndexedPrimitive, 82);
 SLOT(IDirect3DDevice9Vtbl, DrawPrimitiveUP, 83);
 SLOT(IDirect3DDevice9Vtbl, DrawIndexedPrimitiveUP, 84);
+SLOT(IDirect3DDevice9Vtbl, CreateVertexShader, 91);
+SLOT(IDirect3DDevice9Vtbl, SetVertexShader, 92);
 SLOT(IDirect3DDevice9Vtbl, CreatePixelShader, 106);
 SLOT(IDirect3DDevice9Vtbl, SetPixelShader, 107);

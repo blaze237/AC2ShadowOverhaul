@@ -3,12 +3,19 @@
 // when the hotkey is pressed. Used to work out which of AC2's depth buffers is the real scene
 // depth and where in the frame effects such as AO should be injected.
 //
+// With [Debug] FrameDumpDepth the game's depth buffers are created as INTZ textures, so the dump
+// can also read them back and compare each with the game's own z/w target (to see whether the
+// depth prepass holds the whole scene). Every shader drawn is exported with the values of its
+// named constants at its first draw (camera matrices, sun direction, ambient terms...).
+//
 // Hooks: the game's import of d3d9!Direct3DCreate9 -> IDirect3D9::CreateDevice -> the device
 // vtable. If ReShade is installed as d3d9.dll these are ReShade's wrapper objects, so we see the
 // calls exactly as the game makes them, and the return addresses point into the game exe.
 
 #include "common.h"
 #include "softshadows.h"
+#include "ao.h"
+#include "shaders_gen.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -43,11 +50,19 @@ enum
 	DEV_DrawIndexedPrimitive = 82,
 	DEV_DrawPrimitiveUP = 83,
 	DEV_DrawIndexedPrimitiveUP = 84,
+	DEV_CreateVertexShader = 91,
+	DEV_SetVertexShader = 92,
 	DEV_CreatePixelShader = 106,
 	DEV_SetPixelShader = 107,
 };
 
 static const GUID kIID_Texture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
+static const D3DFORMAT kFmtINTZ = (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z');
+
+// [Debug] FrameDumpDepth: the game's depth buffers are created as INTZ depth textures (same
+// 24-bit depth + 8-bit stencil, but readable from a shader) so the dump can read them back.
+static bool g_readableDepth = false;
+static bool g_intzSupported = false;
 
 static int g_hotkey = VK_F8;
 static int g_framesToCapture = 1;
@@ -141,6 +156,7 @@ struct Res
 	std::string creator;
 	bool isTexture = false; // can be bound with SetTexture
 	bool transient = false; // resolved lazily during a dump; dropped at the next dump
+	bool intz = false;      // depth surface we created as level 0 of an INTZ texture
 };
 
 static std::unordered_map<void*, Res> g_res;
@@ -260,6 +276,7 @@ static std::string SurfName(IDirect3DSurface9* s, bool full)
 // ---- Shader hashes -----------------------------------------------------------------------------
 
 static std::unordered_map<void*, uint32_t> g_psHash;
+static std::unordered_map<void*, uint32_t> g_vsHash;
 // Soft shadows: shader handed to the game (rewritten) -> the game's original shader, used when
 // soft shadows are toggled off and for exporting the original bytecode.
 struct SoftSet
@@ -277,6 +294,12 @@ struct SoftSet
 	}
 };
 static std::unordered_map<void*, SoftSet> g_softOriginal;
+// With the frame dump on: the game's own bytecode of every pixel shader we changed (soft shadows
+// and/or the AO output), so dumps export what the game shipped.
+static std::unordered_map<void*, std::vector<DWORD>> g_gameCode;
+// Pixel shaders (as the game knows them) that write the AO output; drawing anything else in the
+// opaque pass leaves the AO target undefined there, which gets logged.
+static std::unordered_map<void*, bool> g_aoOutput;
 static volatile bool g_softAny = false;
 static LONG g_softRewritten = 0, g_softSkipped = 0, g_softFailed = 0;
 
@@ -307,6 +330,7 @@ static IDirect3DSurface9* g_rt[4];
 static IDirect3DSurface9* g_ds;
 static IDirect3DBaseTexture9* g_tex[kTexStages];
 static void* g_ps;
+static void* g_vs;
 static D3DVIEWPORT9 g_vp;
 
 static void ResetTrackedState(IDirect3DSurface9* bb, IDirect3DSurface9* autoDepth)
@@ -316,6 +340,7 @@ static void ResetTrackedState(IDirect3DSurface9* bb, IDirect3DSurface9* autoDept
 	g_rt[0] = bb;
 	g_ds = autoDepth;
 	g_ps = nullptr;
+	g_vs = nullptr;
 	memset(&g_vp, 0, sizeof(g_vp));
 }
 
@@ -342,6 +367,31 @@ struct ShadowPs
 	int stage, draws;
 };
 static std::vector<ShadowPs> g_shadowPs;
+
+// How each depth buffer was used this capture (to tell the prepass buffer from the main one, and
+// the viewport depth range its values were written with).
+struct DepthUse
+{
+	int draws = 0, zWrite = 0, colourOff = 0, firstEvent = 0;
+	float minZ = 0, maxZ = 1; // viewport depth range of the last depth-writing draw
+	bool mixedRange = false;  // depth-writing draws used more than one viewport depth range
+};
+static std::unordered_map<void*, DepthUse> g_depthUse;
+static std::vector<void*> g_capDepth; // depth surfaces in order of first use (alive this frame)
+
+// Shader constants at the first draw of each vertex / pixel shader this capture, to find where
+// the game keeps its camera matrices, sun direction, ambient terms and so on.
+enum { kVsConsts = 256, kPsConsts = 224, kMaxSnaps = 400 };
+struct ShaderSnap
+{
+	void* shader;
+	bool vertex;
+	int draws, event;
+	std::string bindings;
+	std::vector<float> consts; // float4 registers c0..
+};
+static std::vector<ShaderSnap> g_snaps;
+static std::unordered_map<void*, size_t> g_snapIndex[2]; // [vertex]
 
 // The sun shadow atlas: a render-target texture four cascades wide (e.g. 16384x4096 R32F).
 static bool IsShadowAtlas(const Res& r)
@@ -434,8 +484,57 @@ static void OnDraw(IDirect3DDevice9* dev, UINT prims)
 	}
 	if (blend)
 		g_seg.blend++;
-	if (!(colorWrite & 0xF) || !g_rt[0])
+	bool colourOff = !(colorWrite & 0xF) || !g_rt[0];
+	if (colourOff)
 		g_seg.noColor++;
+	if (g_ds)
+	{
+		auto ins = g_depthUse.emplace(g_ds, DepthUse());
+		DepthUse& u = ins.first->second;
+		if (ins.second)
+		{
+			u.firstEvent = g_event;
+			g_capDepth.push_back(g_ds);
+		}
+		u.draws++;
+		if (colourOff)
+			u.colourOff++;
+		if (zEnable && zWrite)
+		{
+			if (u.zWrite && (u.minZ != g_vp.MinZ || u.maxZ != g_vp.MaxZ))
+				u.mixedRange = true;
+			u.zWrite++;
+			u.minZ = g_vp.MinZ;
+			u.maxZ = g_vp.MaxZ;
+		}
+	}
+	for (int vertex = 0; vertex < 2; vertex++)
+	{
+		void* sh = vertex ? g_vs : g_ps;
+		if (!sh)
+			continue;
+		auto it = g_snapIndex[vertex].find(sh);
+		if (it != g_snapIndex[vertex].end())
+		{
+			g_snaps[it->second].draws++;
+			continue;
+		}
+		if (g_snaps.size() >= kMaxSnaps)
+			continue;
+		ShaderSnap sn;
+		sn.shader = sh;
+		sn.vertex = vertex != 0;
+		sn.draws = 1;
+		sn.event = g_event;
+		sn.bindings = Bindings();
+		sn.consts.assign((vertex ? kVsConsts : kPsConsts) * 4, 0.0f);
+		if (vertex)
+			dev->GetVertexShaderConstantF(0, sn.consts.data(), kVsConsts);
+		else
+			dev->GetPixelShaderConstantF(0, sn.consts.data(), kPsConsts);
+		g_snapIndex[vertex][sh] = g_snaps.size();
+		g_snaps.push_back(std::move(sn));
+	}
 	if (std::find(g_seg.ps.begin(), g_seg.ps.end(), g_ps) == g_seg.ps.end())
 		g_seg.ps.push_back(g_ps);
 	for (int i = 0; i < kTexStages; i++)
@@ -472,6 +571,11 @@ static void BeginCapture()
 	g_seg = Segment();
 	g_capTex.clear();
 	g_shadowPs.clear();
+	g_depthUse.clear();
+	g_capDepth.clear();
+	g_snaps.clear();
+	g_snapIndex[0].clear();
+	g_snapIndex[1].clear();
 	g_framesLeft = g_framesToCapture;
 
 	SYSTEMTIME t;
@@ -533,15 +637,16 @@ static void PngChunk(std::string& out, const char* type, const std::string& data
 	Put32(out, Crc32((const unsigned char*)body.data(), body.size()) ^ 0xFFFFFFFFu);
 }
 
-// 8-bit greyscale PNG, uncompressed (stored deflate blocks).
-static bool WriteGreyPng(const char* path, const std::vector<unsigned char>& px, unsigned w, unsigned h)
+// 8-bit greyscale (channels 1) or RGB (channels 3) PNG, uncompressed (stored deflate blocks).
+static bool WritePng(const char* path, const std::vector<unsigned char>& px, unsigned w, unsigned h, unsigned channels = 1)
 {
 	std::string raw;
-	raw.reserve((size_t)(w + 1) * h);
+	size_t row = (size_t)w * channels;
+	raw.reserve((row + 1) * h);
 	for (unsigned y = 0; y < h; y++)
 	{
 		raw += '\0';
-		raw.append((const char*)&px[(size_t)y * w], w);
+		raw.append((const char*)&px[(size_t)y * row], row);
 	}
 	std::string z("\x78\x01", 2);
 	size_t pos = 0;
@@ -569,7 +674,7 @@ static bool WriteGreyPng(const char* path, const std::vector<unsigned char>& px,
 	std::string ihdr;
 	Put32(ihdr, w);
 	Put32(ihdr, h);
-	ihdr += std::string("\x08\x00\x00\x00\x00", 5); // 8-bit greyscale
+	ihdr += std::string(channels == 3 ? "\x08\x02\x00\x00\x00" : "\x08\x00\x00\x00\x00", 5); // 8-bit grey / RGB
 	PngChunk(png, "IHDR", ihdr);
 	PngChunk(png, "IDAT", z);
 	PngChunk(png, "IEND", "");
@@ -596,86 +701,6 @@ static float HalfToFloat(uint16_t h)
 	float f;
 	memcpy(&f, &bits, 4);
 	return f;
-}
-
-static std::string ReadbackFloatTarget(IDirect3DDevice9* dev, IDirect3DTexture9* tex, const D3DSURFACE_DESC& d, const char* pngPath)
-{
-	IDirect3DSurface9 *src = nullptr, *sys = nullptr;
-	std::string result;
-	if (FAILED(tex->GetSurfaceLevel(0, &src)) || !src)
-		return "GetSurfaceLevel failed";
-	if (FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, NULL)) || !sys)
-	{
-		src->Release();
-		return "CreateOffscreenPlainSurface failed";
-	}
-	D3DLOCKED_RECT lr;
-	if (FAILED(dev->GetRenderTargetData(src, sys)) || FAILED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY)))
-	{
-		result = "GetRenderTargetData/LockRect failed";
-	}
-	else
-	{
-		std::vector<float> v((size_t)d.Width * d.Height);
-		for (UINT y = 0; y < d.Height; y++)
-		{
-			const unsigned char* row = (const unsigned char*)lr.pBits + (size_t)y * lr.Pitch;
-			for (UINT x = 0; x < d.Width; x++)
-				v[(size_t)y * d.Width + x] = d.Format == D3DFMT_R32F ? ((const float*)row)[x] : HalfToFloat(((const uint16_t*)row)[x]);
-		}
-		sys->UnlockRect();
-
-		const float clearValue = 1.0f; // the game clears its float targets to white
-		std::vector<float> geo;
-		geo.reserve(v.size() / 4);
-		size_t cleared = 0, above1 = 0, negative = 0, samples = 0;
-		for (size_t i = 0; i < v.size(); i += 4) // every 4th pixel is plenty for statistics
-		{
-			samples++;
-			if (v[i] == clearValue)
-				cleared++;
-			else
-				geo.push_back(v[i]);
-			if (v[i] > 1.0f)
-				above1++;
-			if (v[i] < 0.0f)
-				negative++;
-		}
-		std::sort(geo.begin(), geo.end());
-		auto pct = [&](double p) { return geo.empty() ? 0.0f : geo[(size_t)(p * (geo.size() - 1))]; };
-		float lo = pct(0.01), hi = pct(0.99);
-		auto at = [&](double fx, double fy) { return v[(size_t)(fy * (d.Height - 1)) * d.Width + (size_t)(fx * (d.Width - 1))]; };
-		char buf[700];
-		snprintf(buf, sizeof(buf),
-			"%s %ux%u | cleared (==1.0) %.1f%% | >1.0 %.1f%% | <0 %.1f%% | geometry min %g p1 %g p25 %g p50 %g p75 %g p99 %g max %g | "
-			"centre %g, lower-centre %g, left %g, right %g",
-			FormatName(d.Format).c_str(), d.Width, d.Height, 100.0 * cleared / samples, 100.0 * above1 / samples,
-			100.0 * negative / samples, geo.empty() ? 0.0f : geo.front(), lo, pct(0.25), pct(0.5), pct(0.75), hi,
-			geo.empty() ? 0.0f : geo.back(), at(0.5, 0.5), at(0.5, 0.75), at(0.25, 0.5), at(0.75, 0.5));
-		result = buf;
-
-		// Image: geometry stretched from p1 (black) to p99 (light grey), cleared pixels white.
-		unsigned step = (d.Width + 1279) / 1280;
-		unsigned ow = d.Width / step, oh = d.Height / step;
-		std::vector<unsigned char> px((size_t)ow * oh);
-		float range = hi > lo ? hi - lo : 1.0f;
-		for (unsigned y = 0; y < oh; y++)
-			for (unsigned x = 0; x < ow; x++)
-			{
-				float f = v[(size_t)(y * step) * d.Width + x * step];
-				float n = (f - lo) / range;
-				n = n < 0 ? 0 : (n > 1 ? 1 : n);
-				px[(size_t)y * ow + x] = f == clearValue ? 255 : (unsigned char)(sqrtf(n) * 230.0f);
-			}
-		if (WriteGreyPng(pngPath, px, ow, oh))
-		{
-			const char* name = strrchr(pngPath, '\\');
-			result += std::string(" | image ") + (name ? name + 1 : pngPath);
-		}
-	}
-	sys->Release();
-	src->Release();
-	return result;
 }
 
 // ---- Shadow shader export ----------------------------------------------------------------------
@@ -770,6 +795,37 @@ static bool ShaderDeclaresSampler(const DWORD* code, size_t count, int stage)
 	return false;
 }
 
+static std::vector<DWORD> ShaderCode(void* shader, bool vertex)
+{
+	UINT size = 0;
+	std::vector<DWORD> code;
+	if (vertex)
+	{
+		auto vs = (IDirect3DVertexShader9*)shader;
+		if (FAILED(vs->GetFunction(nullptr, &size)) || !size || size > (1u << 20))
+			return code;
+		code.resize((size + 3) / 4);
+		if (FAILED(vs->GetFunction(code.data(), &size)))
+			code.clear();
+	}
+	else
+	{
+		{
+			Lock l;
+			auto it = g_gameCode.find(shader);
+			if (it != g_gameCode.end())
+				return it->second; // the game's original, not our rewrite
+		}
+		auto ps = (IDirect3DPixelShader9*)shader;
+		if (FAILED(ps->GetFunction(nullptr, &size)) || !size || size > (1u << 20))
+			return code;
+		code.resize((size + 3) / 4);
+		if (FAILED(ps->GetFunction(code.data(), &size)))
+			code.clear();
+	}
+	return code;
+}
+
 static void ExportShadowShaders(const char* base)
 {
 	std::vector<ShadowPs> list;
@@ -789,18 +845,9 @@ static void ExportShadowShaders(const char* base)
 	std::vector<Found> found;
 	for (const ShadowPs& sp : list)
 	{
-		auto ps = (IDirect3DPixelShader9*)sp.ps;
-		{
-			Lock l;
-			auto it = g_softOriginal.find(sp.ps);
-			if (it != g_softOriginal.end() && it->second.original)
-				ps = it->second.original; // export the game's original, not our rewrite
-		}
-		UINT size = 0;
-		if (FAILED(ps->GetFunction(nullptr, &size)) || !size || size > (1u << 20))
-			continue;
-		std::vector<DWORD> code((size + 3) / 4);
-		if (FAILED(ps->GetFunction(code.data(), &size)) || !ShaderDeclaresSampler(code.data(), code.size(), sp.stage))
+		std::vector<DWORD> code = ShaderCode(sp.ps, false); // the game's original, not our rewrite
+		UINT size = (UINT)code.size() * 4;
+		if (code.empty() || !ShaderDeclaresSampler(code.data(), code.size(), sp.stage))
 			continue;
 		uint32_t h = HashShader(code.data());
 		found.push_back({ sp, std::move(code), size, h });
@@ -848,61 +895,7 @@ static void ExportShadowShaders(const char* base)
 	LogInfo("Exported %d shadow-sampling pixel shaders to %s_shaders.txt / %s.", written, base, dir);
 }
 
-static void EndCapture(IDirect3DDevice9* dev)
-{
-	SYSTEMTIME t;
-	GetLocalTime(&t);
-	char base[MAX_PATH];
-	snprintf(base, sizeof(base), "%sAC2ShadowOverhaul_FrameDump_%04d%02d%02d_%02d%02d%02d", ModuleDir(), t.wYear, t.wMonth, t.wDay,
-		t.wHour, t.wMinute, t.wSecond);
-
-	std::string text;
-	{
-		Lock l;
-		FlushSegment();
-		g_capturing = false;
-		Out("");
-		Out("Screen-sized float render targets sampled this frame (read back at Present):");
-		int n = 0;
-		for (void* tex : g_capTex)
-		{
-			auto it = g_res.find(tex);
-			if (it == g_res.end())
-				continue;
-			D3DSURFACE_DESC d = {};
-			auto t9 = (IDirect3DTexture9*)tex;
-			if (FAILED(t9->GetLevelDesc(0, &d)) || d.Width != g_bbW || d.Height != g_bbH)
-				continue;
-			if (d.Format != D3DFMT_R32F && d.Format != D3DFMT_R16F)
-				continue;
-			char png[MAX_PATH];
-			snprintf(png, sizeof(png), "%s_%s.png", base, it->second.name.c_str());
-			Out("  %s: %s", it->second.name.c_str(), ReadbackFloatTarget(dev, t9, d, png).c_str());
-			n++;
-		}
-		if (!n)
-			Out("  (none)");
-		ExportShadowShaders(base);
-		text.swap(g_out);
-	}
-	char path[MAX_PATH];
-	snprintf(path, sizeof(path), "%s.txt", base);
-	FILE* f = fopen(path, "w");
-	if (f)
-	{
-		fwrite(text.data(), 1, text.size(), f);
-		fclose(f);
-		LogInfo("Frame dump written to %s (%d lines).", path, g_lines);
-		MessageBeep(MB_OK);
-	}
-	else
-	{
-		LogWarn("Could not write frame dump to %s.", path);
-	}
-}
-
-// ---- Device hooks ------------------------------------------------------------------------------
-
+// Original device functions (filled in by HookDevice).
 #define ORIG(name, ret, ...) typedef ret(__stdcall* PFN_##name)(IDirect3DDevice9*, ##__VA_ARGS__); static PFN_##name o_##name;
 
 ORIG(Reset, HRESULT, D3DPRESENT_PARAMETERS*)
@@ -923,8 +916,569 @@ ORIG(DrawPrimitive, HRESULT, D3DPRIMITIVETYPE, UINT, UINT)
 ORIG(DrawIndexedPrimitive, HRESULT, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT)
 ORIG(DrawPrimitiveUP, HRESULT, D3DPRIMITIVETYPE, UINT, const void*, UINT)
 ORIG(DrawIndexedPrimitiveUP, HRESULT, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*, D3DFORMAT, const void*, UINT)
+ORIG(CreateVertexShader, HRESULT, const DWORD*, IDirect3DVertexShader9**)
+ORIG(SetVertexShader, HRESULT, IDirect3DVertexShader9*)
 ORIG(CreatePixelShader, HRESULT, const DWORD*, IDirect3DPixelShader9**)
 ORIG(SetPixelShader, HRESULT, IDirect3DPixelShader9*)
+
+
+// Reads level 0 of an R32F / R16F render-target texture into floats.
+static bool ReadFloats(IDirect3DDevice9* dev, IDirect3DTexture9* tex, std::vector<float>& v, UINT& w, UINT& h, std::string& err)
+{
+	D3DSURFACE_DESC d = {};
+	if (FAILED(tex->GetLevelDesc(0, &d)))
+	{
+		err = "GetLevelDesc failed";
+		return false;
+	}
+	if (d.Format != D3DFMT_R32F && d.Format != D3DFMT_R16F)
+	{
+		err = "not R32F / R16F";
+		return false;
+	}
+	IDirect3DSurface9 *src = nullptr, *sys = nullptr;
+	if (FAILED(tex->GetSurfaceLevel(0, &src)) || !src)
+	{
+		err = "GetSurfaceLevel failed";
+		return false;
+	}
+	bool ok = false;
+	if (FAILED(dev->CreateOffscreenPlainSurface(d.Width, d.Height, d.Format, D3DPOOL_SYSTEMMEM, &sys, NULL)) || !sys)
+	{
+		err = "CreateOffscreenPlainSurface failed";
+	}
+	else
+	{
+		D3DLOCKED_RECT lr;
+		if (FAILED(dev->GetRenderTargetData(src, sys)) || FAILED(sys->LockRect(&lr, NULL, D3DLOCK_READONLY)))
+		{
+			err = "GetRenderTargetData/LockRect failed";
+		}
+		else
+		{
+			w = d.Width;
+			h = d.Height;
+			v.resize((size_t)w * h);
+			for (UINT y = 0; y < h; y++)
+			{
+				const unsigned char* row = (const unsigned char*)lr.pBits + (size_t)y * lr.Pitch;
+				for (UINT x = 0; x < w; x++)
+					v[(size_t)y * w + x] = d.Format == D3DFMT_R32F ? ((const float*)row)[x] : HalfToFloat(((const uint16_t*)row)[x]);
+			}
+			sys->UnlockRect();
+			ok = true;
+		}
+		sys->Release();
+	}
+	src->Release();
+	return ok;
+}
+
+static const char* FileName(const char* path)
+{
+	const char* name = strrchr(path, '\\');
+	return name ? name + 1 : path;
+}
+
+// Statistics of a depth-like float image (cleared to 1.0) plus a greyscale picture of it.
+static std::string AnalyseFloats(const std::vector<float>& v, UINT w, UINT h, const char* label, const char* pngPath)
+{
+	const float clearValue = 1.0f; // the game clears its float targets and depth buffers to 1
+	std::vector<float> geo;
+	geo.reserve(v.size() / 4);
+	size_t cleared = 0, above1 = 0, negative = 0, samples = 0;
+	for (size_t i = 0; i < v.size(); i += 4) // every 4th pixel is plenty for statistics
+	{
+		samples++;
+		if (v[i] == clearValue)
+			cleared++;
+		else
+			geo.push_back(v[i]);
+		if (v[i] > 1.0f)
+			above1++;
+		if (v[i] < 0.0f)
+			negative++;
+	}
+	if (!samples)
+		return "empty";
+	std::sort(geo.begin(), geo.end());
+	auto pct = [&](double p) { return geo.empty() ? 0.0f : geo[(size_t)(p * (geo.size() - 1))]; };
+	float lo = pct(0.01), hi = pct(0.99);
+	auto at = [&](double fx, double fy) { return v[(size_t)(fy * (h - 1)) * w + (size_t)(fx * (w - 1))]; };
+	char buf[700];
+	snprintf(buf, sizeof(buf),
+		"%s %ux%u | cleared (==1.0) %.1f%% | >1.0 %.1f%% | <0 %.1f%% | geometry min %g p1 %g p25 %g p50 %g p75 %g p99 %g max %g | "
+		"centre %g, lower-centre %g, left %g, right %g",
+		label, w, h, 100.0 * cleared / samples, 100.0 * above1 / samples, 100.0 * negative / samples, geo.empty() ? 0.0f : geo.front(),
+		lo, pct(0.25), pct(0.5), pct(0.75), hi, geo.empty() ? 0.0f : geo.back(), at(0.5, 0.5), at(0.5, 0.75), at(0.25, 0.5),
+		at(0.75, 0.5));
+	std::string result = buf;
+
+	// Image: geometry from p1 (black) to p99 (light grey), cleared pixels white. The values are z/w,
+	// which bunches everything past a few metres just below 1.0; log(1 - z/w) is log distance
+	// (distance ~ near / (1 - z/w)), so equal grey steps are equal distance ratios.
+	unsigned step = (w + 1279) / 1280;
+	unsigned ow = w / step, oh = h / step;
+	std::vector<unsigned char> px((size_t)ow * oh);
+	auto logDist = [](float f) { return -logf(fmaxf(1.0f - f, 1e-7f)); };
+	float logLo = logDist(lo), logHi = logDist(hi);
+	float range = logHi > logLo ? logHi - logLo : 1.0f;
+	for (unsigned y = 0; y < oh; y++)
+		for (unsigned x = 0; x < ow; x++)
+		{
+			float f = v[(size_t)(y * step) * w + x * step];
+			float n = (logDist(f) - logLo) / range;
+			n = n < 0 ? 0 : (n > 1 ? 1 : n);
+			px[(size_t)y * ow + x] = f == clearValue ? 255 : (unsigned char)(n * 230.0f);
+		}
+	if (WritePng(pngPath, px, ow, oh))
+		result += std::string(" | image ") + FileName(pngPath);
+	return result;
+}
+
+// ---- Depth buffer readback ---------------------------------------------------------------------
+// With [Debug] FrameDumpDepth the game's depth buffers are INTZ textures. To read one, it is drawn
+// into an R32F render target with a tiny pixel shader and that target is read back.
+
+static IDirect3DPixelShader9* g_depthPs; // shaders survive Reset; kept for the device's lifetime
+
+// Our own calls go straight to the original device functions so the dump's tracked bindings stay
+// the game's; render targets, depth buffer and all other state are restored afterwards.
+static bool ReadDepth(IDirect3DDevice9* dev, IDirect3DSurface9* depthSurf, std::vector<float>& v, UINT& w, UINT& h, std::string& err)
+{
+	IDirect3DTexture9* depthTex = nullptr;
+	if (FAILED(depthSurf->GetContainer(kIID_Texture9, (void**)&depthTex)) || !depthTex)
+	{
+		err = "not a texture";
+		return false;
+	}
+	D3DSURFACE_DESC d = {};
+	depthTex->GetLevelDesc(0, &d);
+	if (!g_depthPs && FAILED(o_CreatePixelShader(dev, kDepthToColourPs, &g_depthPs)))
+		g_depthPs = nullptr;
+	IDirect3DTexture9* rt = nullptr;
+	IDirect3DSurface9* rtSurf = nullptr;
+	if (!g_depthPs)
+		err = "could not create the copy shader";
+	else if (FAILED(o_CreateTexture(dev, d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &rt, NULL)) || !rt)
+		err = "could not create an R32F render target";
+	else if (FAILED(rt->GetSurfaceLevel(0, &rtSurf)))
+		rtSurf = nullptr;
+
+	bool ok = false;
+	if (rtSurf)
+	{
+		IDirect3DStateBlock9* sb = nullptr;
+		if (FAILED(dev->CreateStateBlock(D3DSBT_ALL, &sb)))
+			sb = nullptr;
+		IDirect3DSurface9* oldRt[4] = {};
+		IDirect3DSurface9* oldDs = nullptr;
+		for (DWORD i = 0; i < 4; i++)
+			if (FAILED(dev->GetRenderTarget(i, &oldRt[i])))
+				oldRt[i] = nullptr;
+		if (FAILED(dev->GetDepthStencilSurface(&oldDs)))
+			oldDs = nullptr;
+
+		o_SetRenderTarget(dev, 0, rtSurf);
+		for (DWORD i = 1; i < 4; i++)
+			o_SetRenderTarget(dev, i, nullptr);
+		o_SetDepthStencilSurface(dev, nullptr);
+		D3DVIEWPORT9 vp = { 0, 0, d.Width, d.Height, 0.0f, 1.0f };
+		o_SetViewport(dev, &vp);
+		static const D3DRENDERSTATETYPE kOff[] = { D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_ALPHABLENDENABLE,
+			D3DRS_ALPHATESTENABLE, D3DRS_SCISSORTESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_FOGENABLE, D3DRS_CLIPPLANEENABLE,
+			D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_TWOSIDEDSTENCILMODE };
+		for (D3DRENDERSTATETYPE rs : kOff)
+			dev->SetRenderState(rs, 0);
+		dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+		dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+		dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+		o_SetVertexShader(dev, nullptr);
+		dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+		o_SetPixelShader(dev, g_depthPs);
+		o_SetTexture(dev, 0, depthTex);
+		dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+		dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+		dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+		dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+		dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+		dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, 0);
+		struct V
+		{
+			float x, y, z, rhw, u, v;
+		};
+		float fw = (float)d.Width - 0.5f, fh = (float)d.Height - 0.5f; // D3D9 half-pixel offset
+		V quad[4] = { { -0.5f, -0.5f, 0, 1, 0, 0 }, { fw, -0.5f, 0, 1, 1, 0 }, { -0.5f, fh, 0, 1, 0, 1 }, { fw, fh, 0, 1, 1, 1 } };
+		bool began = SUCCEEDED(o_BeginScene(dev));
+		HRESULT hr = o_DrawPrimitiveUP(dev, D3DPT_TRIANGLESTRIP, 2, quad, sizeof(V));
+		if (began)
+			o_EndScene(dev);
+		o_SetTexture(dev, 0, nullptr);
+
+		for (DWORD i = 0; i < 4; i++)
+			if (i > 0 || oldRt[i])
+				o_SetRenderTarget(dev, i, oldRt[i]);
+		o_SetDepthStencilSurface(dev, oldDs);
+		if (sb)
+		{
+			sb->Apply();
+			sb->Release();
+		}
+		for (IDirect3DSurface9* s : oldRt)
+			if (s)
+				s->Release();
+		if (oldDs)
+			oldDs->Release();
+
+		if (FAILED(hr))
+			err = "draw failed";
+		else
+			ok = ReadFloats(dev, rt, v, w, h, err);
+		rtSurf->Release();
+	}
+	if (rt)
+		rt->Release();
+	depthTex->Release();
+	return ok;
+}
+
+// Compares a depth buffer with the game's own z/w target (T6) pixel by pixel. The depth buffer
+// holds minZ + z/w * (maxZ - minZ) for the viewport depth range it was drawn with. With n = near
+// plane, 1 - z/w is roughly n / distance, so ratio = (1 - zDepth) / (1 - zT6) ~ distT6 / distDepth:
+//   ~1  both see the same surface               (grey: brighter = nearer)
+//   < 1 the depth buffer sees something farther (red: geometry missing from the depth buffer)
+//   > 1 the depth buffer sees something nearer  (blue: e.g. occluders the final image doesn't have)
+//   depth buffer has geometry where T6 is sky   (yellow), both sky (black)
+static std::string CompareDepth(const std::vector<float>& dv, const DepthUse& use, const std::vector<float>& tv, UINT w, UINT h,
+	const char* pngPath)
+{
+	float range = use.maxZ - use.minZ;
+	if (range <= 0)
+		range = 1;
+	unsigned step = (w + 1279) / 1280;
+	unsigned ow = w / step, oh = h / step;
+	std::vector<unsigned char> px((size_t)ow * oh * 3);
+	size_t bothSky = 0, onlyDepth = 0, onlyT = 0, same = 0, farther = 0, nearer = 0;
+	std::vector<float> ratios;
+	ratios.reserve((size_t)ow * oh);
+	for (unsigned y = 0; y < oh; y++)
+		for (unsigned x = 0; x < ow; x++)
+		{
+			size_t i = (size_t)(y * step) * w + x * step;
+			float t = tv[i];
+			float d = (dv[i] - use.minZ) / range;
+			bool tSky = t >= 1.0f, dSky = d >= 0.99999f;
+			unsigned char* c = &px[((size_t)y * ow + x) * 3];
+			unsigned char r = 0, g = 0, b = 0;
+			if (tSky && dSky)
+			{
+				bothSky++;
+			}
+			else if (tSky)
+			{
+				onlyDepth++;
+				r = 230, g = 200, b = 40;
+			}
+			else if (dSky)
+			{
+				onlyT++;
+				r = 255, g = 0, b = 0;
+			}
+			else
+			{
+				float ratio = (1.0f - d) / (1.0f - t);
+				ratios.push_back(ratio);
+				if (ratio < 0.97f)
+				{
+					farther++;
+					r = 230, g = 40, b = 40;
+				}
+				else if (ratio > 1.03f)
+				{
+					nearer++;
+					r = 60, g = 90, b = 255;
+				}
+				else
+				{
+					same++;
+					float n = sqrtf((1.0f - t) / 0.06f);
+					r = g = b = (unsigned char)(50 + 190 * (n > 1 ? 1 : n));
+				}
+			}
+			c[0] = r, c[1] = g, c[2] = b;
+		}
+	size_t geo = (size_t)ow * oh - bothSky;
+	if (!geo)
+		return "no geometry in either";
+	float median = 0;
+	if (!ratios.empty())
+	{
+		std::nth_element(ratios.begin(), ratios.begin() + ratios.size() / 2, ratios.end());
+		median = ratios[ratios.size() / 2];
+	}
+	char buf[600];
+	snprintf(buf, sizeof(buf),
+		"of the %.1f%% of pixels with geometry: same surface %.1f%% | MISSING from the depth buffer %.1f%% (it sees farther %.1f%%, "
+		"sky %.1f%%) | depth buffer nearer %.1f%% | depth buffer has geometry where T6 is sky %.1f%% | median distance ratio %.4f "
+		"(depth range %g..%g)",
+		100.0 * geo / ((size_t)ow * oh), 100.0 * same / geo, 100.0 * (farther + onlyT) / geo, 100.0 * farther / geo, 100.0 * onlyT / geo,
+		100.0 * nearer / geo, 100.0 * onlyDepth / geo, median, use.minZ, use.maxZ);
+	std::string result = buf;
+	if (WritePng(pngPath, px, ow, oh, 3))
+		result += std::string(" | image ") + FileName(pngPath);
+	return result;
+}
+
+// ---- Shader constant tables --------------------------------------------------------------------
+
+struct CtabEntry
+{
+	std::string name;
+	int set = 0, reg = 0, count = 0, cls = 0, rows = 0, cols = 0;
+};
+
+// Reads the constant table (names of uniforms and their registers) the HLSL compiler embeds.
+static std::vector<CtabEntry> ReadCtab(const DWORD* code, size_t count)
+{
+	std::vector<CtabEntry> out;
+	for (size_t i = 1; i < count;)
+	{
+		DWORD tok = code[i];
+		if (tok == 0x0000FFFF)
+			break;
+		if ((tok & 0xFFFF) != 0xFFFE)
+		{
+			i += 1 + ((tok >> 24) & 0xF);
+			continue;
+		}
+		size_t len = (tok >> 16) & 0x7FFF;
+		if (len < 8 || i + 1 + len > count || code[i + 1] != MAKEFOURCC('C', 'T', 'A', 'B'))
+		{
+			i += 1 + len;
+			continue;
+		}
+		const unsigned char* base = (const unsigned char*)&code[i + 2];
+		size_t size = (len - 1) * 4;
+		auto rd32 = [&](size_t off) -> DWORD {
+			DWORD v = 0;
+			if (off + 4 <= size)
+				memcpy(&v, base + off, 4);
+			return v;
+		};
+		auto rd16 = [&](size_t off) -> int {
+			WORD v = 0;
+			if (off + 2 <= size)
+				memcpy(&v, base + off, 2);
+			return v;
+		};
+		DWORD constants = rd32(12), info = rd32(16);
+		for (DWORD c = 0; c < constants && c < 4096; c++)
+		{
+			size_t e = info + (size_t)c * 20;
+			if (e + 20 > size)
+				break;
+			CtabEntry ce;
+			DWORD nameOff = rd32(e), type = rd32(e + 12);
+			ce.set = rd16(e + 4);
+			ce.reg = rd16(e + 6);
+			ce.count = rd16(e + 8);
+			for (size_t p = nameOff; p < size && base[p]; p++)
+				ce.name += (char)base[p];
+			if (type + 8 <= size)
+			{
+				ce.cls = rd16(type);
+				ce.rows = rd16(type + 4);
+				ce.cols = rd16(type + 6);
+			}
+			out.push_back(ce);
+		}
+		break;
+	}
+	return out;
+}
+
+
+// Writes every vertex / pixel shader drawn this capture: bytecode (<base>_allshaders\vs_ / ps_<hash>.cso)
+// and, in <base>_vs.txt / <base>_ps.txt, the value of each named constant at the shader's first draw
+// followed by its disassembly.
+static void ExportShaderSnaps(const char* base)
+{
+	char dir[MAX_PATH];
+	snprintf(dir, sizeof(dir), "%s_allshaders", base);
+	CreateDirectoryA(dir, nullptr);
+	static const char* kClass[] = { "scalar", "vector", "matrix (row-major: one register per row)",
+		"matrix (column-major: one register per column)", "object", "struct" };
+	static const char* kSet[] = { "bool", "int4", "float4", "sampler" };
+	int counts[2] = {};
+	for (int vertex = 1; vertex >= 0; vertex--)
+	{
+		std::vector<const ShaderSnap*> list;
+		for (const ShaderSnap& s : g_snaps)
+			if (s.vertex == (vertex != 0))
+				list.push_back(&s);
+		std::sort(list.begin(), list.end(), [](const ShaderSnap* a, const ShaderSnap* b) { return a->draws > b->draws; });
+		std::string text;
+		for (const ShaderSnap* s : list)
+		{
+			std::vector<DWORD> code = ShaderCode(s->shader, vertex != 0);
+			if (code.empty())
+				continue;
+			uint32_t h = HashShader(code.data());
+			char path[MAX_PATH];
+			snprintf(path, sizeof(path), "%s\\%s_%08X.cso", dir, vertex ? "vs" : "ps", h);
+			if (FILE* f = fopen(path, "wb"))
+			{
+				fwrite(code.data(), 4, code.size(), f);
+				fclose(f);
+			}
+			char line[400];
+			snprintf(line, sizeof(line), "==== %s %08X | %d draws | first drawn after event %d [%s] ====\n", vertex ? "VS" : "PS", h,
+				s->draws, s->event, s->bindings.c_str());
+			text += line;
+			text += "Constants at the first draw:\n";
+			int regs = vertex ? kVsConsts : kPsConsts;
+			for (const CtabEntry& ce : ReadCtab(code.data(), code.size()))
+			{
+				snprintf(line, sizeof(line), "  %s %s  %s%d..%d  %s%s\n", ce.set < 4 ? kSet[ce.set] : "?", ce.name.c_str(),
+					ce.set == 3 ? "s" : ce.set == 2 ? "c" : ce.set == 1 ? "i" : "b", ce.reg, ce.reg + ce.count - 1,
+					ce.cls < 6 ? kClass[ce.cls] : "?", ce.rows > 1 || ce.cols > 1 ? (" " + std::to_string(ce.rows) + "x" + std::to_string(ce.cols)).c_str() : "");
+				text += line;
+				if (ce.set != 2)
+					continue;
+				for (int r = ce.reg; r < ce.reg + ce.count && r < regs; r++)
+				{
+					const float* c = &s->consts[(size_t)r * 4];
+					snprintf(line, sizeof(line), "      c%-3d = (%.7g, %.7g, %.7g, %.7g)\n", r, c[0], c[1], c[2], c[3]);
+					text += line;
+				}
+			}
+			text += DisassembleShader(code.data(), (UINT)code.size() * 4);
+			text += "\n\n";
+			counts[vertex]++;
+		}
+		char path[MAX_PATH];
+		snprintf(path, sizeof(path), "%s_%s.txt", base, vertex ? "vs" : "ps");
+		if (FILE* f = fopen(path, "w"))
+		{
+			fwrite(text.data(), 1, text.size(), f);
+			fclose(f);
+		}
+	}
+	Out("");
+	Out("Shaders drawn: %d vertex, %d pixel (named constants at first draw + disassembly in %s_vs.txt / %s_ps.txt, bytecode in "
+		"%s_allshaders)",
+		counts[1], counts[0], FileName(base), FileName(base), FileName(base));
+}
+
+static void EndCapture(IDirect3DDevice9* dev)
+{
+	SYSTEMTIME t;
+	GetLocalTime(&t);
+	char base[MAX_PATH];
+	snprintf(base, sizeof(base), "%sAC2ShadowOverhaul_FrameDump_%04d%02d%02d_%02d%02d%02d", ModuleDir(), t.wYear, t.wMonth, t.wDay,
+		t.wHour, t.wMinute, t.wSecond);
+
+	std::string text;
+	{
+		Lock l;
+		FlushSegment();
+		g_capturing = false;
+		Out("");
+		Out("Screen-sized float render targets sampled this frame (read back at Present):");
+		int n = 0;
+		struct FloatImage
+		{
+			std::string name;
+			std::vector<float> v;
+			UINT w, h;
+		};
+		std::vector<FloatImage> screenFloats; // R32F ones, compared with the depth buffers below
+		for (void* tex : g_capTex)
+		{
+			auto it = g_res.find(tex);
+			if (it == g_res.end())
+				continue;
+			D3DSURFACE_DESC d = {};
+			auto t9 = (IDirect3DTexture9*)tex;
+			if (FAILED(t9->GetLevelDesc(0, &d)) || d.Width != g_bbW || d.Height != g_bbH)
+				continue;
+			if (d.Format != D3DFMT_R32F && d.Format != D3DFMT_R16F)
+				continue;
+			char png[MAX_PATH];
+			snprintf(png, sizeof(png), "%s_%s.png", base, it->second.name.c_str());
+			FloatImage img = { it->second.name, {}, 0, 0 };
+			std::string err;
+			if (!ReadFloats(dev, t9, img.v, img.w, img.h, err))
+				Out("  %s: %s", img.name.c_str(), err.c_str());
+			else
+			{
+				Out("  %s: %s", img.name.c_str(), AnalyseFloats(img.v, img.w, img.h, FormatName(d.Format).c_str(), png).c_str());
+				if (d.Format == D3DFMT_R32F)
+					screenFloats.push_back(std::move(img));
+			}
+			n++;
+		}
+		if (!n)
+			Out("  (none)");
+
+		Out("");
+		Out("Depth buffers used this frame (draws / depth-writing / colour-off, viewport depth range of the depth writes):");
+		for (void* s : g_capDepth)
+		{
+			auto it = g_res.find(s);
+			std::string name = it != g_res.end() ? it->second.name : SurfName((IDirect3DSurface9*)s, false);
+			const DepthUse& u = g_depthUse[s];
+			Out("  %s: %d draws, %d depth-writing, %d colour-off, first after event %d, depth range %g..%g%s", name.c_str(), u.draws,
+				u.zWrite, u.colourOff, u.firstEvent, u.minZ, u.maxZ, u.mixedRange ? " (MIXED ranges)" : "");
+			if (!g_readableDepth)
+				continue;
+			if (it == g_res.end() || !it->second.intz)
+			{
+				Out("    not readable (not created as INTZ)");
+				continue;
+			}
+			std::vector<float> v;
+			UINT w = 0, h = 0;
+			std::string err;
+			if (!ReadDepth(dev, (IDirect3DSurface9*)s, v, w, h, err))
+			{
+				Out("    readback failed: %s", err.c_str());
+				continue;
+			}
+			char png[MAX_PATH];
+			snprintf(png, sizeof(png), "%s_%s.png", base, name.c_str());
+			Out("    %s", AnalyseFloats(v, w, h, "INTZ", png).c_str());
+			for (const FloatImage& img : screenFloats)
+			{
+				if (img.w != w || img.h != h)
+					continue;
+				snprintf(png, sizeof(png), "%s_%s_vs_%s.png", base, name.c_str(), img.name.c_str());
+				Out("    vs %s: %s", img.name.c_str(), CompareDepth(v, u, img.v, w, h, png).c_str());
+			}
+		}
+		if (g_capDepth.empty())
+			Out("  (none)");
+		ExportShadowShaders(base);
+		ExportShaderSnaps(base);
+		text.swap(g_out);
+	}
+	char path[MAX_PATH];
+	snprintf(path, sizeof(path), "%s.txt", base);
+	FILE* f = fopen(path, "w");
+	if (f)
+	{
+		fwrite(text.data(), 1, text.size(), f);
+		fclose(f);
+		LogInfo("Frame dump written to %s (%d lines).", path, g_lines);
+		MessageBeep(MB_OK);
+	}
+	else
+	{
+		LogWarn("Could not write frame dump to %s.", path);
+	}
+}
+
+// ---- Device hooks ------------------------------------------------------------------------------
 
 static std::string DescribePresent(const D3DPRESENT_PARAMETERS* pp)
 {
@@ -945,10 +1499,42 @@ static void AfterDeviceReady(IDirect3DDevice9* dev)
 	ResetTrackedState(bb, ds);
 }
 
+// Ambient occlusion runs inside the hooks below (right after the opaque pass); dumps note where.
+static void NoteAO(bool applied)
+{
+	if (applied && g_capturing)
+	{
+		Lock l;
+		Event("Ambient occlusion applied (GTAO, blur, composite into the scene colour)", "AC2ShadowOverhaul");
+	}
+}
+
+static void BeforeDraw(IDirect3DDevice9* dev)
+{
+	NoteAO(AO_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs));
+	if (AO_InPass() && g_ps)
+	{
+		static int logged = 0;
+		if (logged >= 10)
+			return;
+		Lock l;
+		auto it = g_aoOutput.find(g_ps);
+		if (it == g_aoOutput.end() || !it->second)
+		{
+			g_aoOutput[g_ps] = true; // log each shader once
+			auto h = g_psHash.find(g_ps);
+			logged++;
+			LogWarn("Ambient occlusion: shader %08X is drawn in the opaque pass without the AO output (AO may be wrong on it).",
+				h != g_psHash.end() ? h->second : 0u);
+		}
+	}
+}
+
 static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
 {
 	LogInfo("Device Reset: %s", DescribePresent(pp).c_str());
 	Tuning_OnLostDevice();
+	AO_OnLostDevice();
 	HRESULT hr = o_Reset(dev, pp);
 	if (SUCCEEDED(hr))
 	{
@@ -968,6 +1554,7 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 		first = false;
 		LogInfo("First Present seen; frame dump hotkey is 0x%02X.", g_hotkey);
 	}
+	NoteAO(AO_BeforePresent(dev));
 	if (g_capturing)
 	{
 		bool done;
@@ -1020,9 +1607,44 @@ static HRESULT __stdcall h_CreateRenderTarget(IDirect3DDevice9* dev, UINT w, UIN
 	return hr;
 }
 
+// [Debug] FrameDumpDepth: hand the game level 0 of an INTZ depth texture instead of a plain depth
+// surface. The surface keeps the texture alive (its reference count is the texture's), so the
+// texture goes away when the game releases the surface. Not for MSAA (INTZ can't be multisampled)
+// or the shadow atlas depth buffer.
+static bool CreateReadableDepth(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms, IDirect3DSurface9** out,
+	HANDLE* shared)
+{
+	if (!g_readableDepth || !g_intzSupported || ms != D3DMULTISAMPLE_NONE || shared || !out)
+		return false;
+	if (fmt != D3DFMT_D24S8 && fmt != D3DFMT_D24X8)
+		return false;
+	if (h >= 256 && w == 4 * h)
+		return false;
+	IDirect3DTexture9* tex = nullptr;
+	if (FAILED(o_CreateTexture(dev, w, h, 1, D3DUSAGE_DEPTHSTENCIL, kFmtINTZ, D3DPOOL_DEFAULT, &tex, nullptr)) || !tex)
+	{
+		LogWarn("Readable depth: could not create a %ux%u INTZ texture; using a normal depth buffer.", w, h);
+		return false;
+	}
+	IDirect3DSurface9* s = nullptr;
+	HRESULT hr = tex->GetSurfaceLevel(0, &s);
+	tex->Release();
+	if (FAILED(hr) || !s)
+		return false;
+	*out = s;
+	return true;
+}
+
 static HRESULT __stdcall h_CreateDepthStencilSurface(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt, D3DMULTISAMPLE_TYPE ms,
 	DWORD q, BOOL discard, IDirect3DSurface9** out, HANDLE* shared)
 {
+	if (CreateReadableDepth(dev, w, h, fmt, ms, out, shared))
+	{
+		Lock l;
+		Register(*out, 'D', w, h, fmt, kFmtINTZ, D3DUSAGE_DEPTHSTENCIL, ms, false, CALLER);
+		g_res[*out].intz = true;
+		return D3D_OK;
+	}
 	HRESULT hr = o_CreateDepthStencilSurface(dev, w, h, fmt, ms, q, discard, out, shared);
 	if (SUCCEEDED(hr) && out && *out)
 	{
@@ -1042,6 +1664,7 @@ static HRESULT __stdcall h_StretchRect(IDirect3DDevice9* dev, IDirect3DSurface9*
 		Lock l;
 		Event("StretchRect " + SurfName(src, true) + " -> " + SurfName(dst, true), CALLER);
 	}
+	NoteAO(AO_BeforeOther(dev));
 	return o_StretchRect(dev, src, sr, dst, dr, filter);
 }
 
@@ -1054,11 +1677,13 @@ static HRESULT __stdcall h_ColorFill(IDirect3DDevice9* dev, IDirect3DSurface9* s
 		snprintf(buf, sizeof(buf), " colour %08lX", c);
 		Event("ColorFill " + SurfName(s, true) + buf, CALLER);
 	}
+	NoteAO(AO_BeforeOther(dev));
 	return o_ColorFill(dev, s, r, c);
 }
 
 static HRESULT __stdcall h_SetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s)
 {
+	NoteAO(AO_BeforeSetRenderTarget(dev, index, s));
 	HRESULT hr = o_SetRenderTarget(dev, index, s);
 	if (SUCCEEDED(hr) && index < 4)
 	{
@@ -1078,8 +1703,11 @@ static HRESULT __stdcall h_SetRenderTarget(IDirect3DDevice9* dev, DWORD index, I
 				g_vp.X = g_vp.Y = 0;
 				g_vp.Width = d.Width;
 				g_vp.Height = d.Height;
+				g_vp.MinZ = 0.0f;
+				g_vp.MaxZ = 1.0f;
 			}
 		}
+		AO_AfterSetRenderTarget(dev, index, s, g_rt[0]);
 	}
 	return hr;
 }
@@ -1116,6 +1744,7 @@ static HRESULT __stdcall h_EndScene(IDirect3DDevice9* dev)
 		Lock l;
 		Event("EndScene", CALLER);
 	}
+	NoteAO(AO_BeforeOther(dev));
 	return o_EndScene(dev);
 }
 
@@ -1129,6 +1758,7 @@ static HRESULT __stdcall h_Clear(IDirect3DDevice9* dev, DWORD count, const D3DRE
 			(flags & D3DCLEAR_ZBUFFER) ? " DEPTH" : "", (flags & D3DCLEAR_STENCIL) ? " STENCIL" : "", c, z, stencil, count);
 		Event(buf + Bindings(), CALLER);
 	}
+	NoteAO(AO_BeforeOther(dev));
 	return o_Clear(dev, count, rects, flags, c, z, stencil);
 }
 
@@ -1163,18 +1793,21 @@ static HRESULT __stdcall h_SetTexture(IDirect3DDevice9* dev, DWORD stage, IDirec
 
 static HRESULT __stdcall h_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT start, UINT count)
 {
+	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawPrimitive(dev, t, start, count);
 }
 
 static HRESULT __stdcall h_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, INT base, UINT minIdx, UINT numV, UINT start, UINT count)
 {
+	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawIndexedPrimitive(dev, t, base, minIdx, numV, start, count);
 }
 
 static HRESULT __stdcall h_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT count, const void* data, UINT stride)
 {
+	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawPrimitiveUP(dev, t, count, data, stride);
 }
@@ -1182,8 +1815,41 @@ static HRESULT __stdcall h_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETY
 static HRESULT __stdcall h_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT minIdx, UINT numV, UINT count,
 	const void* idx, D3DFORMAT idxFmt, const void* data, UINT stride)
 {
+	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawIndexedPrimitiveUP(dev, t, minIdx, numV, count, idx, idxFmt, data, stride);
+}
+
+// Creates a pixel shader with the AO output added when the shader is part of the main opaque
+// pass (it writes the z/w target as oC1); otherwise as given. kind: 0 unchanged, 1 AO output = 0,
+// 2 AO output = indirect light.
+static LONG g_aoMatched = 0, g_aoZero = 0, g_aoFailed = 0;
+static HRESULT CreatePs(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out, int* kind, std::string* why)
+{
+	if (kind)
+		*kind = 0;
+	if (AO_Enabled())
+	{
+		std::vector<DWORD> ao;
+		bool matched = false;
+		std::string reason;
+		if (AO_RewritePS(code, ao, matched, reason))
+		{
+			HRESULT hr = o_CreatePixelShader(dev, ao.data(), out);
+			if (SUCCEEDED(hr))
+			{
+				if (kind)
+					*kind = matched ? 2 : 1;
+				if (why)
+					*why = reason;
+				return hr;
+			}
+			LONG n = InterlockedIncrement(&g_aoFailed);
+			if (n <= 10)
+				LogWarn("Ambient occlusion: the driver rejected the AO output for shader %08X (0x%08lX); using it without.", HashShader(code), hr);
+		}
+	}
+	return o_CreatePixelShader(dev, code, out);
 }
 
 static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out)
@@ -1191,6 +1857,8 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 	SoftSet set;
 	bool haveSet = false;
 	HRESULT hr = E_FAIL;
+	int aoKind = 0;
+	std::string aoWhy;
 	if (code && out)
 	{
 		const int width = SoftShadows_Width();
@@ -1198,7 +1866,7 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 		std::string reason;
 		if (SoftShadows_Rewrite(code, width, soft, reason))
 		{
-			hr = o_CreatePixelShader(dev, soft.data(), out);
+			hr = CreatePs(dev, soft.data(), out, &aoKind, &aoWhy);
 			if (FAILED(hr))
 			{
 				LONG n = InterlockedIncrement(&g_softFailed);
@@ -1210,16 +1878,17 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 				haveSet = true;
 				set.returned = width;
 				set.byWidth[width] = *out;
-				if (FAILED(o_CreatePixelShader(dev, code, &set.original)))
+				// The game's filter (F6) and the debug menu's other widths. Each gets the AO output too,
+				// as any of them may be drawn in the opaque pass.
+				if (FAILED(CreatePs(dev, code, &set.original, nullptr, nullptr)))
 					set.original = nullptr;
-				// Debug menu: every width ready to switch to.
 				for (int w = 1; w <= 4 && SoftShadows_BuildAllWidths(); w++)
 				{
 					if (w == width)
 						continue;
 					std::vector<DWORD> v;
 					std::string why;
-					if (SoftShadows_Rewrite(code, w, v, why) && FAILED(o_CreatePixelShader(dev, v.data(), &set.byWidth[w])))
+					if (SoftShadows_Rewrite(code, w, v, why) && FAILED(CreatePs(dev, v.data(), &set.byWidth[w], nullptr, nullptr)))
 						set.byWidth[w] = nullptr;
 				}
 				LONG n = InterlockedIncrement(&g_softRewritten);
@@ -1235,26 +1904,71 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 		}
 	}
 	if (FAILED(hr))
-		hr = o_CreatePixelShader(dev, code, out);
+		hr = code && out ? CreatePs(dev, code, out, &aoKind, &aoWhy) : o_CreatePixelShader(dev, code, out);
 	if (SUCCEEDED(hr) && out && *out)
 	{
 		uint32_t h = HashShader(code);
+		if (aoKind == 2)
+		{
+			LONG n = InterlockedIncrement(&g_aoMatched);
+			if (n == 1 || n % 50 == 0)
+				LogInfo("Ambient occlusion: %ld opaque shaders given the indirect light output so far.", n);
+		}
+		else if (aoKind == 1)
+		{
+			LONG n = InterlockedIncrement(&g_aoZero);
+			if (n <= 30)
+				LogInfo("Ambient occlusion: shader %08X gets no AO (%s).", h, aoWhy.c_str());
+		}
 		Lock l;
 		g_psHash[*out] = h;
-		// The address may belong to a shader the game released earlier: drop its stale set.
+		// The address may belong to a shader the game released earlier: drop its stale data.
 		auto it = g_softOriginal.find(*out);
 		if (it != g_softOriginal.end())
 		{
 			it->second.Release();
 			g_softOriginal.erase(it);
 		}
+		g_gameCode.erase(*out);
+		g_aoOutput[*out] = aoKind != 0;
 		if (haveSet)
 		{
 			g_softOriginal[*out] = set;
 			g_softAny = true;
 		}
+		if (g_hotkey && (haveSet || aoKind))
+		{
+			std::vector<DWORD>& keep = g_gameCode[*out];
+			for (size_t i = 0; i < (1u << 20); i++)
+			{
+				keep.push_back(code[i]);
+				if (code[i] == 0x0000FFFF)
+					break;
+			}
+		}
 	}
 	return hr;
+}
+
+static HRESULT __stdcall h_CreateVertexShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DVertexShader9** out)
+{
+	HRESULT hr = o_CreateVertexShader(dev, code, out);
+	if (SUCCEEDED(hr) && code && out && *out)
+	{
+		uint32_t h = HashShader(code);
+		{
+			Lock l;
+			g_vsHash[*out] = h;
+		}
+		AO_OnCreateVertexShader(*out, code);
+	}
+	return hr;
+}
+
+static HRESULT __stdcall h_SetVertexShader(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
+{
+	g_vs = vs;
+	return o_SetVertexShader(dev, vs);
 }
 
 static HRESULT __stdcall h_SetPixelShader(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
@@ -1310,9 +2024,24 @@ static void HookDevice(IDirect3DDevice9* dev)
 	H(DrawIndexedPrimitive);
 	H(DrawPrimitiveUP);
 	H(DrawIndexedPrimitiveUP);
+	H(CreateVertexShader);
+	H(SetVertexShader);
 	H(CreatePixelShader);
 	H(SetPixelShader);
 #undef H
+	AoDeviceFns fns;
+	fns.SetRenderTarget = o_SetRenderTarget;
+	fns.SetDepthStencilSurface = o_SetDepthStencilSurface;
+	fns.SetViewport = o_SetViewport;
+	fns.SetTexture = o_SetTexture;
+	fns.DrawPrimitiveUP = o_DrawPrimitiveUP;
+	fns.SetVertexShader = o_SetVertexShader;
+	fns.SetPixelShader = o_SetPixelShader;
+	fns.CreatePixelShader = o_CreatePixelShader;
+	fns.CreateVertexShader = o_CreateVertexShader;
+	fns.CreateTexture = o_CreateTexture;
+	fns.ColorFill = o_ColorFill;
+	AO_SetDeviceFns(fns);
 }
 
 // ---- IDirect3D9 hooks --------------------------------------------------------------------------
@@ -1335,6 +2064,30 @@ static HRESULT __stdcall h_CreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEVTYP
 	char buf[1024];
 	snprintf(buf, sizeof(buf), "Device: adapter %u, behaviour flags 0x%lX, %s", adapter, flags, params.c_str());
 	g_deviceInfo = buf;
+	LogInfo("%s", buf);
+
+	// What the GPU offers for effects that need the scene depth (INTZ) and extra render targets (MRT).
+	D3DADAPTER_IDENTIFIER9 id = {};
+	d3d->GetAdapterIdentifier(adapter, 0, &id);
+	D3DDISPLAYMODE mode = {};
+	d3d->GetAdapterDisplayMode(adapter, &mode);
+	D3DFORMAT adapterFmt = pp && !pp->Windowed && pp->BackBufferFormat != D3DFMT_UNKNOWN ? pp->BackBufferFormat : mode.Format;
+	if (adapterFmt == D3DFMT_UNKNOWN)
+		adapterFmt = D3DFMT_X8R8G8B8;
+	g_intzSupported = SUCCEEDED(d3d->CheckDeviceFormat(adapter, type, adapterFmt, D3DUSAGE_DEPTHSTENCIL, D3DRTYPE_TEXTURE, kFmtINTZ));
+	D3DCAPS9 caps;
+	memset(&caps, 0, sizeof(caps));
+	(*out)->GetDeviceCaps(&caps);
+	snprintf(buf, sizeof(buf),
+		"GPU: %.200s (vendor 0x%04lX device 0x%04lX) | INTZ depth textures: %s | MRT: %lu targets, independent bit depths %s, "
+		"post-blend %s | PS %lu.%lu, max PS instructions executed %lu | readable depth (FrameDumpDepth): %s",
+		id.Description, id.VendorId, id.DeviceId, g_intzSupported ? "yes" : "NO", caps.NumSimultaneousRTs,
+		(caps.PrimitiveMiscCaps & D3DPMISCCAPS_MRTINDEPENDENTBITDEPTHS) ? "yes" : "no",
+		(caps.PrimitiveMiscCaps & D3DPMISCCAPS_MRTPOSTPIXELSHADERBLENDING) ? "yes" : "no", (caps.PixelShaderVersion >> 8) & 0xFF,
+		caps.PixelShaderVersion & 0xFF, caps.MaxPixelShader30InstructionSlots ? caps.MaxPShaderInstructionsExecuted : 0,
+		!g_readableDepth ? "off" : g_intzSupported ? "on" : "unavailable");
+	g_deviceInfo += "\n";
+	g_deviceInfo += buf;
 	LogInfo("%s", buf);
 	HookDevice(*out);
 	AfterDeviceReady(*out);
@@ -1375,6 +2128,7 @@ void FrameDump_Init(bool deviceHooksNeeded)
 			return;
 	}
 	g_hotkey = dump ? IniInt("Debug", "FrameDumpKey", VK_F8) : 0;
+	g_readableDepth = dump && IniInt("Debug", "FrameDumpDepth", 1) != 0;
 	g_framesToCapture = IniInt("Debug", "FrameDumpFrames", 1);
 	if (g_framesToCapture < 1)
 		g_framesToCapture = 1;

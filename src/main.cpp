@@ -2,6 +2,7 @@
 // Works alongside EaglePatch+; does not depend on it.
 #include "common.h"
 #include "softshadows.h"
+#include "ao.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -49,6 +50,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 	bool tuning = Tuning_Init();
 	Shadows_Init(NULL, tuning);
 	bool soft = SoftShadows_Init();
-	FrameDump_Init(soft || tuning);
+	bool ao = AO_Init();
+	FrameDump_Init(soft || tuning || ao);
 	return TRUE;
 }
