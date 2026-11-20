@@ -1,9 +1,11 @@
 // Screen-space global illumination (one bounce, plus more over frames) for Assassin's Creed II.
 //
-// Shader side (load time, gishader.cpp): every pixel shader of the main opaque pass (the ones that
-// write the z/w target as oC1) gets its indirect light term raised by albedo x GI, where GI is read
-// from our half-res GI texture (sampler s13) at the pixel's position in the previous frame. The game
-// then fogs the result as usual, so the bounce light sits exactly where its own ambient light does.
+// Shader side (load time, src/litshader.cpp, one rewrite with ambient occlusion's outputs): every
+// pixel shader of the main opaque pass (the ones that write the z/w target as oC1) gets its indirect
+// light term raised by albedo x GI, where GI is read from our half-res GI texture (sampler s13) at
+// the pixel's position in the previous frame. The game then fogs the result as usual, so the bounce
+// light sits exactly where its own ambient light does. Ambient occlusion darkens only the game's
+// own indirect light, not this: the trace already accounts for what occludes the bounce.
 //
 // Device side (gi.cpp): when the opaque pass ends, the GI for the next frame is traced from this
 // frame's lit colour and z/w target (horizon-based gathering with a cosine-weighted sector mask, at
@@ -72,8 +74,9 @@ enum
 	GI_FORM_ADD,         // add lit, sunLight, indirect (albedo from the sun or ambient product earlier)
 };
 
+// The bounce light alone (Lit_RewritePS in litshader.h does it together with the AO outputs).
 // Returns false (code untouched) for shaders outside the opaque pass or where the lighting can't be
-// traced; `reason` says why. Works on the game's code and on code AC2ShadowOverhaul already rewrote.
+// traced; `reason` says why.
 bool GI_RewritePS(const DWORD* code, std::vector<DWORD>& out, std::string& reason);
 
 // Where the last successful rewrite put things, for tests.

@@ -1,5 +1,5 @@
-// SSGI: settings, opaque-pass tracking and the passes. See gi.h for the overview, gishader.cpp for
-// the shader rewrite and shaders/ssgi.hlsl for the passes.
+// SSGI: settings, opaque-pass tracking and the passes. See gi.h for the overview, src/litshader.cpp
+// for the shader rewrite and shaders/ssgi.hlsl for the passes.
 //
 // The frame (from AC2ShadowOverhaul's F8 dumps): ... the main opaque pass with RT0 = scene colour and
 // RT1 = z/w (R32F), split into batches with RT1 unbound and re-bound between them; then RT1 is

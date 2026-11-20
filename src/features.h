@@ -16,6 +16,8 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <vector>
+#include <string>
+#include <stdint.h>
 
 extern volatile bool g_fxPassthrough;
 
@@ -49,7 +51,8 @@ void Fx_AfterSetPixelShader(IDirect3DPixelShader9* ps);
 // (TAA jitter). OnCreateVertexShader gets the game's code either way.
 bool Fx_RewriteVS(const DWORD* code, std::vector<DWORD>& out);
 void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode);
-// Adds the SSGI bounce light to `code` (the game's shader, possibly already rewritten for soft
-// shadows and AO). Returns false (out untouched) if it doesn't apply.
-bool Fx_RewritePSForGI(const DWORD* code, uint32_t hash, std::vector<DWORD>& out);
+// The opaque shaders get the SSGI bounce light (litshader.h; framedump.cpp's CreatePs does the
+// rewrite, AO's and SSGI's parts in one go). NoteGiRewrite logs how that went for one shader.
+bool Fx_GiShaders();
+void Fx_NoteGiRewrite(uint32_t hash, bool applied, const std::string& reason);
 void Fx_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* gameCode);

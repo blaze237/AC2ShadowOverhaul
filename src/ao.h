@@ -1,9 +1,11 @@
-// Ambient occlusion on the game's indirect (ambient + bounce) light.
+// Ambient occlusion on the game's baked indirect (ambient cube + lightmap) light.
 //
-// Shader side (load time): every pixel shader of the main opaque pass (the ones that also write
-// the z/w target as oC1) gets an extra output oC2 = indirect light x (1 - fog), traced through the
-// shader's dataflow from g_AmbientCube / the world lightmap to where the sun term is added on.
-// Shaders where that can't be traced write 0 (no AO on those surfaces).
+// Shader side (load time, litshader.cpp): every pixel shader of the main opaque pass (the ones that
+// also write the z/w target as oC1) gets an extra output oC2 = indirect light x (1 - fog), traced
+// through the shader's dataflow from g_AmbientCube / the world lightmap to where the sun term is
+// added on. Shaders where that can't be traced write 0 (no AO on those surfaces). SSGI's bounce
+// light, added to the same term by the same rewrite, is not in oC2: its trace already accounts for
+// what occludes it, and AO would darken it twice.
 //
 // Device side: while the game has its z/w target bound as render target 1, our float16 "indirect"
 // target is bound as render target 2. When the opaque pass ends (render target 1 unbound, before
@@ -39,7 +41,8 @@ void CS_SetOn(bool on);
 float CS_Length();    // metres
 void CS_SetLength(float metres);
 
-// Shader rewrite. Returns false (code untouched) for shaders that don't write oC1, or that can't
+// Shader rewrite, the AO outputs alone (Lit_RewritePS in litshader.h does them together with the
+// SSGI bounce light). Returns false (code untouched) for shaders that don't write oC1, or that can't
 // be changed; `matched` says whether the indirect light was found (else oC2 = 0). `reason`
 // explains a false return or an unmatched shader.
 bool AO_RewritePS(const DWORD* code, std::vector<DWORD>& out, bool& matched, std::string& reason);

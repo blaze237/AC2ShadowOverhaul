@@ -13,8 +13,9 @@
 #   - the AO shaders on WARP (D3D11's software renderer, part of Windows) over a synthetic scene
 #   - soft shadow and AO output rewrites on the game's real pixel shaders (*)
 #  SSGI (tests/ssgi/)
-#   - the SSGI passes on WARP; the rewrite on the game's shaders (*),
-#     also stacked on the soft shadow and AO rewrites
+#   - the SSGI passes on WARP; the rewrite on the game's shaders (*), also stacked on the soft
+#     shadow and AO rewrites, and merged with the AO outputs as the plugin does it (oC2 = the baked
+#     indirect light only, the bounce light still in the colour)
 #   - end to end: SSGI alone, then with every effect on
 #  Volumetric fog and sun shafts (tests/vol/)
 #   - end to end: placement 0, placement 1 and fog off alone, then placement 0 and 1 with every
@@ -160,9 +161,9 @@ cd ssgi
 build "SSGI WARP test" $CXX $SUB -o ssgi_warp_test.exe ssgi_warp_test.cpp ../../src/core/camera.cpp -ld3d11 &&
 	run "SSGI: passes on WARP" . -- ./ssgi_warp_test.exe
 if [ -n "$SHADERS" ]; then
-	build "gishader test" $CXX $SUB -Wno-unused -DWITH_OVERHAUL -o gishader_test.exe gishader_test.cpp ../../src/ssgi/gishader.cpp \
-		../../src/softshadows.cpp ../../src/aoshader.cpp ../../src/common.cpp ../../src/core/shaderinfo.cpp &&
-		run "SSGI: rewrite on the game's shaders (alone and stacked on soft shadows + AO)" . '$p' -- ./gishader_test.exe "$SHADERS"
+	build "gishader test" $CXX $SUB -Wno-unused -DWITH_OVERHAUL -o gishader_test.exe gishader_test.cpp ../../src/litshader.cpp \
+		../../src/softshadows.cpp ../../src/common.cpp ../../src/core/shaderinfo.cpp &&
+		run "SSGI: rewrite on the game's shaders (alone, stacked, and merged with the AO outputs)" . '$p' -- ./gishader_test.exe "$SHADERS"
 else
 	echo "== SSGI: shader rewrite test skipped (no exported shaders in ../re/shaders/dump)"
 fi

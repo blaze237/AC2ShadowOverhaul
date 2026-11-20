@@ -1,5 +1,5 @@
 // Ambient occlusion and contact shadows: settings, the opaque-pass tracking and the passes. See
-// ao.h for the overview and aoshader.cpp for the shader rewrite.
+// ao.h for the overview and litshader.cpp for the shader rewrite.
 //
 // The frame (from F8 dumps): ... main opaque pass with RT0 = scene colour (FP16) and RT1 = z/w
 // (R32F), toggled off and on between batches; then RT1 is unbound and the sky is drawn, then
@@ -14,6 +14,7 @@
 #include "shaders_gen.h"
 #include "core/scene.h"
 #include "core/fxpass.h"
+#include "core/shaderinfo.h"
 #include <math.h>
 #include <stdio.h>
 #include <unordered_map>
@@ -76,6 +77,14 @@ bool CS_Init()
 }
 
 // ---- Pixel shaders: where the sun direction is -------------------------------------------------
+
+int AO_SunRegister(const DWORD* code)
+{
+	core::ConstantTable vars;
+	if (!code || (code[0] & 0xFFFF0000) != 0xFFFF0000 || !core::ReadConstantTable(code, vars))
+		return -1;
+	return vars.Register("g_ShadowedDirect", core::RS_FLOAT4); // m_Direction is its first member
+}
 
 static SRWLOCK g_psLock = SRWLOCK_INIT;
 static std::unordered_map<void*, int> g_psSun; // game pixel shader -> register of g_ShadowedDirect

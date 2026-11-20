@@ -5,10 +5,15 @@
 //  3. with the GI texture = g, every output equals the original's with albedo x g added to the lit
 //     colour at the combine (the interpreter injects it there), so fog etc. apply to it unchanged;
 //  4. the GI texture is read once, at (Q . c216, Q . c217) / (Q . c218) with Q = (oC1.x, vPos, 1).
-// Built with WITH_OVERHAUL (tests/run_tests.sh does, with src/softshadows.cpp and src/aoshader.cpp),
-// the same checks run on the soft shadow + AO rewritten shaders (the plugin's order: soft shadows,
-// AO output, then the bounce light), and the reverse order is checked too: the AO output must still
-// be found on our code and must include the bounce light.
+// Built with WITH_OVERHAUL (tests/run_tests.sh does, with src/softshadows.cpp and src/litshader.cpp):
+//  - the same checks on the soft shadow + AO rewritten shaders (the AO outputs and the bounce light
+//    as two separate rewrites, one on top of the other);
+//  - the reverse order: the AO output must still be found on our code (and then includes the bounce);
+//  - merged, as the plugin does it (Lit_RewritePS with both parts, on the soft shadow rewrite):
+//    oC0 / oC1 bit-identical to the original with the GI texture black; oC2 = exactly the game's
+//    baked indirect light x (1 - fog) (removing the ambient term at the combine removes exactly oC2
+//    from the colour) and bit-identical whatever the GI texture holds; oC0 with GI = g equals the
+//    original with albedo x g injected at the combine (the bounce light reaches the colour, fogged).
 #include "interp.h"
 #include <windows.h>
 
@@ -37,7 +42,8 @@ static bool Disassemble(const std::vector<DWORD>& code, std::string& text)
 }
 
 #ifdef WITH_OVERHAUL
-bool AO_RewritePS(const DWORD* code, std::vector<DWORD>& out, bool& matched, std::string& reason);
+#include "ao.h"
+#include "litshader.h"
 bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& out, std::string& reason);
 #endif
 
@@ -258,6 +264,107 @@ static std::string CheckReverse(const std::vector<DWORD>& giCode, bool expectAo,
 	}
 	return "their AO includes the bounce light";
 }
+
+// Merged, as the plugin creates the shaders: see the top.
+static std::string CheckMerged(const std::vector<DWORD>& code, bool expectAo, bool& failed)
+{
+	failed = false;
+	std::vector<DWORD> both;
+	LitParts parts;
+	parts.ao = parts.gi = true;
+	LitRewriteResult res;
+	if (!Lit_RewritePS(code.data(), parts, both, res) || !res.gi || res.ao != true || res.aoMatched != expectAo)
+	{
+		failed = true;
+		return "merged: PARTS DIFFER (ao " + std::to_string(res.ao) + ", matched " + std::to_string(res.aoMatched) + ", gi " +
+			std::to_string(res.gi) + ": " + res.aoWhy + " / " + res.giWhy + ")";
+	}
+	if (!expectAo)
+		return "merged: bounce light, oC2 = 0 (as AO alone)";
+	AoRewriteLayout LA = g_aoLastLayout;
+	GiRewriteLayout LG = g_giLastLayout;
+	std::string text;
+	if (!Disassemble(both, text) || text.find("error") != std::string::npos)
+	{
+		failed = true;
+		return "merged: DISASSEMBLY FAILED";
+	}
+	int trials = 0, baseBad = 0, termBad = 0, giMoves = 0, bounceBad = 0;
+	float worst = 0;
+	std::string err;
+	for (int n = 0; n < 400 && trials < 120; n++)
+	{
+		Inputs in = RandomInputs();
+		Outputs a, b;
+		if (!Run(code, in, a, err) || !Run(both, in, b, err))
+		{
+			failed = true;
+			return "merged: interpreter: " + err;
+		}
+		bool bad = a.killed;
+		for (int t = 0; t < 2; t++)
+			for (int k = 0; k < 4; k++)
+				bad |= Bad(a.oC[t][k]);
+		if (bad)
+			continue;
+		trials++;
+		baseBad += memcmp(a.oC[0], b.oC[0], 16) != 0 || memcmp(a.oC[1], b.oC[1], 16) != 0 || !b.written[2] || !b.written[3];
+		// oC2 = the baked indirect term's share of the colour
+		Inputs cut = in;
+		cut.zeroAt = LA.combineAt;
+		cut.zeroSrc = LA.addend;
+		Outputs zc;
+		if (!Run(code, cut, zc, err))
+		{
+			failed = true;
+			return "merged: interpreter: " + err;
+		}
+		for (int k = 0; k < 3; k++)
+		{
+			float expect = a.oC[0][k] - zc.oC[0][k], got = b.oC[2][k];
+			if (!(fabsf(expect - got) <= 2e-4f * (1.0f + fabsf(a.oC[0][k]) + fabsf(got))))
+			{
+				termBad++;
+				worst = fmaxf(worst, fabsf(expect - got));
+			}
+		}
+		// with GI = g: oC2 unchanged, oC0 = the original with albedo x g injected at the combine
+		Inputs g = in;
+		for (int k = 0; k < 3; k++)
+			g.gi[k] = Rand() * 2;
+		g.gi[3] = 1;
+		Inputs inj = g;
+		inj.injectAt = LG.combineAt;
+		inj.injectAlb = LG.albedo;
+		inj.captureAt = LG.albedoAt;
+		Outputs bg, eg;
+		if (!Run(both, g, bg, err) || !Run(code, inj, eg, err))
+		{
+			failed = true;
+			return "merged: interpreter: " + err;
+		}
+		giMoves += memcmp(b.oC[2], bg.oC[2], 16) != 0 || memcmp(b.oC[3], bg.oC[3], 16) != 0;
+		for (int k = 0; k < 3; k++)
+			if (!(fabsf(eg.oC[0][k] - bg.oC[0][k]) <= 2e-5f * (1.0f + fabsf(eg.oC[0][k]) + fabsf(bg.oC[0][k]))))
+			{
+				bounceBad++;
+				worst = fmaxf(worst, fabsf(eg.oC[0][k] - bg.oC[0][k]));
+				break;
+			}
+	}
+	char buf[200];
+	if (baseBad || termBad || giMoves || bounceBad || !trials)
+	{
+		failed = true;
+		snprintf(buf, sizeof(buf),
+			"merged: FAILED (%d trials: %d changed oC0/oC1, %d oC2 not the baked indirect, %d oC2/oC3 moved with GI, %d bounce wrong; worst %g)",
+			trials, baseBad, termBad, giMoves, bounceBad, worst);
+		return buf;
+	}
+	snprintf(buf, sizeof(buf), "merged: oC2 = baked indirect only, bounce in oC0, temps r%d-r%d, %d trials ok", LG.temp,
+		LA.sunTemp > LG.temp2 ? LA.sunTemp : LG.temp2, trials);
+	return buf;
+}
 #endif
 
 int main(int argc, char** argv)
@@ -323,6 +430,9 @@ int main(int argc, char** argv)
 			std::string rev = CheckReverse(giCode, aoMatched, f3);
 			fail |= f3;
 			line += " | theirs after ours: " + rev;
+			bool fm;
+			line += " | " + CheckMerged(soft.empty() ? code : soft, aoMatched, fm);
+			fail |= fm;
 		}
 #endif
 		failures += fail;

@@ -14,9 +14,9 @@ CC="${TC}i686-w64-mingw32-clang"
 "$CC" -fsyntax-only tools/vtbl_check.c
 
 SRC="src/main.cpp src/common.cpp src/shadows.cpp src/framedump.cpp src/crashlog.cpp src/softshadows.cpp src/tuning.cpp
-	src/ao.cpp src/aoshader.cpp src/features.cpp
+	src/ao.cpp src/litshader.cpp src/features.cpp
 	src/core/shaderinfo.cpp src/core/camera.cpp src/core/scene.cpp src/core/menu.cpp src/core/fxpass.cpp
-	src/ssgi/gi.cpp src/ssgi/gishader.cpp src/ssgi/menu.cpp
+	src/ssgi/gi.cpp src/ssgi/menu.cpp
 	src/vol/volumetrics.cpp src/vol/menu.cpp
 	src/taa/taa.cpp src/taa/vsjitter.cpp src/taa/menu.cpp"
 

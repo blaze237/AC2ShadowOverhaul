@@ -15,6 +15,7 @@
 #include "common.h"
 #include "softshadows.h"
 #include "ao.h"
+#include "litshader.h"
 #include "features.h"
 #include "shaders_gen.h"
 #include "core/shaderinfo.h"
@@ -1852,68 +1853,64 @@ static HRESULT __stdcall h_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIM
 	return o_DrawIndexedPrimitiveUP(dev, t, minIdx, numV, count, idx, idxFmt, data, stride);
 }
 
-// Creates a pixel shader with the AO output added when the shader is part of the main opaque
-// pass (it writes the z/w target as oC1); otherwise as given. kind: 0 unchanged, 1 AO output = 0,
-// 2 AO output = indirect light.
+// Creates a pixel shader with what the effects need added to it when it is part of the main opaque
+// pass (it writes the z/w target as oC1): the AO / contact shadow outputs and the SSGI bounce light,
+// both from one rewrite (litshader.h); otherwise as given. kind: 0 no AO output, 1 AO output = 0,
+// 2 AO output = indirect light. If the driver rejects the shader with both parts, each is tried on
+// its own before the game's code.
 static LONG g_aoMatched = 0, g_aoZero = 0, g_aoFailed = 0;
-static HRESULT CreatePsAO(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out, int* kind, std::string* why);
-
-// The shader with the SSGI bounce light added on top of the AO rewrite (and the soft shadows, already
-// in `code`); falls back to without SSGI if that can't be done.
 static HRESULT CreatePs(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out, int* kind, std::string* why)
 {
 	if (kind)
 		*kind = 0;
-	std::vector<DWORD> ao;
-	bool matched = false;
-	std::string reason;
-	const DWORD* base = code;
-	if (AO_Enabled() && AO_RewritePS(code, ao, matched, reason))
-		base = ao.data();
-	std::vector<DWORD> gi;
-	if (Fx_RewritePSForGI(base, HashShader(code), gi))
+	LitParts want;
+	want.ao = AO_Enabled();
+	want.gi = Fx_GiShaders();
+	if (!want.ao && !want.gi)
+		return o_CreatePixelShader(dev, code, out);
+	const uint32_t hash = HashShader(code);
+	LitParts tries[3] = { want, want, want };
+	tries[1].gi = false; // AO only
+	tries[2].ao = false; // SSGI only
+	std::string giWhy;
+	for (int t = 0; t < 3; t++)
 	{
-		HRESULT hr = o_CreatePixelShader(dev, gi.data(), out);
+		std::vector<DWORD> lit;
+		LitRewriteResult r;
+		if (!Lit_RewritePS(code, tries[t], lit, r))
+		{
+			if (t == 0)
+				giWhy = r.giWhy;
+			break;
+		}
+		if (t == 0)
+			giWhy = r.giWhy;
+		HRESULT hr = o_CreatePixelShader(dev, lit.data(), out);
 		if (SUCCEEDED(hr))
 		{
-			if (kind && base != code)
-				*kind = matched ? 2 : 1;
+			if (kind)
+				*kind = r.ao ? (r.aoMatched ? 2 : 1) : 0;
 			if (why)
-				*why = reason;
+				*why = r.aoWhy;
+			if (want.gi)
+				Fx_NoteGiRewrite(hash, r.gi, giWhy);
 			return hr;
 		}
-		static LONG failed = 0;
-		if (InterlockedIncrement(&failed) <= 10)
-			LogWarn("SSGI: the driver rejected rewritten shader %08X (0x%08lX); using it without bounce light.", HashShader(code), hr);
-	}
-	return CreatePsAO(dev, code, out, kind, why);
-}
-
-static HRESULT CreatePsAO(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out, int* kind, std::string* why)
-{
-	if (kind)
-		*kind = 0;
-	if (AO_Enabled())
-	{
-		std::vector<DWORD> ao;
-		bool matched = false;
-		std::string reason;
-		if (AO_RewritePS(code, ao, matched, reason))
+		if (r.gi)
 		{
-			HRESULT hr = o_CreatePixelShader(dev, ao.data(), out);
-			if (SUCCEEDED(hr))
-			{
-				if (kind)
-					*kind = matched ? 2 : 1;
-				if (why)
-					*why = reason;
-				return hr;
-			}
-			LONG n = InterlockedIncrement(&g_aoFailed);
-			if (n <= 10)
-				LogWarn("Ambient occlusion: the driver rejected the AO output for shader %08X (0x%08lX); using it without.", HashShader(code), hr);
+			static LONG failed = 0;
+			if (InterlockedIncrement(&failed) <= 10)
+				LogWarn("SSGI: the driver rejected rewritten shader %08X (0x%08lX).", hash, hr);
 		}
+		else if (InterlockedIncrement(&g_aoFailed) <= 10)
+			LogWarn("Ambient occlusion: the driver rejected the AO output for shader %08X (0x%08lX); using it without.", hash, hr);
+		if (t == 0 && !(r.ao && r.gi))
+			break; // only one part applied: nothing smaller to try
+		if (t == 0)
+			giWhy = "the driver rejected it";
 	}
+	if (want.gi)
+		Fx_NoteGiRewrite(hash, false, giWhy);
 	return o_CreatePixelShader(dev, code, out);
 }
 

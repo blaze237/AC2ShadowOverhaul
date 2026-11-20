@@ -289,17 +289,16 @@ void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode)
 
 static LONG g_giRewritten = 0, g_giSkipped = 0;
 
-bool Fx_RewritePSForGI(const DWORD* code, uint32_t hash, std::vector<DWORD>& out)
+bool Fx_GiShaders() { return g_gi; }
+
+void Fx_NoteGiRewrite(uint32_t hash, bool applied, const std::string& reason)
 {
-	if (!g_gi || !code)
-		return false;
-	std::string reason;
-	if (ssgi::GI_RewritePS(code, out, reason))
+	if (applied)
 	{
 		LONG n = InterlockedIncrement(&g_giRewritten);
 		if (n == 1 || n % 50 == 0)
 			LogInfo("SSGI: %ld opaque shaders given bounce light so far.", n);
-		return true;
+		return;
 	}
 	if (reason != "not an opaque pass shader" && reason != "not ps_3_0")
 	{
@@ -307,7 +306,6 @@ bool Fx_RewritePSForGI(const DWORD* code, uint32_t hash, std::vector<DWORD>& out
 		if (n <= 30)
 			LogInfo("SSGI: opaque shader %08X gets no bounce light (%s).", hash, reason.c_str());
 	}
-	return false;
 }
 
 void Fx_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* gameCode)

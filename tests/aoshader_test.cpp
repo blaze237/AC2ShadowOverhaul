@@ -14,7 +14,7 @@
 #include "../src/common.cpp"
 #include "../src/core/shaderinfo.cpp"
 #include "../src/softshadows.cpp"
-#include "../src/aoshader.cpp"
+#include "../src/litshader.cpp"
 #include <stdio.h>
 #include <math.h>
 #include <string>

@@ -133,12 +133,14 @@ generate yourself from your own copy of the game; none of the game's code or dat
   visibility-distance setter; the render list capacity patch and its guards are in `src/shadows.cpp`.
 - Soft shadows (`src/softshadows.cpp`) rewrite the SM3 pixel shaders that sample the shadow atlas,
   replacing the game's 4-tap bilinear filter with an N x N box filter clamped to each cascade's tile.
-- Ambient occlusion and contact shadows (`src/aoshader.cpp`, `src/ao.cpp`, `src/shaders/ao.hlsl`):
-  each shader of the main opaque pass gets two extra outputs, its indirect light and its shadowed
-  sun light (traced through the shader from the ambient cube / world lightmap and the shadow map to
-  where they are added together). After the opaque pass, GTAO and a short ray march towards the sun
-  are computed from the game's own z/w target, blurred, and the occluded share of each light is
-  subtracted from the scene, before the sky and transparents are drawn.
+- Ambient occlusion and contact shadows (`src/ao.cpp`, `src/shaders/ao.hlsl`) and SSGI (`src/ssgi`)
+  share one shader rewrite (`src/litshader.cpp`): one dataflow analysis traces each opaque shader's
+  baked indirect light and shadowed sun light from the ambient cube / world lightmap and the shadow
+  map to where they are added together. AO gets them as two extra outputs; SSGI adds its bounce
+  light to the indirect term after AO's copy is taken, so AO darkens only the game's baked light.
+  After the opaque pass, GTAO and a short ray march towards the sun are computed from the game's own
+  z/w target, blurred, and the occluded share of each light is subtracted from the scene, before
+  SSGI traces the result and before the sky and transparents are drawn.
 - `src/framedump.cpp` hooks D3D9 (through `Direct3DCreate9`, so it works under ReShade) to rewrite
   shaders as they are created and to produce the frame dump. It feeds every device call to the
   effects through `src/features.cpp` (SSGI in `src/ssgi`, volumetrics in `src/vol`, TAA in `src/taa`).
