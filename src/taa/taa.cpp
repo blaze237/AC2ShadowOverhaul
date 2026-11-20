@@ -473,7 +473,7 @@ const char* Taa_Status()
 	if (!g_enabled)
 		return "disabled in the ini";
 	if (g_failed)
-		return "unavailable (see AC2TAA.log)";
+		return "unavailable (see AC2ShadowOverhaul.log)";
 	if (!g_on)
 		return "off";
 	if (g_historyValid)

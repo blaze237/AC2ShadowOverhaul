@@ -109,7 +109,7 @@ protected:
 		if (GI_GetSetting(GS_ON) < 0.5f)
 			snprintf(buf, n, "off (the first setting turns it on)");
 		else if (st.failed)
-			snprintf(buf, n, "FAILED: could not create its textures (see AC2SSGI.log)");
+			snprintf(buf, n, "FAILED: could not create its textures (see AC2ShadowOverhaul.log)");
 		else if (!running)
 			snprintf(buf, n, "not running: no opaque pass seen (in-game anti-aliasing on? menus?)");
 		else if (st.gpuMs >= 0)
