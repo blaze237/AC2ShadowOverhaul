@@ -110,12 +110,17 @@ This writes `dist/scripts/AC2ShadowOverhaul.asi` (+ ini).
 
 ## Tests
 
-`tests/run_tests.sh [path-to-llvm-mingw/bin]` builds the mod and runs the offline tests, which need
-neither the game nor a GPU: an end-to-end test with a fake `d3d9.dll` (shader rewrite, menu,
-ini saving, the AO passes), the AO shaders run on Windows' software renderer (WARP) over a synthetic
-scene, and, if you have exported shaders, tests that run the soft shadow and AO rewriters over real
-game shaders. After editing `src/shaders/ao.hlsl`, regenerate `src/shaders_gen.h` with
-`tools/gen_shaders.c` (instructions at its top). See the comments at the top of each file in `tests/` for the others.
+`tests/run_tests.sh [path-to-llvm-mingw/bin]` builds the mod once and runs all the offline tests,
+which need neither the game nor a GPU, and exits non-zero if any check fails: end-to-end tests that
+load the built .asi into a fake `AssassinsCreedIIGame.exe` over a mock `d3d9.dll` (`tests/mockd3d`)
+for the shadows and AO, SSGI (`tests/ssgi`), the volumetrics (`tests/vol`) and TAA (`tests/taa`),
+each alone and with every effect on, plus a combined test (`tests/combined_test.cpp`: the frame order
+of all effects, one menu at a time, MSAA, refusal next to an old plugin); the effects' shaders run on
+Windows' software renderer (WARP) over synthetic scenes; unit tests of the maths, menus and vertex
+shader jitter; and, if you have exported shaders (`re/shaders/dump`, `re/shaders/vs`), tests that run
+the soft shadow, AO, SSGI and TAA rewriters over real game shaders. After editing `src/shaders/ao.hlsl`,
+regenerate `src/shaders_gen.h` with `tools/gen_shaders.c` (instructions at its top). See the comments
+at the top of each file in `tests/` for the others.
 
 `re/` holds the small scripts used to find the hook sites in the exe. They work on a disassembly you
 generate yourself from your own copy of the game; none of the game's code or data is in this repo.

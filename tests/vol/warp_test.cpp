@@ -504,7 +504,7 @@ static bool AnyNan(const std::vector<float>& v)
 
 struct Settings
 {
-	// The plugin's defaults (AC2Volumetrics.ini), except the denser fog the checks use.
+	// The plugin's defaults ([VolumetricFog] / [SunShafts] in AC2ShadowOverhaul.ini), except the denser fog the checks use.
 	float density = 0.004f, falloff = 0.02f, base = 0.0f, sun = 0.35f, g = 0.45f, ambient = 0.25f, maxDist = 300.0f, steps = 40;
 	float shaftIntensity = 0.35f, shaftThreshold = 0.5f;
 	bool shadows = true, shafts = true;
@@ -704,10 +704,10 @@ int main(int argc, char** argv)
 {
 	(void)argc;
 	(void)argv;
-	FILE* f = fopen("../src/shaders/volumetrics.hlsl", "rb");
+	FILE* f = fopen("../../src/vol/shaders/volumetrics.hlsl", "rb");
 	if (!f)
 	{
-		printf("run from tests/ (needs ../src/shaders/volumetrics.hlsl)\n");
+		printf("run from tests/vol (needs ../../src/vol/shaders/volumetrics.hlsl)\n");
 		return 1;
 	}
 	char buf[4096];

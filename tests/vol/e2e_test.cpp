@@ -1,17 +1,20 @@
-// End-to-end test of the plugin's Direct3D hooks and frame tracking. Built as
-// e2e/AssassinsCreedIIGame.exe next to a fake d3d9.dll (tests/mockd3d), it statically imports
-// d3d9!Direct3DCreate9 like the game, loads scripts\AC2Volumetrics.asi (and, with "overhaul",
-// scripts\AC2ShadowOverhaul.asi first, as Ultimate ASI Loader would), then renders frames shaped
-// like AC2's: shadow atlas, opaque pass with the z/w target as RT1 in two batches, the sky
-// (viewport depth 1..1), a transparent draw, post-processing into the back buffer.
+// End-to-end test of the volumetric fog and sun shafts through the plugin's Direct3D hooks and frame
+// tracking. Built as e2e/AssassinsCreedIIGame.exe next to the mock d3d9.dll (tests/mockd3d), it
+// statically imports d3d9!Direct3DCreate9 like the game, loads scripts\AC2ShadowOverhaul.asi (as
+// Ultimate ASI Loader would), then renders frames shaped like AC2's: shadow atlas, opaque pass with
+// the z/w target as RT1 in two batches, the sky (viewport depth 1..1), a transparent draw,
+// post-processing into the back buffer (reading the scene colour).
 //
 // Checks: our passes run once per frame, in order, after the sky and before the transparents
 // (Placement=0) or after the transparents (Placement=1); the camera, sun, light-space matrix and
 // cascades reach the shaders exactly; the game's render targets, pixel shader, viewport and blend
-// states are back when the game draws again; with AC2 Shadow Overhaul loaded too, its ambient
-// occlusion still runs before the sky and ours after it.
+// states are back when the game draws again. Alone, nothing else draws; with every effect on, the
+// ambient occlusion and SSGI passes run after the opaque pass and before the sky (AO first), ours
+// after the sky, and the TAA resolve after ours, before the post-processing reads the scene.
 //
-// Usage: AssassinsCreedIIGame.exe [placement1] [overhaul] [fogoff]
+// Usage: AssassinsCreedIIGame.exe [placement1] [fogoff] [all]
+//   (default) volumetrics alone: ambient occlusion, contact shadows, SSGI and TAA Enabled=0
+//   all       every effect on
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
@@ -19,24 +22,7 @@
 #include <math.h>
 #include <string>
 #include <vector>
-#include "../src/shaders_gen.h"
-
-struct MockDraw
-{
-	IDirect3DSurface9* rt[4];
-	IDirect3DPixelShader9* ps;
-	const DWORD* psCode;
-	D3DVIEWPORT9 vp;
-	DWORD alphaBlend, srcBlend, destBlend, blendOp, colorWrite;
-	IDirect3DBaseTexture9* tex[16];
-	float psConst[32][4];
-	bool up;
-};
-struct MockLog
-{
-	std::vector<MockDraw> draws;
-	int presents;
-};
+#include "e2e_common.h"
 
 static int g_fails = 0;
 static void Check(bool ok, const char* what)
@@ -155,59 +141,41 @@ static void Mul(const float a[16], const float b[16], float out[16])
 
 // ---- Classifying the recorded draws ------------------------------------------------------------
 
-enum Kind
-{
-	GAME,
-	OURS,
-	OTHER
-};
-static const struct
-{
-	const DWORD* code;
-	size_t size;
-	const char* name;
-} kOurs[] = {
-	{ kVolFogMarchPs, sizeof(kVolFogMarchPs), "march" },
-	{ kVolFogBlurPs, sizeof(kVolFogBlurPs), "blur" },
-	{ kVolShaftsMaskPs, sizeof(kVolShaftsMaskPs), "mask" },
-	{ kVolShaftsBlurPs, sizeof(kVolShaftsBlurPs), "radial" },
-	{ kVolCompositePs, sizeof(kVolCompositePs), "composite" },
-};
+// One of our passes (march, blur, mask, radial, composite), or nullptr.
 static const char* OurName(const MockDraw& d)
 {
-	if (!d.psCode)
-		return nullptr;
-	for (const auto& o : kOurs)
-		if (!memcmp(d.psCode, o.code, o.size))
-			return o.name;
-	return nullptr;
+	return E2E_Effect(d) == FX_VOL ? E2E_PassName(d) : nullptr;
 }
 
 int main(int argc, char** argv)
 {
-	bool placement1 = false, overhaul = false, fogOff = false;
+	bool placement1 = false, all = false, fogOff = false;
 	for (int i = 1; i < argc; i++)
 	{
 		placement1 |= !strcmp(argv[i], "placement1");
-		overhaul |= !strcmp(argv[i], "overhaul");
+		all |= !strcmp(argv[i], "all");
 		fogOff |= !strcmp(argv[i], "fogoff");
 	}
+	printf("volumetrics end to end: placement %d%s, %s\n", placement1 ? 1 : 0, fogOff ? ", fog off" : "",
+		all ? "with every effect on" : "volumetrics alone");
 	// The ini the plugin reads: the shipped one, plus the variant's changes.
-	CopyFileA("..\\..\\AC2Volumetrics.ini", "scripts\\AC2Volumetrics.ini", FALSE);
-	WritePrivateProfileStringA("VolumetricFog", "Placement", placement1 ? "1" : "0", ".\\scripts\\AC2Volumetrics.ini");
-	WritePrivateProfileStringA("VolumetricFog", "StartEnabled", fogOff ? "0" : "1", ".\\scripts\\AC2Volumetrics.ini");
-	if (overhaul && !LoadLibraryA("scripts\\AC2ShadowOverhaul.asi"))
+	E2EEffects fx;
+	fx.vol = true;
+	if (all)
+		fx = E2EEffects::All();
+	if (!E2E_WriteIni(fx))
+		return 1;
+	E2E_SetIni("VolumetricFog", "Placement", placement1 ? "1" : "0");
+	E2E_SetIni("VolumetricFog", "StartEnabled", fogOff ? "0" : "1");
+	if (!E2E_LoadPlugin())
+		return 1;
+	PFN_MockGetLog getLog = MockExport<PFN_MockGetLog>("MockGetLog");
+	MockLog* log = getLog ? getLog() : nullptr;
+	if (!log)
 	{
-		printf("FAIL  could not load scripts\\AC2ShadowOverhaul.asi\n");
+		printf("FAIL  not the mock d3d9.dll\n");
 		return 1;
 	}
-	if (!LoadLibraryA("scripts\\AC2Volumetrics.asi"))
-	{
-		printf("FAIL  could not load scripts\\AC2Volumetrics.asi\n");
-		return 1;
-	}
-	auto getLog = (MockLog * (WINAPI*)()) GetProcAddress(GetModuleHandleA("d3d9.dll"), "MockGetLog");
-	MockLog* log = getLog();
 
 	IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION);
 	D3DPRESENT_PARAMETERS pp = {};
@@ -249,15 +217,6 @@ int main(int argc, char** argv)
 	dev->CreatePixelShader(otherCode.data(), &transPs);
 	dev->CreatePixelShader(otherCode.data(), &postPs);
 	dev->CreatePixelShader(casterCode.data(), &casterPs);
-	// Our hooks see the game's shaders through the device it uses (ReShade or the overhaul's hooks above it).
-	bool rewritten = false;
-	{
-		IDirect3DPixelShader9* cur = nullptr;
-		dev->SetPixelShader(litPs);
-		dev->GetPixelShader(&cur);
-		rewritten = cur != litPs;
-	}
-	(void)rewritten;
 
 	// Camera: the sun is high (from a real frame dump), the camera looks up towards it.
 	const float nearZ = 0.1f, farZ = 1779.0f;
@@ -357,7 +316,7 @@ int main(int argc, char** argv)
 	// ---- The last frame ----------------------------------------------------------------------------
 	std::vector<MockDraw> d(log->draws.begin() + frameStart, log->draws.end());
 	int sky = -1, trans = -1, post = -1, lastOpaque = -1;
-	std::vector<int> ours, others;
+	std::vector<int> ours, others[FX_COUNT]; // others: the other effects' passes
 	std::string sequence;
 	IDirect3DPixelShader9* gamePs[] = { litPs, skyPs, transPs, postPs, casterPs };
 	for (int i = 0; i < (int)d.size(); i++)
@@ -371,8 +330,8 @@ int main(int argc, char** argv)
 			ours.push_back(i);
 			sequence += sequence.empty() ? name : std::string(" ") + name;
 		}
-		else if (!game && !(d[i].rt[1] == zw)) // the overhaul rewrites the opaque shaders, so those are still the game's
-			others.push_back(i);
+		else if (!game && !(d[i].rt[1] == zw)) // the opaque shaders may be rewritten (AO, SSGI), so those are still the game's
+			others[E2E_Effect(d[i])].push_back(i);
 		if (d[i].vp.MinZ == 1.0f && !name && !d[i].up)
 			sky = i;
 		if (!d[i].up && d[i].rt[1] == zw)
@@ -433,13 +392,27 @@ int main(int argc, char** argv)
 		if (OurName(log->draws[i]) && !strcmp(OurName(log->draws[i]), "composite"))
 			perFrame++;
 	Check(perFrame == kFrames, "one composite per frame");
-	if (overhaul)
+	for (int e = 0; e < FX_COUNT; e++)
+		if (!others[e].empty())
+			printf("  %s draws this frame: %zu\n", e == FX_NONE ? "unknown" : kE2EEffectNames[e], others[e].size());
+	Check(others[FX_NONE].empty(), "no draws other than the game's and the effects' passes");
+	if (!all)
+		Check(others[FX_AO].empty() && others[FX_SSGI].empty() && others[FX_TAA].empty(), "alone: no other effect's passes");
+	else
 	{
-		bool before = !others.empty();
-		for (int i : others)
-			before &= i > lastOpaque && i < sky;
-		printf("  AC2 Shadow Overhaul draws this frame: %zu\n", others.size());
-		Check(before, "AC2 Shadow Overhaul's ambient occlusion still runs after the opaque pass and before the sky");
+		auto within = [](const std::vector<int>& v, int after, int before) {
+			bool ok = !v.empty();
+			for (int i : v)
+				ok &= i > after && i < before;
+			return ok;
+		};
+		Check(others[FX_AO].size() == 4 && within(others[FX_AO], lastOpaque, sky),
+			"ambient occlusion (4 passes) runs after the opaque pass and before the sky");
+		Check(others[FX_SSGI].size() == 5 && within(others[FX_SSGI], lastOpaque, sky) && !others[FX_AO].empty() &&
+				others[FX_SSGI].front() > others[FX_AO].back(),
+			"SSGI (5 passes) runs after the ambient occlusion and before the sky");
+		Check(!ours.empty() && within(others[FX_TAA], ours.back(), post),
+			"the TAA resolve runs after ours, before the post-processing reads the scene");
 	}
 	printf("%s: %d failure(s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails);
 	return g_fails ? 1 : 0;

@@ -11,7 +11,8 @@
 // on it (the runtime validates the bytecode).
 //
 // Usage: vsjitter_test [dir-with-vs_*.cso]
-#include "../src/vsjitter.h"
+#include "taa/vsjitter.h"
+using namespace taa;
 #include <windows.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
@@ -573,7 +574,7 @@ int main(int argc, char** argv)
 	TestShader("Fullscreen (vs_3_0)", Compile(kSynthetic, "Fullscreen", "vs_3_0").data(), 0, true);
 	TestShader("UsesC255 (vs_3_0)", Compile(kSynthetic, "UsesC255", "vs_3_0").data(), 0, true);
 
-	const char* dir = argc > 1 ? argv[1] : "../re/shaders";
+	const char* dir = argc > 1 ? argv[1] : "../../re/shaders/vs";
 	std::string pattern = std::string(dir) + "\\vs_*.cso";
 	WIN32_FIND_DATAA fd;
 	HANDLE h = FindFirstFileA(pattern.c_str(), &fd);

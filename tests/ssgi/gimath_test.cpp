@@ -5,7 +5,8 @@
 //  - ReprojectionRows maps (z/w, x, y, 1) of a pixel in the current frame to the texel of the same
 //    world point in last frame's half-res texture, and w to its view depth then / now;
 //  - IdentityRows maps each pixel onto itself.
-#include "../src/gi.h"
+#include "ssgi/gi.h"
+using namespace ssgi;
 #include <stdio.h>
 #include <math.h>
 

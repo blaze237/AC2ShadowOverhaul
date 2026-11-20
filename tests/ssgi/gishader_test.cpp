@@ -5,9 +5,10 @@
 //  3. with the GI texture = g, every output equals the original's with albedo x g added to the lit
 //     colour at the combine (the interpreter injects it there), so fog etc. apply to it unchanged;
 //  4. the GI texture is read once, at (Q . c216, Q . c217) / (Q . c218) with Q = (oC1.x, vPos, 1).
-// With AC2ShadowOverhaul's sources next to this repo (../../src), the same checks run on its soft
-// shadow + AO rewritten shaders (its hooks may run before ours), and the reverse order is checked
-// too: its AO output must still be found on our code and must include the bounce light.
+// Built with WITH_OVERHAUL (tests/run_tests.sh does, with src/softshadows.cpp and src/aoshader.cpp),
+// the same checks run on the soft shadow + AO rewritten shaders (the plugin's order: soft shadows,
+// AO output, then the bounce light), and the reverse order is checked too: the AO output must still
+// be found on our code and must include the bounce light.
 #include "interp.h"
 #include <windows.h>
 

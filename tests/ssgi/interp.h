@@ -2,8 +2,9 @@
 // Runs straight-line code and if / else; textures return a hash of (sampler, coordinates), except the
 // GI sampler, which returns Inputs::gi and records where it was read.
 #pragma once
-#include "../src/sm3.h"
-#include "../src/gi.h"
+#include "sm3.h"
+#include "ssgi/gi.h"
+using namespace ssgi;
 #include <stdio.h>
 #include <math.h>
 #include <string>

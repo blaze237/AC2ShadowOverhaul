@@ -1,8 +1,8 @@
-// End-to-end test of AC2TAA.asi through its real hooks, on the mock d3d9.dll (tests/mock).
+// End-to-end test of TAA through the real hooks of AC2ShadowOverhaul.asi, on the mock d3d9.dll
+// (tests/mockd3d).
 //
-// Built as AssassinsCreedIIGame.exe; loads scripts/*.asi in alphabetical order like Ultimate ASI
-// Loader (so with AC2ShadowOverhaul.asi there too, both hook the device and chain). Then it plays
-// the frame sequence of AC2's real frame (from an F8 dump): depth prepass into a scene-sized
+// Built as AssassinsCreedIIGame.exe; loads scripts\AC2ShadowOverhaul.asi like Ultimate ASI Loader.
+// Then it plays the frame sequence of AC2's real frame (from an F8 dump): depth prepass into a scene-sized
 // texture, shadow atlas, main pass with the z/w target as render target 1, transparents, a glow
 // pass into the back buffer, post-processing that reads the scene colour, HUD. Checks:
 //   - the game's transforming vertex shader is created with the jitter, the full-screen one isn't
@@ -12,7 +12,11 @@
 //   - the resolve runs right before the first draw that reads the scene colour, writes the scene
 //     colour's colour channels only, and the game's state is back afterwards
 //   - after a Reset, and after a frame that never reads its scene, the next frame isn't jittered
-#include "mock/mock_log.h"
+//
+// Usage: AssassinsCreedIIGame.exe [all]
+//   (default) TAA alone: ambient occlusion, contact shadows, SSGI and volumetrics Enabled=0
+//   all       every effect on: the AO and SSGI passes run in the main pass too, before the resolve
+#include "e2e_common.h"
 #include <windows.h>
 #include <d3d9.h>
 #include <d3dcompiler.h>
@@ -178,35 +182,29 @@ struct Game
 
 static bool Zero(const float c[4]) { return c[0] == 0 && c[1] == 0 && c[2] == 0 && c[3] == 0; }
 
-int main()
+static bool g_all = false;
+
+int main(int argc, char** argv)
 {
 	setvbuf(stdout, nullptr, _IONBF, 0);
+	g_all = argc > 1 && !strcmp(argv[1], "all");
 	return Main();
 }
 
 int Main()
 {
-	// Load the plugins like the ASI loader: scripts/*.asi, alphabetically.
-	std::vector<std::string> asis;
-	WIN32_FIND_DATAA fd;
-	HANDLE h = FindFirstFileA("scripts\\*.asi", &fd);
-	if (h != INVALID_HANDLE_VALUE)
-	{
-		do
-			asis.push_back(fd.cFileName);
-		while (FindNextFileA(h, &fd));
-		FindClose(h);
-	}
-	std::sort(asis.begin(), asis.end());
-	if (getenv("E2E_REVERSE")) // the other hook order: the later-loaded plugin's hooks are outermost
-		std::reverse(asis.begin(), asis.end());
-	for (auto& a : asis)
-	{
-		HMODULE m = LoadLibraryA(("scripts\\" + a).c_str());
-		printf("loaded %s: %s\n", a.c_str(), m ? "ok" : "FAILED");
-		CHECK(m, "could not load %s", a.c_str());
-	}
-	bool withSo = std::find(asis.begin(), asis.end(), "AC2ShadowOverhaul.asi") != asis.end();
+	printf("TAA end to end, %s\n", g_all ? "with every effect on" : "TAA alone");
+	E2EEffects fx;
+	fx.taa = true;
+	if (g_all)
+		fx = E2EEffects::All();
+	if (!E2E_WriteIni(fx))
+		return 1;
+	HMODULE m = E2E_LoadPlugin();
+	printf("loaded AC2ShadowOverhaul.asi: %s\n", m ? "ok" : "FAILED");
+	if (!m)
+		return 1;
+	const bool withSo = g_all;
 
 	IDirect3D9* d3d = Direct3DCreate9(D3D_SDK_VERSION); // through the game exe's import, as the plugins patched it
 	D3DPRESENT_PARAMETERS pp = {};
@@ -218,9 +216,12 @@ int Main()
 	pp.EnableAutoDepthStencil = TRUE;
 	pp.AutoDepthStencilFormat = D3DFMT_D24S8;
 	Game g;
-	if (FAILED(d3d->CreateDevice(0, D3DDEVTYPE_HAL, GetDesktopWindow(), D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g.dev)))
+	if (FAILED(d3d->CreateDevice(0, D3DDEVTYPE_HAL, g_wnd, D3DCREATE_HARDWARE_VERTEXPROCESSING, &pp, &g.dev)))
 		return printf("CreateDevice failed\n"), 1;
-	g.log = ((MockLog * (WINAPI*)()) GetProcAddress(GetModuleHandleA("d3d9.dll"), "MockGetLog"))();
+	PFN_MockGetLog getLog = MockExport<PFN_MockGetLog>("MockGetLog");
+	g.log = getLog ? getLog() : nullptr;
+	if (!g.log)
+		return printf("not the mock d3d9.dll\n"), 1;
 	g.Create();
 
 	printf("== shaders\n");
@@ -238,7 +239,7 @@ int Main()
 		CHECK(!UsesC255(g.log->vsCode[before + 1]), "the full-screen vertex shader was jittered");
 	}
 
-	printf("== frames%s\n", withSo ? " (with AC2ShadowOverhaul.asi loaded too)" : "");
+	printf("== frames%s\n", withSo ? " (with every effect on)" : "");
 	const float px = 2.0f / 1920; // one pixel in NDC
 	float lastJitter[2] = { 0, 0 };
 	float bias = -0.5f;
@@ -270,9 +271,9 @@ int Main()
 		// target of the plugin's own (the history). (AC2ShadowOverhaul's AO composite also writes the
 		// scene colour colour-only, after the opaque pass, but after its half-size AO targets.)
 		auto isOutput = [&](size_t i) {
-			if (i == 0 || L.draws[i].rt0 != g.s2 || L.draws[i].colorWrite != 7)
+			if (i == 0 || L.draws[i].rt[0] != g.s2 || L.draws[i].colorWrite != 7)
 				return false;
-			IDirect3DSurface9* prev = L.draws[i - 1].rt0;
+			IDirect3DSurface9* prev = L.draws[i - 1].rt[0];
 			D3DSURFACE_DESC d = {};
 			prev->GetDesc(&d);
 			return prev != g.s2 && prev != g.s8 && prev != g.s9 && prev != g.bb && d.Width == g.W && d.Height == g.H;
@@ -284,13 +285,41 @@ int Main()
 		for (size_t i = t.prepass; i < t.glow; i++)
 		{
 			CHECK(!isOutput(i), "%s: resolved too early (draw %zu)", what, i - t.prepass);
-			aoComposites += L.draws[i].rt0 == g.s2 && L.draws[i].colorWrite == 7;
+			aoComposites += L.draws[i].rt[0] == g.s2 && L.draws[i].colorWrite == 7;
 		}
 		if (aoComposites && !strcmp(what, "frame 2"))
-			printf("  AC2ShadowOverhaul's AO composite ran in the main pass too (%d draw)\n", aoComposites);
+			printf("  the AO composite ran in the main pass too (%d draw)\n", aoComposites);
+		// The same, by the passes' shaders: exactly one resolve then one output, between the glow pass
+		// and the post draw. With every effect on, the AO (4) and SSGI (5) passes run at the end of
+		// the main pass (before the transparents), AO first; nothing else draws.
+		E2EPassCount early = E2E_CountPasses(&L, t.prepass, t.glow), late = E2E_CountPasses(&L, t.glow + 1, t.post);
+		CHECK(early.n[FX_TAA] == 0 && late.n[FX_TAA] == 2 && t.post >= 2 && E2E_PassName(L.draws[t.post - 2]) &&
+				!strcmp(E2E_PassName(L.draws[t.post - 2]), "taa-resolve") && E2E_PassName(L.draws[t.post - 1]) &&
+				!strcmp(E2E_PassName(L.draws[t.post - 1]), "taa-output"),
+			"%s: expected the resolve and output passes right before the post draw (%d before the glow pass, %d after)", what, early.n[FX_TAA],
+			late.n[FX_TAA]);
+		CHECK(late.Effects() == late.n[FX_TAA] && E2E_CountPasses(&L, t.post, t.hud + 1).Effects() == 0, "%s: other passes after the main pass", what);
+		E2EPassCount main = E2E_CountPasses(&L, t.opaque, t.transparent);
+		int wantAo = g_all ? 4 : 0, wantGi = g_all ? 5 : 0;
+		CHECK(main.n[FX_AO] == wantAo && main.n[FX_SSGI] == wantGi && early.Effects() == wantAo + wantGi,
+			"%s: %d AO and %d SSGI passes at the end of the main pass (expected %d and %d), %d effect passes before the glow pass", what,
+			main.n[FX_AO], main.n[FX_SSGI], wantAo, wantGi, early.Effects());
+		if (g_all)
+		{
+			size_t lastAo = 0, firstGi = (size_t)-1;
+			for (size_t i = t.opaque; i < t.transparent; i++)
+			{
+				E2EEffect e = E2E_Effect(L.draws[i]);
+				if (e == FX_AO)
+					lastAo = i;
+				if (e == FX_SSGI && firstGi == (size_t)-1)
+					firstGi = i;
+			}
+			CHECK(lastAo < firstGi, "%s: SSGI ran before the AO", what);
+		}
 		// The game's state at its post draw is its own again.
-		CHECK(po.rt0 == g.s9 && po.rt1 == nullptr, "%s: render targets not restored", what);
-		CHECK(po.tex0 == g.t2, "%s: the scene texture binding not restored", what);
+		CHECK(po.rt[0] == g.s9 && po.rt[1] == nullptr, "%s: render targets not restored", what);
+		CHECK(po.tex[0] == g.t2, "%s: the scene texture binding not restored", what);
 		CHECK(po.ps == g.postPs && po.vs == g.fsVs, "%s: shaders not restored", what);
 		CHECK(po.colorWrite == 0xF, "%s: colour write mask not restored", what);
 	};

@@ -1,4 +1,4 @@
-// Tests the in-game menu's input and saving (src/menu.cpp) with a fake keyboard: F1 opens it,
+// Tests the TAA in-game menu's input and saving (src/taa/menu.cpp) with a fake keyboard: F1 opens it,
 // arrows select and change, values reach the TAA settings at once and land in the ini a second
 // later (comments kept); keys do nothing while it's hidden.
 #include <windows.h>
@@ -7,8 +7,9 @@ static SHORT WINAPI FakeAsyncKeyState(int vk) { return vk >= 0 && vk < 256 && g_
 static bool FakeFocus() { return true; }
 #define GetAsyncKeyState FakeAsyncKeyState
 #define GameHasFocus FakeFocus
-#include "../src/menu.cpp"
+#include "taa/menu.cpp"
 #undef GetAsyncKeyState
+using namespace taa;
 #include <string>
 
 static int g_failures = 0;
@@ -41,7 +42,7 @@ int main()
 	char dir[MAX_PATH];
 	GetFullPathNameA(".", MAX_PATH, dir, nullptr);
 	std::string ini = std::string(dir) + "\\menu_test.ini";
-	CHECK(CopyFileA("..\\AC2TAA.ini", ini.c_str(), FALSE), "could not copy the ini");
+	CHECK(CopyFileA("..\\..\\AC2ShadowOverhaul.ini", ini.c_str(), FALSE), "could not copy the ini");
 	IniSetPath(ini.c_str());
 	LogInit("menu_test.log", true);
 	Taa_Init();
@@ -74,8 +75,9 @@ int main()
 	Menu_OnPresent(nullptr); // the delayed save happens on a poll
 	std::string text = ReadFile(ini.c_str());
 	CHECK(text.find("Sharpness=0.35") != std::string::npos, "Sharpness not saved");
-	CHECK(text.find("StartEnabled=0") != std::string::npos, "on/off not saved as StartEnabled");
-	CHECK(text.find("DebugView=0") != std::string::npos, "DebugView not saved");
+	// The merged ini has StartEnabled / DebugView in several sections: read [TAA]'s.
+	CHECK(GetPrivateProfileIntA("TAA", "StartEnabled", -1, ini.c_str()) == 0, "on/off not saved as [TAA] StartEnabled");
+	CHECK(GetPrivateProfileIntA("TAA", "DebugView", -1, ini.c_str()) == 0, "DebugView not saved");
 	CHECK(text.find("; Sharpening of the result") != std::string::npos, "comments lost");
 
 	Press(VK_F1); // close

@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <string>
 #include "../src/shaders_gen.h"
+#include "mockd3d/mock_api.h"
 #include <math.h>
 
 // D3DCompiler (any version with D3DCompile / D3DDisassemble) for test shaders.
@@ -258,19 +259,7 @@ int main()
 	// Ambient occlusion: one opaque pass (scene colour + R32F z/w as render target 1) drawn with a
 	// lit shader in the game's style and a vertex shader carrying g_WorldViewProj / g_World.
 	{
-		struct MockAoStats
-		{
-			int draws, colorFills, stateCaptures, stateApplies;
-			IDirect3DSurface9* lastRt0;
-			DWORD lastBlendOp, lastAlphaBlend;
-			IDirect3DPixelShader9* lastPs;
-			int instancedUpDraws;
-		};
-		typedef MockAoStats*(WINAPI * PFN_Stats)();
-		HMODULE mock = GetModuleHandleA("d3d9.dll");
-		PFN_Stats getStats = (PFN_Stats)GetProcAddress(mock, "MockGetStats");
-		if (!getStats)
-			getStats = (PFN_Stats)GetProcAddress(mock, "MockGetStats@0");
+		PFN_MockGetStats getStats = MockExport<PFN_MockGetStats>("MockGetStats");
 		MockAoStats* stats = getStats();
 		const char* litSrc =
 			"float4 g_FogColor : register(c16);\n"

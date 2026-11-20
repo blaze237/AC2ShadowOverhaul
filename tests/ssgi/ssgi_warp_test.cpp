@@ -26,7 +26,8 @@
 #include <string>
 #include <vector>
 #include <utility>
-#include "../src/gi.h"
+#include "ssgi/gi.h"
+using namespace ssgi;
 
 static const UINT W = 1280, H = 720, HW = W / 2, HH = H / 2;
 static const float P00 = 1.0f, P11 = (float)W / H, NEAR_ = 0.1f, FAR_ = 1000.0f;
@@ -444,9 +445,9 @@ static void Avg(const std::vector<float>& img, float px, float py, float out[4],
 int main()
 {
 	setvbuf(stdout, nullptr, _IONBF, 0);
-	FILE* f = fopen("../src/shaders/ssgi.hlsl", "rb");
+	FILE* f = fopen("../../src/ssgi/shaders/ssgi.hlsl", "rb");
 	if (!f)
-		return printf("run from tests/\n"), 1;
+		return printf("run from tests/ssgi\n"), 1;
 	char buf[4096];
 	size_t n;
 	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)

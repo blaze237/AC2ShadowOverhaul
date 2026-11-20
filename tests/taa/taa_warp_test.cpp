@@ -17,7 +17,8 @@
 //
 // The HLSL is compiled for shader model 4 in backwards-compatibility mode with TAA_D3D11 defined
 // (pixel centres differ from D3D9's VPOS).
-#include "../src/taa.h"
+#include "taa/taa.h"
+using namespace taa;
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -648,9 +649,9 @@ static void SavePanel(const char* name, const std::vector<float>& single, const 
 
 int main()
 {
-	FILE* f = fopen("../src/shaders/taa.hlsl", "rb");
+	FILE* f = fopen("../../src/taa/shaders/taa.hlsl", "rb");
 	if (!f)
-		return printf("run from tests/\n"), 1;
+		return printf("run from tests/taa\n"), 1;
 	char buf[4096];
 	size_t n;
 	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)

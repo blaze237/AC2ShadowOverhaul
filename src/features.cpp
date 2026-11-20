@@ -287,8 +287,20 @@ void Fx_OnResetDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp)
 
 // ---- Device calls ------------------------------------------------------------------------------
 
+// While an effect handles a device call (and may run its passes), the hooks pass straight through:
+// device calls an effect makes through the vtable (SSGI's and TAA's SetViewport, the volumetrics'
+// SetTexture, ...) are its own, not the game's, so the other effects and the frame dump must not
+// track them (the state blocks then restore the game's state behind the hooks' backs).
+struct FxScope
+{
+	bool was;
+	FxScope() : was(g_fxPassthrough) { g_fxPassthrough = true; }
+	~FxScope() { g_fxPassthrough = was; }
+};
+
 void Fx_BeforePresent(IDirect3DDevice9* dev)
 {
+	FxScope scope;
 	if (g_gi)
 		ssgi::GI_BeforePresent(dev);
 	if (g_vol)
@@ -323,6 +335,7 @@ void Fx_DrawOverlays(IDirect3DDevice9* dev, unsigned bbW, unsigned bbH)
 
 void Fx_BeforeCopyFrom(IDirect3DDevice9* dev, IDirect3DSurface9* src, bool stretchRect)
 {
+	FxScope scope;
 	if (stretchRect)
 	{
 		if (g_gi)
@@ -336,12 +349,14 @@ void Fx_BeforeCopyFrom(IDirect3DDevice9* dev, IDirect3DSurface9* src, bool stret
 
 void Fx_BeforeOther(IDirect3DDevice9* dev)
 {
+	FxScope scope;
 	if (g_gi)
 		ssgi::GI_BeforeOther(dev);
 }
 
 void Fx_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s)
 {
+	FxScope scope;
 	if (g_gi)
 		ssgi::GI_BeforeSetRenderTarget(dev, index, s);
 	if (g_vol)
@@ -350,6 +365,7 @@ void Fx_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 
 void Fx_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 {
+	FxScope scope;
 	CheckMainPass(index, s, rt0);
 	if (g_gi && index < 4)
 		ssgi::GI_AfterSetRenderTarget(dev, index, s, rt0);
@@ -390,6 +406,7 @@ void Fx_AfterVertexConstants(IDirect3DDevice9* dev, UINT start, UINT count)
 
 void Fx_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps)
 {
+	FxScope scope;
 	(void)ps;
 	if (g_gi)
 		ssgi::GI_BeforeDraw(dev, vs);
