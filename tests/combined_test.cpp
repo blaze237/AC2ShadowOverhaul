@@ -398,6 +398,36 @@ static int TestOrder()
 	Check(post.ps == g.postPs && post.rt[0] == g.bb && post.tex[0] == g.sceneTex && post.tex[1] == g.bloomTex && post.colorWrite == 0xF,
 		"post draw: the game's shader, target, textures and colour mask");
 	Check(E2E_LogCount("(MSAA) is on") == 0 && E2E_LogCount("multisampled") == 0, "no MSAA warning");
+
+	// One sun for everything (core/scene.h reads g_ShadowedDirect once): the contact shadows' view-space
+	// direction (GTAO pass, c6) is the volumetrics' world direction (march pass, c21) seen through the
+	// volumetrics' camera axes (c5-c7), and both are the game's g_ShadowedDirect, normalised.
+	const MockDraw *gtao = nullptr, *march = nullptr;
+	for (size_t i = t.begin; i < t.end; i++)
+	{
+		const char* name = E2E_PassName(L.draws[i]);
+		if (name && !strcmp(name, "gtao"))
+			gtao = &L.draws[i];
+		if (name && !strcmp(name, "march"))
+			march = &L.draws[i];
+	}
+	bool oneSun = gtao && march;
+	if (oneSun)
+	{
+		const V3 sun = Norm(V3{ -0.2789036f, -0.434417f, 0.856443f }); // as Game::Create sets it
+		const float* w = march->psConst[21];
+		oneSun = fabsf(w[0] - sun.x) < 1e-5f && fabsf(w[1] - sun.y) < 1e-5f && fabsf(w[2] - sun.z) < 1e-5f;
+		for (int k = 0; k < 3; k++)
+		{
+			const float* axis = march->psConst[5 + k];
+			float v = axis[0] * w[0] + axis[1] * w[1] + axis[2] * w[2];
+			oneSun &= fabsf(gtao->psConst[6][k] - v) < 1e-4f;
+		}
+		oneSun &= gtao->psConst[6][3] > 0; // contact shadows on (their length)
+		printf("sun: contact shadows (view) (%.4f, %.4f, %.4f), volumetrics (world) (%.4f, %.4f, %.4f)\n", gtao->psConst[6][0],
+			gtao->psConst[6][1], gtao->psConst[6][2], w[0], w[1], w[2]);
+	}
+	Check(oneSun, "contact shadows and volumetrics use the same sun direction (the game's g_ShadowedDirect)");
 	return 0;
 }
 

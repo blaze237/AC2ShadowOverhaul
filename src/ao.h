@@ -48,9 +48,6 @@ void CS_SetLength(float metres);
 // explains a false return or an unmatched shader.
 bool AO_RewritePS(const DWORD* code, std::vector<DWORD>& out, bool& matched, std::string& reason);
 
-// Register of g_ShadowedDirect (the sun direction, its first member) in a ps_3_0 shader, or -1.
-int AO_SunRegister(const DWORD* code);
-
 // Where the rewrite put things, for tests.
 struct AoRewriteLayout
 {
@@ -69,11 +66,10 @@ extern AoRewriteLayout g_aoLastLayout;
 
 // Our own device calls go to the original (unhooked) functions (core/fxpass.h).
 
-void AO_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code);    // remembers where the sun direction is
 // Render target changes: Before may apply AO (returns true if it did); After binds/unbinds ours.
 bool AO_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
 void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0);
-bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps); // true if AO was applied first
+bool AO_BeforeDraw(IDirect3DDevice9* dev); // true if AO was applied first
 bool AO_InPass();                             // our target is bound (the opaque pass is drawing)
 bool AO_BeforeOther(IDirect3DDevice9* dev);   // Clear, StretchRect, ColorFill, EndScene...
 bool AO_BeforePresent(IDirect3DDevice9* dev); // also ends the frame

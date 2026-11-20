@@ -70,6 +70,72 @@ void Scene_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code)
 	ReleaseSRWLockExclusive(&g_vsLock);
 }
 
+// ---- Pixel shaders: where the sun and fog constants are ---------------------------------------------
+
+struct LightRegisters
+{
+	int sun = -1, sunCount = 0, fog = -1;
+};
+static SRWLOCK g_psLock = SRWLOCK_INIT;
+static std::unordered_map<void*, LightRegisters> g_psLights;
+
+void Scene_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code)
+{
+	if (!ps)
+		return;
+	ConstantTable t;
+	LightRegisters r;
+	if (code && (code[0] & 0xFFFF0000) == 0xFFFF0000 && ReadConstantTable(code, t))
+	{
+		if (const ShaderConstant* c = t.Find("g_ShadowedDirect", RS_FLOAT4)) // struct { m_Direction; m_Color; ... }
+		{
+			r.sun = c->reg;
+			r.sunCount = c->count;
+		}
+		r.fog = t.Register("g_FogColor", RS_FLOAT4);
+	}
+	AcquireSRWLockExclusive(&g_psLock);
+	if (r.sun >= 0 || r.fog >= 0)
+		g_psLights[ps] = r;
+	else
+		g_psLights.erase(ps); // the address may have belonged to a released shader
+	ReleaseSRWLockExclusive(&g_psLock);
+}
+
+static void CaptureLights(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
+{
+	if (!ps)
+		return;
+	LightRegisters r;
+	AcquireSRWLockShared(&g_psLock);
+	auto it = g_psLights.find(ps);
+	if (it != g_psLights.end())
+		r = it->second;
+	ReleaseSRWLockShared(&g_psLock);
+	float v[8];
+	if (r.sun >= 0 && (!S.sunOk || (!S.sunColourOk && r.sunCount >= 2)) &&
+		SUCCEEDED(dev->GetPixelShaderConstantF(r.sun, v, r.sunCount >= 2 ? 2 : 1)))
+	{
+		float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+		if (len > 0.5f && len < 2.0f) // a direction (not an unset register)
+		{
+			for (int k = 0; k < 3; k++)
+				S.sunDir[k] = v[k] / len;
+			if (!S.sunKnown)
+				LogInfo("Main pass: sun direction found (%.3f, %.3f, %.3f).", S.sunDir[0], S.sunDir[1], S.sunDir[2]);
+			S.sunOk = S.sunKnown = true;
+			if (r.sunCount >= 2)
+			{
+				for (int k = 0; k < 3; k++)
+					S.sunColour[k] = v[4 + k] > 0 ? v[4 + k] : 0;
+				S.sunColourOk = true;
+			}
+		}
+	}
+	if (r.fog >= 0 && !S.fogOk && SUCCEEDED(dev->GetPixelShaderConstantF(r.fog, S.fogColour, 1)))
+		S.fogOk = true;
+}
+
 // ---- Camera ------------------------------------------------------------------------------------
 
 static void CaptureCamera(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
@@ -170,13 +236,17 @@ void Scene_AfterSetViewport(const D3DVIEWPORT9* vp)
 		S.viewport = *vp;
 }
 
-void Scene_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
+void Scene_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps)
 {
 	if (S.inOpaquePass)
 	{
-		// The first opaque draw with the camera matrices sets this frame's camera.
+		// The first opaque draw with the camera matrices sets this frame's camera; the first ones
+		// with the sun and fog constants, the sun and fog (needs a device whose constants can be
+		// read back, not a pure device).
 		if (!S.camera.ok)
 			CaptureCamera(dev, vs);
+		if (!S.sunOk || !S.sunColourOk || !S.fogOk)
+			CaptureLights(dev, ps);
 		return;
 	}
 	if (S.passSeen && S.rt0 == S.sceneColour && IsSkyViewport(S.viewport))
@@ -188,6 +258,7 @@ void Scene_EndFrame()
 	if (S.camera.ok)
 		S.prevCamera = S.camera;
 	S.camera.ok = false;
+	S.sunOk = S.sunColourOk = S.fogOk = false;
 	S.passSeen = S.inOpaquePass = S.skySeen = false;
 	S.sceneColour = nullptr;
 	S.sceneColourTexture = nullptr;
@@ -202,6 +273,7 @@ void Scene_OnLostDevice()
 	S.sceneColourTexture = nullptr;
 	S.zw = nullptr;
 	S.camera.ok = S.prevCamera.ok = false;
+	S.sunOk = S.sunColourOk = S.fogOk = false;
 }
 
 void Scene_OnDeviceReady(IDirect3DSurface9* backBuffer)

@@ -4,9 +4,14 @@
 // its own hooks chained in ASI load order. Now there is one set of hooks, and each device call is
 // passed to the effects here in a fixed order:
 //
-//   end of the opaque pass:  ambient occlusion + contact shadows, then SSGI (traces the AO'd image)
+//   end of the opaque pass:  the half-res normals + depth AO and SSGI share (core/geoprep.h, once),
+//                            ambient occlusion + contact shadows, then SSGI (traces the AO'd image)
 //   after the sky:           volumetric fog + sun shafts
 //   first read of the scene: TAA resolve (so everything above is anti-aliased)
+//
+// What they read from the game's frame (main pass, camera, sun, fog) comes from one tracker,
+// core/scene.h, fed before any effect sees a call; the opaque shaders get AO's outputs and SSGI's
+// bounce light from one rewrite (litshader.h).
 //
 // Every effect draws its own passes through the original device functions, below the hooks, so no
 // effect ever sees another's draws. Text overlays (the menus, the MSAA warning) go through the

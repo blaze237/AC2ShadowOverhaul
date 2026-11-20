@@ -15,7 +15,6 @@
 #include "core/scene.h"
 #include "core/fxpass.h"
 #include "core/geoprep.h"
-#include "core/shaderinfo.h"
 #include <math.h>
 #include <stdio.h>
 #include <unordered_map>
@@ -75,58 +74,6 @@ bool CS_Init()
 	g_csOn = IniInt(S, "StartEnabled", 1) != 0;
 	LogInfo("Contact shadows: length %.2f m%s.", (double)g_csLength, g_csOn ? "" : " (starting off)");
 	return true;
-}
-
-// ---- Pixel shaders: where the sun direction is -------------------------------------------------
-
-int AO_SunRegister(const DWORD* code)
-{
-	core::ConstantTable vars;
-	if (!code || (code[0] & 0xFFFF0000) != 0xFFFF0000 || !core::ReadConstantTable(code, vars))
-		return -1;
-	return vars.Register("g_ShadowedDirect", core::RS_FLOAT4); // m_Direction is its first member
-}
-
-static SRWLOCK g_psLock = SRWLOCK_INIT;
-static std::unordered_map<void*, int> g_psSun; // game pixel shader -> register of g_ShadowedDirect
-
-void AO_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code)
-{
-	if (!g_enabled || !ps)
-		return;
-	int reg = AO_SunRegister(code);
-	AcquireSRWLockExclusive(&g_psLock);
-	if (reg >= 0)
-		g_psSun[ps] = reg;
-	else
-		g_psSun.erase(ps);
-	ReleaseSRWLockExclusive(&g_psLock);
-}
-
-static float g_sunWorld[3];   // direction towards the sun, world space (last seen)
-static bool g_sunKnown = false, g_sunThisFrame = false;
-
-static void CaptureSun(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
-{
-	if (!ps)
-		return;
-	int reg = -1;
-	AcquireSRWLockShared(&g_psLock);
-	auto it = g_psSun.find(ps);
-	if (it != g_psSun.end())
-		reg = it->second;
-	ReleaseSRWLockShared(&g_psLock);
-	float v[4];
-	if (reg < 0 || FAILED(dev->GetPixelShaderConstantF(reg, v, 1)))
-		return;
-	float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-	if (!(len > 0.5f && len < 2.0f))
-		return;
-	for (int k = 0; k < 3; k++)
-		g_sunWorld[k] = v[k] / len;
-	if (!g_sunKnown)
-		LogInfo("Contact shadows: sun direction found (%.3f, %.3f, %.3f).", g_sunWorld[0], g_sunWorld[1], g_sunWorld[2]);
-	g_sunKnown = g_sunThisFrame = true;
 }
 
 // ---- Camera ------------------------------------------------------------------------------------
@@ -324,7 +271,7 @@ void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 	}
 }
 
-bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
+bool AO_BeforeDraw(IDirect3DDevice9* dev)
 {
 	if (g_pending)
 	{
@@ -336,8 +283,6 @@ bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
 		g_passDraws++;
 		if (!g_camOk)
 			g_camOk = core::Scene().camera.ok;
-		if (!g_sunThisFrame)
-			CaptureSun(dev, ps);
 	}
 	return false;
 }
@@ -364,7 +309,6 @@ bool AO_BeforePresent(IDirect3DDevice9* dev)
 	}
 	g_done = g_cleared = g_pending = false;
 	g_camOk = false;
-	g_sunThisFrame = false;
 	g_passDraws = 0;
 	return applied;
 }
@@ -424,12 +368,14 @@ static void Composite(IDirect3DDevice9* dev)
 		core::SetSamplerClamp(dev, s, D3DTEXF_POINT);
 
 	const float view = (float)g_view;
-	// Sun direction in view space; contact shadows off = length 0. AO off = strength 0 (AO^0 = 1).
+	// Sun direction in view space (the scene tracker's: this frame's, else the last seen);
+	// contact shadows off = length 0. AO off = strength 0 (AO^0 = 1).
+	const core::SceneState& sc = core::Scene();
 	float sunView[3] = { 0, 0, 0 };
 	const float* axes[3] = { cam.right, cam.up, cam.forward };
 	for (int k = 0; k < 3; k++)
-		sunView[k] = axes[k][0] * g_sunWorld[0] + axes[k][1] * g_sunWorld[1] + axes[k][2] * g_sunWorld[2];
-	const bool cs = CS_Active() && g_sunKnown;
+		sunView[k] = axes[k][0] * sc.sunDir[0] + axes[k][1] * sc.sunDir[1] + axes[k][2] * sc.sunDir[2];
+	const bool cs = CS_Active() && sc.sunKnown;
 	const float aoStrength = AO_Active() ? g_strength : 0.0f;
 	const float c[8][4] = {
 		{ (float)g_w, (float)g_h, 1.0f / g_w, 1.0f / g_h },

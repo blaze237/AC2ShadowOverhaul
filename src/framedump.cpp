@@ -1481,8 +1481,8 @@ static void NoteAO(bool applied)
 
 static void BeforeDraw(IDirect3DDevice9* dev)
 {
-	core::Scene_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs);
-	NoteAO(AO_BeforeDraw(dev, (IDirect3DPixelShader9*)g_ps));
+	core::Scene_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps);
+	NoteAO(AO_BeforeDraw(dev));
 	Fx_BeforeDraw(dev);
 	if (AO_InPass() && g_ps)
 	{
@@ -1996,7 +1996,7 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 		}
 		g_gameCode.erase(*out);
 		g_aoOutput[*out] = aoKind != 0;
-		AO_OnCreatePixelShader(*out, code);
+		core::Scene_OnCreatePixelShader(*out, code);
 		Fx_OnCreatePixelShader(*out, code);
 		if (haveSet)
 		{

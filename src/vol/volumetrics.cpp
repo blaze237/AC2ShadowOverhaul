@@ -110,14 +110,14 @@ struct VsInfo
 };
 struct PsInfo
 {
-	int sun = -1, fogColor = -1, nearFar = -1, rangeMin = -1, rangeMax = -1, scaleX = -1, scaleY = -1, offsetX = -1, offsetY = -1,
+	int nearFar = -1, rangeMin = -1, rangeMax = -1, scaleX = -1, scaleY = -1, offsetX = -1, offsetY = -1,
 		bias = -1, fade = -1, cloudUV = -1, shadowSampler = -1, cloudSampler = -1;
 	bool Shadow() const
 	{
 		return nearFar >= 0 && rangeMin >= 0 && rangeMax >= 0 && scaleX >= 0 && scaleY >= 0 && offsetX >= 0 && offsetY >= 0 &&
 			fade >= 0 && shadowSampler >= 0;
 	}
-	bool Any() const { return sun >= 0 || fogColor >= 0 || Shadow() || (cloudUV >= 0 && cloudSampler >= 0); }
+	bool Any() const { return Shadow() || (cloudUV >= 0 && cloudSampler >= 0); }
 };
 
 static CRITICAL_SECTION g_mapLock;
@@ -169,8 +169,6 @@ void Vol_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code)
 			int* reg;
 			int minCount;
 		} const map[] = {
-			{ "g_ShadowedDirect", &info.sun, 2 }, // struct { m_Direction; m_Color; ... }
-			{ "g_FogColor", &info.fogColor, 1 },
 			{ "g_ShadowNearFar", &info.nearFar, 1 },
 			{ "g_ShadowCascadesRangesMin", &info.rangeMin, 1 },
 			{ "g_ShadowCascadesRangesMax", &info.rangeMax, 1 },
@@ -209,7 +207,7 @@ struct FrameData
 	float light3x4[3][4];
 	Shadow sh;
 	IDirect3DBaseTexture9* atlas; // referenced until the frame is done
-	float sunDir[4], sunCol[4];
+	float sunDir[4], sunCol[4]; // the scene tracker's (core/scene.h), copied at Apply
 	float fogColor[4];
 	float cloudUV[4];
 	IDirect3DBaseTexture9* cloudTex;
@@ -234,7 +232,8 @@ static void ResetFrame()
 }
 
 // Cloud shadow parameters come with the shadow ones (same shaders), so they don't hold this up.
-static bool FrameComplete() { return g_frame.cam && g_frame.light && g_frame.shadow && g_frame.sun && g_frame.fog; }
+// (The sun and the fog colour come from the scene tracker, core/scene.h.)
+static bool FrameComplete() { return g_frame.cam && g_frame.light && g_frame.shadow; }
 
 static IDirect3DVertexShader9* g_curVs;
 static IDirect3DPixelShader9* g_curPs;
@@ -277,25 +276,6 @@ static void CaptureFromDraw(IDirect3DDevice9* dev)
 		g_frame.light = true;
 	if (!havePs)
 		return;
-	if (!g_frame.sun && pi.sun >= 0)
-	{
-		float v[8];
-		if (SUCCEEDED(dev->GetPixelShaderConstantF(pi.sun, v, 2)))
-		{
-			float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-			if (len > 0.5f && len < 2.0f)
-			{
-				for (int k = 0; k < 3; k++)
-				{
-					g_frame.sunDir[k] = v[k] / len;
-					g_frame.sunCol[k] = v[4 + k] > 0 ? v[4 + k] : 0;
-				}
-				g_frame.sun = true;
-			}
-		}
-	}
-	if (!g_frame.fog && GetPs(dev, pi.fogColor, g_frame.fogColor))
-		g_frame.fog = true;
 	if (!g_frame.shadow && pi.Shadow())
 	{
 		Shadow& s = g_frame.sh;
@@ -617,6 +597,16 @@ static void Apply(IDirect3DDevice9* dev)
 	g_phase = DONE;
 	if (!Wanted() || g_failed)
 		return;
+	// The sun and fog of this frame, as the scene tracker read them from the opaque draws.
+	const core::SceneState& sc = core::Scene();
+	g_frame.sun = sc.sunOk && sc.sunColourOk;
+	g_frame.fog = sc.fogOk;
+	for (int k = 0; k < 3; k++)
+	{
+		g_frame.sunDir[k] = sc.sunDir[k];
+		g_frame.sunCol[k] = sc.sunColour[k];
+	}
+	memcpy(g_frame.fogColor, sc.fogColour, sizeof(g_frame.fogColor));
 	const FrameData& F = g_frame;
 	if (!F.cam || !F.sun)
 	{

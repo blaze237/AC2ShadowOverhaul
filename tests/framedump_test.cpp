@@ -388,7 +388,7 @@ int main()
 		}
 		printf("ao: first frame applied (logged): %s\n", log.find("Ambient occlusion: first frame applied") != std::string::npos ? "yes" : "NO");
 		printf("contact shadows: sun direction read from g_ShadowedDirect: %s\n",
-			log.find("Contact shadows: sun direction found (0.000, 0.600, 0.800)") != std::string::npos ? "yes" : "NO");
+			log.find("Main pass: sun direction found (0.000, 0.600, 0.800)") != std::string::npos ? "yes" : "NO");
 
 		// The menu turns AO (6) and contact shadows (9) off: next frame nothing is bound or drawn.
 		MenuPress(dev, '6');

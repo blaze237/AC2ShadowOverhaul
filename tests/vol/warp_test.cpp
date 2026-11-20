@@ -144,7 +144,19 @@ static bool Trace(V3 o, V3 d, float& t, V3& n)
 // ---- Sun shadow atlas, laid out like the game's ------------------------------------------------
 
 static V3 g_sun, g_lx, g_ly, g_eye;
-static const float kRangeMax[4] = { 400, 100, 30, 10 }, kRangeMin[4] = { 100, 30, 10, 0 };
+static const float kVanillaMax[4] = { 400, 100, 30, 10 }; // the game's default cascades, coarsest first
+// The cascade rings in use: vanilla, or stretched like the shadow distance tweaks do (src/shadows.cpp
+// scales the game's splits before it builds the cascades, so the constants the fog reads change).
+static float kRangeMax[4] = { 400, 100, 30, 10 }, kRangeMin[4] = { 100, 30, 10, 0 };
+static void SetCascades(float distanceScale, float splitScale)
+{
+	kRangeMax[0] = kVanillaMax[0] * distanceScale;
+	for (int i = 1; i < 4; i++)
+		kRangeMax[i] = fminf(kVanillaMax[i] * splitScale, kRangeMax[i - 1]); // kept ordered, as shadows.cpp does
+	for (int i = 0; i < 3; i++)
+		kRangeMin[i] = kRangeMax[i + 1];
+	kRangeMin[3] = 0;
+}
 static const float kNearFar[2] = { -1.0f / 3600.0f, 1.0f / 3.0f };
 static float g_light[3][4], g_scaleX[4], g_scaleY[4], g_offX[4], g_offY[4], g_fade[2];
 static std::vector<float> g_atlas;
@@ -905,6 +917,29 @@ int main(int argc, char** argv)
 						dimmed++;
 			}
 		Check(skyPx > 0 && dimmed == 0, "sun: sky and sun keep their full brightness", dimmed, skyPx);
+	}
+
+	// ---- Street view again with the cascades stretched as the shipped ini does (distance and splits
+	// x 6): the fog reads the ranges, scales, offsets and fade from the game's constants, so it must
+	// still match the ray-traced reference (the atlas is just coarser per metre).
+	{
+		SetCascades(6.0f, 6.0f);
+		g_eye = { 0.0f, 0.0f, 1.7f };
+		BuildShadowSpace();
+		g_atlasTex.srv->Release();
+		g_atlasTex.t->Release();
+		g_atlasTex = MakeTex(4 * TILE, TILE, DXGI_FORMAT_R32_FLOAT, false, g_atlas.data(), 4 * TILE * 4);
+		SetCamera(0.0f, 4.0f);
+		Outputs stretched = RunView(s);
+		CheckAgainstReference(stretched, s, "street, cascades x6");
+		double sumSt = 0, sumUnSt = 0;
+		for (size_t i = 0; i < stretched.march.size(); i += 4)
+		{
+			sumSt += stretched.march[i + 1];
+			sumUnSt += unshadowed.march[i + 1];
+		}
+		Check(sumSt < 0.8 * sumUnSt, "street, cascades x6: shadows still remove a good share of the scattered sunlight", sumSt / sumUnSt, 0.8);
+		SetCascades(1.0f, 1.0f);
 	}
 
 	// ---- Beams view: from the street, the low sun across the row of alleys, plugin defaults --------

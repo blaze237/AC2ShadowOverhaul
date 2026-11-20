@@ -6,8 +6,9 @@
 // opaque batches and after the last one, then draws the sky (viewport depth range 1..1), then
 // alpha-blended transparents, then switches RT0 away for post-processing.
 //
-// We read what we need from the shader constants of the opaque draws (camera, the shadow atlas's
-// light-space matrix and cascade layout, sun direction and colour, fog colour, cloud shadows),
+// We read what we need from the shader constants of the opaque draws (the shadow atlas's light-space
+// matrix and cascade layout, cloud shadows; the camera, sun direction and colour and fog colour come
+// from the scene tracker, core/scene.h, which reads them once for every effect),
 // and after the sky - before the transparents - run our passes and blend the result onto the scene
 // colour. See volumetrics.cpp for the frame tracking and src/shaders/volumetrics.hlsl for the passes.
 #pragma once
