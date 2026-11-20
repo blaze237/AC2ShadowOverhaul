@@ -5,7 +5,8 @@
 #
 #  Shared core (tests/core/)
 #   - the camera maths (bit for bit what the effects computed before they shared it) and the
-#     reprojection helpers; the constant table reader on our shaders and the game's (*)
+#     reprojection helpers; the constant table reader on our shaders and the game's (*); the menu
+#     engine's keys, exclusive opening and saving
 #  Shadows, soft shadows, ambient occlusion, contact shadows, frame dump (tests/)
 #   - end to end (fdtest/): the .asi in a fake AssassinsCreedIIGame.exe over the mock d3d9.dll; the
 #     shader rewrite, the F9 menu (frame dump, on/off switches, soft shadow width), ini saving
@@ -47,7 +48,7 @@ FLAGS="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEA
 SUB="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -fms-extensions -fasm-blocks -I.. -I../../src -fuse-ld=lld -static"
 TESTS="$(pwd)"
 # The shared core, for tests that link an effect's code (paths from a suite's folder).
-CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp"
+CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp ../../src/core/menu.cpp"
 OUT="$TESTS/run_tests.out"
 
 # A Windows path for a folder (the tests are Windows programs), or "" if it doesn't exist.
@@ -123,6 +124,8 @@ build "camera test" $CXX $SUB -o camera_test.exe camera_test.cpp ../../src/core/
 	run "core: camera / reprojection maths" . -- ./camera_test.exe
 build "constant table test" $CXX $SUB -o shaderinfo_test.exe shaderinfo_test.cpp ../../src/core/shaderinfo.cpp &&
 	run "core: constant tables (our shaders and the game's)" . -- ./shaderinfo_test.exe "$SHADERS" "$VS_SHADERS"
+build "menu engine test" $CXX $SUB -o menu_test.exe menu_test.cpp ../../src/core/menu.cpp ../../src/common.cpp &&
+	run "core: menu engine (keys, exclusive opening, saving)" . -- ./menu_test.exe
 cd ..
 
 # ---- Shadows, soft shadows, AO, contact shadows, frame dump ---------------------------------------

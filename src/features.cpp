@@ -13,6 +13,7 @@
 #include "taa/menu.h"
 #include "taa/vsjitter.h"
 #include "core/scene.h"
+#include "core/menu.h"
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -116,65 +117,13 @@ static std::string MsaaBlockedEffects()
 	return list;
 }
 
-// Minimal ID3DXFont (from the d3dx9_42.dll the game already loads), as in the menus.
-struct WarnFont;
-struct WarnFontVtbl
-{
-	void* QueryInterface;
-	void* AddRef;
-	ULONG(__stdcall* Release)(WarnFont*);
-	void* pad[11];
-	INT(__stdcall* DrawTextA)(WarnFont*, void* sprite, LPCSTR text, INT count, RECT* rect, DWORD format, D3DCOLOR color);
-	void* DrawTextW;
-	HRESULT(__stdcall* OnLostDevice)(WarnFont*);
-	HRESULT(__stdcall* OnResetDevice)(WarnFont*);
-};
-struct WarnFont
-{
-	WarnFontVtbl* vt;
-};
-typedef HRESULT(WINAPI* PFN_D3DXCreateFontA)(IDirect3DDevice9*, INT, UINT, UINT, UINT, BOOL, DWORD, DWORD, DWORD, DWORD, LPCSTR, WarnFont**);
-static WarnFont* g_warnFont;
-static UINT g_warnFontHeight;
-static bool g_warnFontFailed;
+// Bigger than the menus' text, centred a sixth of the way down the screen.
+static core::TextFont g_warnFont;
 
-static bool EnsureWarnFont(IDirect3DDevice9* dev, UINT bbHeight)
-{
-	UINT height = bbHeight / 40;
-	if (height < 15)
-		height = 15;
-	if (g_warnFont && height == g_warnFontHeight)
-		return true;
-	if (g_warnFont)
-		g_warnFont->vt->Release(g_warnFont);
-	g_warnFont = nullptr;
-	if (g_warnFontFailed)
-		return false;
-	PFN_D3DXCreateFontA create = nullptr;
-	for (const char* d : { "d3dx9_42.dll", "d3dx9_43.dll" })
-	{
-		HMODULE m = GetModuleHandleA(d);
-		if (!m)
-			m = LoadLibraryA(d);
-		if (m && (create = (PFN_D3DXCreateFontA)GetProcAddress(m, "D3DXCreateFontA")) != nullptr)
-			break;
-	}
-	if (!create || FAILED(create(dev, (INT)height, 0, FW_BOLD, 1, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
-						   DEFAULT_PITCH | FF_DONTCARE, "Consolas", &g_warnFont)) ||
-		!g_warnFont)
-	{
-		g_warnFont = nullptr;
-		g_warnFontFailed = true;
-		return false;
-	}
-	g_warnFontHeight = height;
-	return true;
-}
-
-static void DrawWarning(IDirect3DDevice9* dev, unsigned bbW, unsigned bbH)
+static void DrawWarning(IDirect3DDevice9* dev)
 {
 	bool msaa = g_ppMsaa || core::Scene_MsaaRecently();
-	if (!msaa || !bbW || !bbH)
+	if (!msaa)
 		return;
 	std::string effects = MsaaBlockedEffects();
 	if (effects.empty())
@@ -185,43 +134,24 @@ static void DrawWarning(IDirect3DDevice9* dev, unsigned bbW, unsigned bbH)
 		logged = true;
 		LogWarn("In-game anti-aliasing (MSAA) is on, so these are off: %s. Showing the on-screen warning.", effects.c_str());
 	}
-	if (!EnsureWarnFont(dev, bbH))
+	core::BackBufferOverlay o(dev);
+	if (!o.Ok())
+		return;
+	UINT height = o.Height() / 40;
+	if (!g_warnFont.Ensure(dev, height < 15 ? 15 : height) || !o.Begin())
 		return;
 	std::string line1 = "AC2 Shadow Overhaul: the game's anti-aliasing (MSAA) is on";
 	std::string line2 = "These need it off and are not working: " + effects;
 	std::string line3 = "Turn anti-aliasing off in the game's graphics options (or switch these effects off in their menus)";
-
-	IDirect3DSurface9 *bb = nullptr, *oldRt = nullptr;
-	D3DVIEWPORT9 oldVp;
-	if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb)
-		return;
-	dev->GetRenderTarget(0, &oldRt);
-	dev->GetViewport(&oldVp);
-	dev->SetRenderTarget(0, bb);
-	D3DVIEWPORT9 vp = { 0, 0, bbW, bbH, 0.0f, 1.0f };
-	dev->SetViewport(&vp);
-	if (SUCCEEDED(dev->BeginScene()))
+	const int h = (int)g_warnFont.Height(), w = (int)o.Width(), shadow = h / 12 + 1;
+	const DWORD fmt = DT_CENTER | DT_TOP | DT_NOCLIP | DT_SINGLELINE;
+	int y = (int)o.Height() / 6;
+	for (const std::string* s : { &line1, &line2, &line3 })
 	{
-		int h = (int)g_warnFontHeight;
-		int y = (int)bbH / 6;
-		for (const std::string* s : { &line1, &line2, &line3 })
-		{
-			int shadow = h / 12 + 1;
-			RECT r = { shadow, y + shadow, (LONG)bbW + shadow, y + 2 * h };
-			g_warnFont->vt->DrawTextA(g_warnFont, nullptr, s->c_str(), -1, &r, DT_CENTER | DT_TOP | DT_NOCLIP | DT_SINGLELINE,
-				D3DCOLOR_ARGB(220, 0, 0, 0));
-			r = { 0, y, (LONG)bbW, y + 2 * h };
-			g_warnFont->vt->DrawTextA(g_warnFont, nullptr, s->c_str(), -1, &r, DT_CENTER | DT_TOP | DT_NOCLIP | DT_SINGLELINE,
-				D3DCOLOR_XRGB(255, 40, 40));
-			y += h * 5 / 4;
-		}
-		dev->EndScene();
+		g_warnFont.Draw(s->c_str(), { shadow, y + shadow, w + shadow, y + 2 * h }, fmt, D3DCOLOR_ARGB(220, 0, 0, 0));
+		g_warnFont.Draw(s->c_str(), { 0, y, w, y + 2 * h }, fmt, D3DCOLOR_XRGB(255, 40, 40));
+		y += h * 5 / 4;
 	}
-	dev->SetRenderTarget(0, oldRt ? oldRt : bb);
-	dev->SetViewport(&oldVp);
-	if (oldRt)
-		oldRt->Release();
-	bb->Release();
 }
 
 // ---- Device lifetime ---------------------------------------------------------------------------
@@ -240,12 +170,8 @@ void Fx_OnDeviceCreated(IDirect3D9* d3d, UINT adapter, IDirect3DDevice9* dev, DW
 
 void Fx_OnLostDevice()
 {
-	ssgi::Menu_OnLostDevice();
-	if (g_volMenu)
-		vol::Menu_OnLostDevice();
-	taa::Menu_OnLostDevice();
-	if (g_warnFont)
-		g_warnFont->vt->OnLostDevice(g_warnFont);
+	core::Menu_OnLostDevice();
+	g_warnFont.OnLostDevice();
 	if (g_gi)
 		ssgi::GI_OnLostDevice();
 	if (g_vol)
@@ -259,12 +185,8 @@ void Fx_OnResetDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp)
 	NotePresentParams(pp);
 	if (g_vol)
 		vol::Vol_OnDeviceReady(dev);
-	ssgi::Menu_OnResetDevice();
-	if (g_volMenu)
-		vol::Menu_OnResetDevice();
-	taa::Menu_OnResetDevice();
-	if (g_warnFont)
-		g_warnFont->vt->OnResetDevice(g_warnFont);
+	core::Menu_OnResetDevice();
+	g_warnFont.OnResetDevice();
 }
 
 // ---- Device calls ------------------------------------------------------------------------------
@@ -291,26 +213,14 @@ void Fx_BeforePresent(IDirect3DDevice9* dev)
 		taa::Taa_OnPresent(dev);
 }
 
-void Fx_DrawOverlays(IDirect3DDevice9* dev, unsigned bbW, unsigned bbH)
+void Fx_DrawOverlays(IDirect3DDevice9* dev)
 {
 	g_fxPassthrough = true;
-	ssgi::Menu_OnPresent(dev, [] {
-		ssgi::GiDeviceFns d = {};
-		d.SetRenderTarget = g_fns.SetRenderTarget;
-		d.SetDepthStencilSurface = g_fns.SetDepthStencilSurface;
-		d.SetTexture = g_fns.SetTexture;
-		d.DrawPrimitiveUP = g_fns.DrawPrimitiveUP;
-		d.SetVertexShader = g_fns.SetVertexShader;
-		d.SetPixelShader = g_fns.SetPixelShader;
-		d.CreatePixelShader = g_fns.CreatePixelShader;
-		d.CreateVertexShader = g_fns.CreateVertexShader;
-		d.StretchRect = g_fns.StretchRect;
-		return d;
-	}());
+	ssgi::Menu_OnPresent(dev);
 	if (g_volMenu)
 		vol::Menu_OnPresent(dev);
 	taa::Menu_OnPresent(dev);
-	DrawWarning(dev, bbW, bbH);
+	DrawWarning(dev);
 	g_fxPassthrough = false;
 }
 

@@ -1502,7 +1502,6 @@ static void BeforeDraw(IDirect3DDevice9* dev)
 static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
 {
 	LogInfo("Device Reset: %s", DescribePresent(pp).c_str());
-	Tuning_OnLostDevice();
 	core::Scene_OnLostDevice();
 	AO_OnLostDevice();
 	Fx_OnLostDevice();
@@ -1510,7 +1509,6 @@ static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* p
 	if (SUCCEEDED(hr))
 	{
 		AfterDeviceReady(dev);
-		Tuning_OnResetDevice();
 		Fx_OnResetDevice(dev, pp);
 	}
 	else
@@ -1545,8 +1543,8 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 	{
 		g_fxPassthrough = true;
 		if (Tuning_Enabled())
-			Tuning_OnPresent(dev, g_bbW, g_bbH);
-		Fx_DrawOverlays(dev, g_bbW, g_bbH);
+			Tuning_OnPresent(dev);
+		Fx_DrawOverlays(dev);
 		g_fxPassthrough = false;
 	}
 	HRESULT hr = o_Present(dev, a, b, w, r);

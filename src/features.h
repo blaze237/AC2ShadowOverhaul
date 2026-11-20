@@ -51,7 +51,7 @@ void Fx_OnResetDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp); /
 
 // Device calls. Before* may run effect passes first.
 void Fx_BeforePresent(IDirect3DDevice9* dev);
-void Fx_DrawOverlays(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight); // menus + warnings, just before Present
+void Fx_DrawOverlays(IDirect3DDevice9* dev); // menus + warnings, just before Present
 void Fx_BeforeCopyFrom(IDirect3DDevice9* dev, IDirect3DSurface9* src, bool stretchRect); // StretchRect / GetRenderTargetData
 void Fx_BeforeOther(IDirect3DDevice9* dev);              // ColorFill, Clear, EndScene
 void Fx_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);

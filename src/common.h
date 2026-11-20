@@ -1,4 +1,4 @@
-// AC2ShadowOverhaul - shared helpers (logging, ini, memory patching, signature scanning, menus)
+// AC2ShadowOverhaul - shared helpers (logging, ini, memory patching, signature scanning)
 #pragma once
 
 #include <windows.h>
@@ -50,14 +50,12 @@ bool Shadows_TweaksOn();
 void Shadows_SetTweaksOn(bool on);
 float Shadows_GetSetting(int which);
 void Shadows_SetSetting(int which, float value);
-// In-game menu ([Menu] MenuKey shows it top right; Up/Down or 1-0 select, Left/Right change).
+// In-game shadow menu (tuning.cpp; [Menu] MenuKey, default F9; see core/menu.h for the keys).
 bool Tuning_Init();
 void Tuning_Flush(); // writes unsaved menu changes to the ini
 bool Tuning_Enabled();
 struct IDirect3DDevice9;
-void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned backBufferWidth, unsigned backBufferHeight);
-void Tuning_OnLostDevice();
-void Tuning_OnResetDevice();
+void Tuning_OnPresent(IDirect3DDevice9* dev);
 void FrameDump_Init(bool deviceHooksNeeded);
 bool FrameDump_Available(); // [Debug] FrameDump=1 and the hooks are in
 bool FrameDump_Busy();      // a dump is requested or being written
@@ -65,11 +63,3 @@ void FrameDump_Request();   // dump the next frame(s) (the menu's "Frame dump" i
 void CrashLog_Init();
 void CrashLog_Detach(bool processExit);
 void LogMemoryState(const char* when);
-
-// ---- Menus -----------------------------------------------------------------------------------
-// Each effect group has its own menu and key (shadows F9, SSGI F3, TAA F1, volumetrics F11); only
-// one is open at a time. A menu that opens claims ownership; the others see they lost it and hide.
-enum MenuId { MENU_NONE = 0, MENU_SHADOWS, MENU_SSGI, MENU_TAA, MENU_VOLUMETRICS };
-int MenuOwner();
-void MenuClaim(int id);   // this menu was opened
-void MenuRelease(int id); // this menu was closed (only clears ownership if it still has it)

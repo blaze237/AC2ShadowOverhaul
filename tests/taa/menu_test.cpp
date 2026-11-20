@@ -1,14 +1,11 @@
-// Tests the TAA in-game menu's input and saving (src/taa/menu.cpp) with a fake keyboard: F1 opens it,
-// arrows select and change, values reach the TAA settings at once and land in the ini a second
-// later (comments kept); keys do nothing while it's hidden.
+// Tests the TAA in-game menu's input and saving (src/taa/menu.cpp on the shared menu engine) with a
+// fake keyboard: F1 opens it, arrows select and change, values reach the TAA settings at once and
+// land in the ini a second later (comments kept); keys do nothing while it's hidden.
 #include <windows.h>
 static bool g_keys[256];
 static SHORT WINAPI FakeAsyncKeyState(int vk) { return vk >= 0 && vk < 256 && g_keys[vk] ? (SHORT)0x8000 : 0; }
 static bool FakeFocus() { return true; }
-#define GetAsyncKeyState FakeAsyncKeyState
-#define GameHasFocus FakeFocus
 #include "taa/menu.cpp"
-#undef GetAsyncKeyState
 using namespace taa;
 #include <string>
 
@@ -45,6 +42,7 @@ int main()
 	CHECK(CopyFileA("..\\..\\AC2ShadowOverhaul.ini", ini.c_str(), FALSE), "could not copy the ini");
 	IniSetPath(ini.c_str());
 	LogInit("menu_test.log", true);
+	core::Menu_SetInputForTests(FakeAsyncKeyState, FakeFocus);
 	Taa_Init();
 	Menu_Init();
 	TaaSettings t0 = Taa_GetSettings();
@@ -56,7 +54,7 @@ int main()
 	Press('9'); // Debug view
 	Press(VK_DOWN); // wraps to TAA
 	Press(VK_DOWN); // Sharpness
-	CHECK(g_selected == ITEM_SHARPNESS, "number key / arrows selected item %d", g_selected);
+	CHECK(g_menu.Selected() == ITEM_SHARPNESS, "number key / arrows selected item %d", g_menu.Selected());
 	Press(VK_RIGHT);
 	Press(VK_RIGHT);
 	float sharp = Taa_GetSettings().sharpness;

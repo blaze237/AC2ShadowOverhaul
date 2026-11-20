@@ -81,8 +81,6 @@ const char* Vol_Status();
 // Tuning menu (menu.cpp).
 bool Menu_Init();
 void Menu_OnPresent(IDirect3DDevice9* dev);
-void Menu_OnLostDevice();
-void Menu_OnResetDevice();
 void Menu_Flush();
 
 } // namespace vol

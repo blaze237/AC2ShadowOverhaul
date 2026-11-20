@@ -286,10 +286,3 @@ bool GameHasFocus()
 		GetWindowThreadProcessId(fg, &pid);
 	return pid == GetCurrentProcessId();
 }
-
-// ---- Menus -------------------------------------------------------------------------------------
-
-static volatile LONG g_menuOwner = MENU_NONE;
-int MenuOwner() { return (int)g_menuOwner; }
-void MenuClaim(int id) { InterlockedExchange(&g_menuOwner, id); }
-void MenuRelease(int id) { InterlockedCompareExchange(&g_menuOwner, MENU_NONE, id); }

@@ -37,3 +37,4 @@ __pycache__/
 /tests/combined/
 /tests/run_tests.out
 /tests/taa/menu_test.ini
+/tests/core/menu_test.ini
