@@ -4,6 +4,7 @@
 #include "common.h"
 #include "shaders_gen.h"
 #include "core/scene.h"
+#include "core/fxpass.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -140,16 +141,13 @@ static core::Camera g_prevCam;
 
 // ---- Device state ------------------------------------------------------------------------------
 
-static TaaDeviceFns D;
-static const GUID kIID_Texture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
-void Taa_SetDeviceFns(const TaaDeviceFns& fns) { D = fns; }
+static const core::DeviceFns& D = core::Orig();
 
 static bool g_failed = false; // TAA can't run on this device (logged once)
-static IDirect3DTexture9* g_histTex[2];
-static IDirect3DSurface9* g_histSurf[2];
+static core::RenderTarget g_hist[2];
 static int g_histIndex = 0; // the one written next
 static UINT g_histW, g_histH;
-static IDirect3DStateBlock9* g_state;
+static core::PassState g_state;
 static IDirect3DVertexShader9* g_vsFull;
 static IDirect3DPixelShader9 *g_psResolve, *g_psOutput;
 static IDirect3DVertexDeclaration9* g_decl;
@@ -177,17 +175,9 @@ static DWORD g_gameBias[16];           // the game's own D3DSAMP_MIPMAPLODBIAS p
 
 static void ReleaseResources()
 {
-	auto rel = [](auto*& p) {
-		if (p)
-			p->Release();
-		p = nullptr;
-	};
 	for (int i = 0; i < 2; i++)
-	{
-		rel(g_histSurf[i]);
-		rel(g_histTex[i]);
-	}
-	rel(g_state);
+		g_hist[i].Release();
+	g_state.Release();
 	g_histW = g_histH = 0;
 	g_historyValid = false;
 }
@@ -225,26 +215,24 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 	HRESULT hr;
 	if (!g_vsFull)
 	{
-		const D3DVERTEXELEMENT9 decl[] = { { 0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 }, D3DDECL_END() };
 		// Our own full-screen VS goes to the original CreateVertexShader (never jittered).
 		if (FAILED(hr = D.CreateVertexShader(dev, kTaaFullscreenVs, &g_vsFull)) || FAILED(hr = dev->CreatePixelShader(kTaaResolvePs, &g_psResolve)) ||
-			FAILED(hr = dev->CreatePixelShader(kTaaOutputPs, &g_psOutput)) || FAILED(hr = dev->CreateVertexDeclaration(decl, &g_decl)))
+			FAILED(hr = dev->CreatePixelShader(kTaaOutputPs, &g_psOutput)) || !(g_decl = core::FullscreenDecl(dev)))
 		{
 			Fail("could not create its shaders", hr);
 			return false;
 		}
 	}
-	if (g_histTex[0] && g_histW == w && g_histH == h)
+	if (g_hist[0].tex && g_histW == w && g_histH == h)
 		return true;
 	ReleaseResources();
 	for (int i = 0; i < 2; i++)
-		if (FAILED(hr = D.CreateTexture(dev, w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_histTex[i], NULL)) ||
-			FAILED(hr = g_histTex[i]->GetSurfaceLevel(0, &g_histSurf[i])))
+		if (FAILED(hr = g_hist[i].Create(dev, w, h, D3DFMT_A16B16G16R16F)))
 		{
 			Fail("could not create its history targets", hr);
 			return false;
 		}
-	if (FAILED(hr = dev->CreateStateBlock(D3DSBT_ALL, &g_state)))
+	if (FAILED(hr = g_state.Create(dev)))
 	{
 		Fail("could not create a state block", hr);
 		return false;
@@ -301,7 +289,7 @@ static bool IsJitterTarget(IDirect3DSurface9* s)
 	if (FAILED(s->GetDesc(&d)) || d.Width != g_sceneW || d.Height != g_sceneH)
 		return false;
 	IDirect3DTexture9* tex = nullptr;
-	if (FAILED(s->GetContainer(kIID_Texture9, (void**)&tex)) || !tex)
+	if (FAILED(s->GetContainer(core::kIID_Texture9, (void**)&tex)) || !tex)
 		return false;
 	tex->Release();
 	return true;
@@ -513,12 +501,6 @@ void Taa_OnLostDevice()
 
 // ---- The passes --------------------------------------------------------------------------------
 
-static void Fullscreen(IDirect3DDevice9* dev)
-{
-	static const float tri[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
-	D.DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, tri, sizeof(tri[0]));
-}
-
 static void Resolve(IDirect3DDevice9* dev)
 {
 	g_resolved = true;
@@ -542,69 +524,16 @@ static void Resolve(IDirect3DDevice9* dev)
 	if (!valid)
 		memset(reproj, 0, sizeof(reproj));
 
-	// Save everything we touch: state block for states/shaders/constants/textures/viewport, and the
-	// render targets, depth buffer and vertex input by hand (state blocks don't hold them, and the
-	// game's instanced foliage needs its stream frequencies back).
-	g_state->Capture();
-	IDirect3DSurface9* oldRt[4] = {};
-	IDirect3DSurface9* oldDs = nullptr;
-	for (DWORD i = 0; i < 4; i++)
-		if (FAILED(dev->GetRenderTarget(i, &oldRt[i])))
-			oldRt[i] = nullptr;
-	if (FAILED(dev->GetDepthStencilSurface(&oldDs)))
-		oldDs = nullptr;
-	const UINT kStreams = 8;
-	IDirect3DVertexBuffer9* oldVb[kStreams] = {};
-	UINT oldOffset[kStreams] = {}, oldStride[kStreams] = {}, oldFreq[kStreams];
-	for (UINT i = 0; i < kStreams; i++)
-	{
-		oldFreq[i] = 1;
-		if (FAILED(dev->GetStreamSource(i, &oldVb[i], &oldOffset[i], &oldStride[i])))
-			oldVb[i] = nullptr;
-		dev->GetStreamSourceFreq(i, &oldFreq[i]);
-	}
-	IDirect3DIndexBuffer9* oldIb = nullptr;
-	if (FAILED(dev->GetIndices(&oldIb)))
-		oldIb = nullptr;
-	IDirect3DVertexDeclaration9* oldDecl = nullptr;
-	if (FAILED(dev->GetVertexDeclaration(&oldDecl)))
-		oldDecl = nullptr;
-	DWORD oldFvf = 0;
-	dev->GetFVF(&oldFvf);
-	for (UINT i = 0; i < kStreams; i++)
-		if (oldFreq[i] != 1)
-			dev->SetStreamSourceFreq(i, 1);
-
-	const DWORD rs[][2] = {
-		{ D3DRS_ZENABLE, FALSE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_STENCILENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE },
-		{ D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_SEPARATEALPHABLENDENABLE, FALSE }, { D3DRS_CULLMODE, D3DCULL_NONE },
-		{ D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_COLORWRITEENABLE, 0xF }, { D3DRS_SRGBWRITEENABLE, FALSE },
-		{ D3DRS_FOGENABLE, FALSE }, { D3DRS_CLIPPLANEENABLE, 0 }, { D3DRS_FILLMODE, D3DFILL_SOLID },
-		{ D3DRS_TWOSIDEDSTENCILMODE, FALSE }, { D3DRS_POINTSPRITEENABLE, FALSE },
-	};
-	for (const auto& r : rs)
-		dev->SetRenderState((D3DRENDERSTATETYPE)r[0], r[1]);
+	g_state.Save(dev);
+	g_state.BeginPasses(dev, g_decl, g_vsFull);
 	for (DWORD s = 0; s < 4; s++)
 	{
-		const DWORD filter = s == 1 ? D3DTEXF_LINEAR : D3DTEXF_POINT;
-		D.SetSamplerState(dev, s, D3DSAMP_MINFILTER, filter);
-		D.SetSamplerState(dev, s, D3DSAMP_MAGFILTER, filter);
-		D.SetSamplerState(dev, s, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-		D.SetSamplerState(dev, s, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-		D.SetSamplerState(dev, s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-		D.SetSamplerState(dev, s, D3DSAMP_SRGBTEXTURE, FALSE);
-		D.SetSamplerState(dev, s, D3DSAMP_MAXMIPLEVEL, 0);
-		D.SetSamplerState(dev, s, D3DSAMP_MIPMAPLODBIAS, 0);
+		core::SetSamplerClamp(dev, s, s == 1 ? D3DTEXF_LINEAR : D3DTEXF_POINT);
+		D.SetSamplerState(dev, s, D3DSAMP_MIPMAPLODBIAS, 0); // not through the hook (it adds our mip bias)
 	}
-	D.SetDepthStencilSurface(dev, nullptr);
-	for (DWORD i = 1; i < 4; i++)
-		if (oldRt[i])
-			D.SetRenderTarget(dev, i, nullptr);
-	dev->SetVertexDeclaration(g_decl);
-	D.SetVertexShader(dev, g_vsFull);
 
 	IDirect3DTexture9* depthTex = nullptr;
-	if (FAILED(g_depthSurf->GetContainer(kIID_Texture9, (void**)&depthTex)))
+	if (FAILED(g_depthSurf->GetContainer(core::kIID_Texture9, (void**)&depthTex)))
 		depthTex = nullptr;
 	const int cur = g_histIndex, prev = cur ^ 1;
 	const float W = (float)g_sceneW, H = (float)g_sceneH;
@@ -624,56 +553,27 @@ static void Resolve(IDirect3DDevice9* dev)
 	dev->SetPixelShaderConstantF(0, &c[0][0], 10);
 
 	// Resolve: scene + previous history -> new history.
-	D.SetRenderTarget(dev, 0, g_histSurf[cur]);
-	D3DVIEWPORT9 vp = { 0, 0, g_sceneW, g_sceneH, 0.0f, 1.0f };
-	dev->SetViewport(&vp);
+	core::SetTarget(dev, g_hist[cur].surf, g_sceneW, g_sceneH);
 	D.SetTexture(dev, 0, g_sceneTex);
-	D.SetTexture(dev, 1, g_histTex[prev]);
+	D.SetTexture(dev, 1, g_hist[prev].tex);
 	D.SetTexture(dev, 2, depthTex);
-	D.SetTexture(dev, 3, g_histTex[prev]);
+	D.SetTexture(dev, 3, g_hist[prev].tex);
 	dev->SetPixelShader(g_psResolve);
-	Fullscreen(dev);
+	core::DrawFullscreen(dev);
 
 	// Output: new history (sharpened) -> scene colour, colour channels only.
-	D.SetRenderTarget(dev, 0, g_sceneSurf);
-	dev->SetViewport(&vp);
+	core::SetTarget(dev, g_sceneSurf, g_sceneW, g_sceneH);
 	D.SetTexture(dev, 0, nullptr);
-	D.SetTexture(dev, 1, g_histTex[cur]);
+	D.SetTexture(dev, 1, g_hist[cur].tex);
 	D.SetTexture(dev, 2, nullptr);
 	D.SetTexture(dev, 3, nullptr);
 	D.SetSamplerState(dev, 1, D3DSAMP_MINFILTER, D3DTEXF_POINT);
 	D.SetSamplerState(dev, 1, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
 	dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
 	dev->SetPixelShader(g_psOutput);
-	Fullscreen(dev);
+	core::DrawFullscreen(dev);
 
-	// Restore.
-	for (DWORD i = 0; i < 4; i++)
-		if (i == 0 || oldRt[i])
-			D.SetRenderTarget(dev, i, oldRt[i]);
-	D.SetDepthStencilSurface(dev, oldDs);
-	g_state->Apply();
-	if (oldDecl)
-		dev->SetVertexDeclaration(oldDecl);
-	else
-		dev->SetFVF(oldFvf);
-	for (UINT i = 0; i < kStreams; i++)
-	{
-		dev->SetStreamSource(i, oldVb[i], oldOffset[i], oldStride[i]);
-		dev->SetStreamSourceFreq(i, oldFreq[i]);
-		if (oldVb[i])
-			oldVb[i]->Release();
-	}
-	dev->SetIndices(oldIb);
-	if (oldIb)
-		oldIb->Release();
-	if (oldDecl)
-		oldDecl->Release();
-	for (DWORD i = 0; i < 4; i++)
-		if (oldRt[i])
-			oldRt[i]->Release();
-	if (oldDs)
-		oldDs->Release();
+	g_state.Restore(dev);
 	if (depthTex)
 		depthTex->Release();
 	// The state block put back c255 and the sampler biases as they were when captured.

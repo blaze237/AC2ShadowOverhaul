@@ -94,20 +94,7 @@ extern GiRewriteLayout g_giLastLayout;
 
 // ---- Device side (called from the hooks in hooks.cpp) -------------------------------------------
 
-// The functions below the hooks, so our own calls don't go through our hooks.
-struct GiDeviceFns
-{
-	HRESULT(__stdcall* SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetDepthStencilSurface)(IDirect3DDevice9*, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
-	HRESULT(__stdcall* DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
-	HRESULT(__stdcall* SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
-	HRESULT(__stdcall* SetPixelShader)(IDirect3DDevice9*, IDirect3DPixelShader9*);
-	HRESULT(__stdcall* CreatePixelShader)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
-	HRESULT(__stdcall* CreateVertexShader)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
-	HRESULT(__stdcall* StretchRect)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
-};
-void GI_SetDeviceFns(const GiDeviceFns& fns);
+// Our own device calls go to the original (unhooked) functions (core/fxpass.h).
 
 void GI_OnSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);              // the game's own binding of our stage
 // Render target changes: Before may run the GI passes (returns true if it did); After starts/ends the pass.

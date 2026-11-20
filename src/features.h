@@ -19,32 +19,13 @@
 
 extern volatile bool g_fxPassthrough;
 
-// The original (unhooked) device functions.
-struct FxDeviceFns
-{
-	HRESULT(__stdcall* Reset)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
-	HRESULT(__stdcall* CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
-	HRESULT(__stdcall* StretchRect)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
-	HRESULT(__stdcall* ColorFill)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, D3DCOLOR);
-	HRESULT(__stdcall* SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetDepthStencilSurface)(IDirect3DDevice9*, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
-	HRESULT(__stdcall* SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
-	HRESULT(__stdcall* SetSamplerState)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
-	HRESULT(__stdcall* DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
-	HRESULT(__stdcall* CreateVertexShader)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
-	HRESULT(__stdcall* SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
-	HRESULT(__stdcall* SetVertexShaderConstantF)(IDirect3DDevice9*, UINT, const float*, UINT);
-	HRESULT(__stdcall* CreatePixelShader)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
-	HRESULT(__stdcall* SetPixelShader)(IDirect3DDevice9*, IDirect3DPixelShader9*);
-};
+// The original (unhooked) device functions the effects draw through are core::Orig() (core/fxpass.h).
 
 // Startup: reads the ini of every merged effect and their menus. Returns true if any of them
 // needs the device hooks.
 bool Fx_Init();
 void Fx_Flush(); // at exit: saves pending menu changes
 
-void Fx_SetDeviceFns(const FxDeviceFns& fns);
 void Fx_OnDeviceCreated(IDirect3D9* d3d, UINT adapter, IDirect3DDevice9* dev, DWORD behaviourFlags, const D3DPRESENT_PARAMETERS* pp);
 void Fx_OnLostDevice();                                   // before Reset
 void Fx_OnResetDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp); // after a successful Reset

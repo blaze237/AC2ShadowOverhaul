@@ -1,6 +1,7 @@
 // See scene.h.
 #include "core/scene.h"
 #include "core/shaderinfo.h"
+#include "core/fxpass.h"
 #include "common.h"
 #include <math.h>
 #include <unordered_map>
@@ -9,7 +10,6 @@ namespace core
 {
 
 static SceneState S;
-static const GUID kIID_Texture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
 
 const SceneState& Scene() { return S; }
 

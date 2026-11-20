@@ -19,6 +19,7 @@
 #include "shaders_gen.h"
 #include "core/shaderinfo.h"
 #include "core/scene.h"
+#include "core/fxpass.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -2121,21 +2122,8 @@ static void HookDevice(IDirect3DDevice9* dev)
 	H(CreatePixelShader);
 	H(SetPixelShader);
 #undef H
-	AoDeviceFns fns;
-	fns.SetRenderTarget = o_SetRenderTarget;
-	fns.SetDepthStencilSurface = o_SetDepthStencilSurface;
-	fns.SetViewport = o_SetViewport;
-	fns.SetTexture = o_SetTexture;
-	fns.DrawPrimitiveUP = o_DrawPrimitiveUP;
-	fns.SetVertexShader = o_SetVertexShader;
-	fns.SetPixelShader = o_SetPixelShader;
-	fns.CreatePixelShader = o_CreatePixelShader;
-	fns.CreateVertexShader = o_CreateVertexShader;
-	fns.CreateTexture = o_CreateTexture;
-	fns.ColorFill = o_ColorFill;
-	AO_SetDeviceFns(fns);
-
-	FxDeviceFns fx;
+	// The effects draw their passes through these, below the hooks.
+	core::DeviceFns fx;
 	fx.Reset = o_Reset;
 	fx.CreateTexture = o_CreateTexture;
 	fx.StretchRect = o_StretchRect;
@@ -2151,7 +2139,7 @@ static void HookDevice(IDirect3DDevice9* dev)
 	fx.SetVertexShaderConstantF = o_SetVertexShaderConstantF;
 	fx.CreatePixelShader = o_CreatePixelShader;
 	fx.SetPixelShader = o_SetPixelShader;
-	Fx_SetDeviceFns(fx);
+	core::SetDeviceFns(fx);
 }
 
 // ---- IDirect3D9 hooks --------------------------------------------------------------------------

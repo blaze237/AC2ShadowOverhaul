@@ -63,22 +63,7 @@ extern AoRewriteLayout g_aoLastLayout;
 
 // ---- Device side (called from the device hooks) ------------------------------------------------
 
-// The original (unhooked) device functions, so our own calls don't go through the hooks.
-struct AoDeviceFns
-{
-	HRESULT(__stdcall* SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetDepthStencilSurface)(IDirect3DDevice9*, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
-	HRESULT(__stdcall* SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
-	HRESULT(__stdcall* DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
-	HRESULT(__stdcall* SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
-	HRESULT(__stdcall* SetPixelShader)(IDirect3DDevice9*, IDirect3DPixelShader9*);
-	HRESULT(__stdcall* CreatePixelShader)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
-	HRESULT(__stdcall* CreateVertexShader)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
-	HRESULT(__stdcall* CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
-	HRESULT(__stdcall* ColorFill)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, D3DCOLOR);
-};
-void AO_SetDeviceFns(const AoDeviceFns& fns);
+// Our own device calls go to the original (unhooked) functions (core/fxpass.h).
 
 void AO_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code);    // remembers where the sun direction is
 // Render target changes: Before may apply AO (returns true if it did); After binds/unbinds ours.

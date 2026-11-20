@@ -48,7 +48,7 @@ FLAGS="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEA
 SUB="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -fms-extensions -fasm-blocks -I.. -I../../src -fuse-ld=lld -static"
 TESTS="$(pwd)"
 # The shared core, for tests that link an effect's code (paths from a suite's folder).
-CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp ../../src/core/menu.cpp"
+CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp ../../src/core/menu.cpp ../../src/core/fxpass.cpp"
 OUT="$TESTS/run_tests.out"
 
 # A Windows path for a folder (the tests are Windows programs), or "" if it doesn't exist.

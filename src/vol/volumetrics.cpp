@@ -14,6 +14,7 @@
 #include "common.h"
 #include "shaders_gen.h"
 #include "core/scene.h"
+#include "core/fxpass.h"
 #include "core/shaderinfo.h"
 #include <math.h>
 #include <stdio.h>
@@ -340,16 +341,11 @@ static void CaptureFromDraw(IDirect3DDevice9* dev)
 
 // ---- Device resources --------------------------------------------------------------------------
 
-static DeviceFns D;
-static const GUID kIID_Texture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
-void Vol_SetDeviceFns(const DeviceFns& fns) { D = fns; }
+static const core::DeviceFns& D = core::Orig();
 
-static IDirect3DTexture9* g_fogTex[2];
-static IDirect3DSurface9* g_fogSurf[2];
-static IDirect3DTexture9* g_shaftTex[2];
-static IDirect3DSurface9* g_shaftSurf[2];
+static core::RenderTarget g_fog[2], g_shaft[2];
 static UINT g_w, g_h, g_lw, g_lh, g_sw, g_sh, g_div;
-static IDirect3DStateBlock9* g_state;
+static core::PassState g_state;
 static IDirect3DVertexShader9* g_vs;
 static IDirect3DPixelShader9 *g_psMarch, *g_psBlur, *g_psMask, *g_psRadial, *g_psComposite;
 static IDirect3DVertexDeclaration9* g_decl;
@@ -367,12 +363,10 @@ static void ReleaseTargets()
 {
 	for (int i = 0; i < 2; i++)
 	{
-		Rel(g_fogSurf[i]);
-		Rel(g_fogTex[i]);
-		Rel(g_shaftSurf[i]);
-		Rel(g_shaftTex[i]);
+		g_fog[i].Release();
+		g_shaft[i].Release();
 	}
-	Rel(g_state);
+	g_state.Release();
 	g_w = g_h = 0;
 }
 
@@ -383,17 +377,15 @@ static void Fail(const char* what, HRESULT hr)
 	ReleaseTargets();
 }
 
-static bool MakeTarget(IDirect3DDevice9* dev, UINT w, UINT h, IDirect3DTexture9*& tex, IDirect3DSurface9*& surf)
+static bool MakeTarget(IDirect3DDevice9* dev, UINT w, UINT h, core::RenderTarget& t)
 {
-	HRESULT hr = dev->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &tex, NULL);
-	if (SUCCEEDED(hr))
-		hr = tex->GetSurfaceLevel(0, &surf);
+	HRESULT hr = t.Create(dev, w, h, D3DFMT_A16B16G16R16F);
 	if (FAILED(hr))
 	{
 		Fail("could not create its render targets", hr);
 		return false;
 	}
-	dev->ColorFill(surf, NULL, 0); // nothing undefined (NaN) is ever sampled
+	dev->ColorFill(t.surf, NULL, 0); // nothing undefined (NaN) is ever sampled
 	return true;
 }
 
@@ -416,26 +408,25 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 			}
 		}
 		HRESULT hr;
-		const D3DVERTEXELEMENT9 decl[] = { { 0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 }, D3DDECL_END() };
 		if (FAILED(hr = D.CreateVertexShader(dev, kVolFullscreenVs, &g_vs)) || FAILED(hr = D.CreatePixelShader(dev, kVolFogMarchPs, &g_psMarch)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kVolFogBlurPs, &g_psBlur)) || FAILED(hr = D.CreatePixelShader(dev, kVolShaftsMaskPs, &g_psMask)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kVolShaftsBlurPs, &g_psRadial)) ||
-			FAILED(hr = D.CreatePixelShader(dev, kVolCompositePs, &g_psComposite)) || FAILED(hr = dev->CreateVertexDeclaration(decl, &g_decl)))
+			FAILED(hr = D.CreatePixelShader(dev, kVolCompositePs, &g_psComposite)) || !(g_decl = core::FullscreenDecl(dev)))
 		{
 			Fail("could not create its shaders", hr);
 			return false;
 		}
 	}
 	UINT div = (UINT)g_set.resolution;
-	if (g_state && g_w == w && g_h == h && g_div == div)
+	if (g_state.Ready() && g_w == w && g_h == h && g_div == div)
 		return true;
 	ReleaseTargets();
 	UINT lw = (w + div - 1) / div, lh = (h + div - 1) / div;
 	UINT sw = (w + kShaftsDiv - 1) / kShaftsDiv, sh = (h + kShaftsDiv - 1) / kShaftsDiv;
 	for (int i = 0; i < 2; i++)
-		if (!MakeTarget(dev, lw, lh, g_fogTex[i], g_fogSurf[i]) || !MakeTarget(dev, sw, sh, g_shaftTex[i], g_shaftSurf[i]))
+		if (!MakeTarget(dev, lw, lh, g_fog[i]) || !MakeTarget(dev, sw, sh, g_shaft[i]))
 			return false;
-	HRESULT hr = dev->CreateStateBlock(D3DSBT_ALL, &g_state);
+	HRESULT hr = g_state.Create(dev);
 	if (FAILED(hr))
 	{
 		Fail("could not create a state block", hr);
@@ -608,19 +599,6 @@ void Vol_OnDeviceReady(IDirect3DDevice9* dev)
 
 // ---- The passes --------------------------------------------------------------------------------
 
-static void Fullscreen(IDirect3DDevice9* dev)
-{
-	static const float tri[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
-	D.DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, tri, sizeof(tri[0]));
-}
-
-static void SetTarget(IDirect3DDevice9* dev, IDirect3DSurface9* s, UINT w, UINT h)
-{
-	D.SetRenderTarget(dev, 0, s);
-	D3DVIEWPORT9 vp = { 0, 0, w, h, 0.0f, 1.0f };
-	D.SetViewport(dev, &vp);
-}
-
 static void Sampler(IDirect3DDevice9* dev, DWORD s, D3DTEXTUREFILTERTYPE filter, D3DTEXTUREADDRESS address)
 {
 	dev->SetSamplerState(s, D3DSAMP_MINFILTER, filter);
@@ -657,10 +635,10 @@ static void Apply(IDirect3DDevice9* dev)
 	if (FAILED(g_scene->GetDesc(&sd)) || !EnsureResources(dev, sd.Width, sd.Height))
 		return;
 	IDirect3DTexture9* depthTex = nullptr;
-	if (FAILED(g_depthRt->GetContainer(kIID_Texture9, (void**)&depthTex)) || !depthTex)
+	if (FAILED(g_depthRt->GetContainer(core::kIID_Texture9, (void**)&depthTex)) || !depthTex)
 		return;
 	IDirect3DTexture9* sceneTex = nullptr; // for the shafts' sky brightness; optional
-	if (FAILED(g_scene->GetContainer(kIID_Texture9, (void**)&sceneTex)))
+	if (FAILED(g_scene->GetContainer(core::kIID_Texture9, (void**)&sceneTex)))
 		sceneTex = nullptr;
 
 	const core::CameraFloats& C = F.camera.f;
@@ -683,61 +661,15 @@ static void Apply(IDirect3DDevice9* dev)
 	}
 	const bool shafts = (g_set.shaftsOn || g_set.view == 3) && shaftFade > 0.0f && sceneTex;
 
-	// Save everything we touch: state block for states/shaders/constants/textures/viewport, and the
-	// render targets and depth buffer by hand (state blocks don't hold them).
-	g_state->Capture();
-	IDirect3DSurface9* oldRt[4] = {};
-	IDirect3DSurface9* oldDs = nullptr;
-	for (DWORD i = 0; i < 4; i++)
-		if (FAILED(dev->GetRenderTarget(i, &oldRt[i])))
-			oldRt[i] = nullptr;
-	if (FAILED(dev->GetDepthStencilSurface(&oldDs)))
-		oldDs = nullptr;
-	// Vertex input, by hand as well: the game draws instanced geometry (foliage), and our
-	// DrawPrimitiveUP calls reset stream 0 and must run with instancing off.
-	const UINT kStreams = 8;
-	IDirect3DVertexBuffer9* oldVb[kStreams] = {};
-	UINT oldOffset[kStreams] = {}, oldStride[kStreams] = {}, oldFreq[kStreams];
-	for (UINT i = 0; i < kStreams; i++)
-	{
-		oldFreq[i] = 1;
-		if (FAILED(dev->GetStreamSource(i, &oldVb[i], &oldOffset[i], &oldStride[i])))
-			oldVb[i] = nullptr;
-		dev->GetStreamSourceFreq(i, &oldFreq[i]);
-	}
-	IDirect3DIndexBuffer9* oldIb = nullptr;
-	if (FAILED(dev->GetIndices(&oldIb)))
-		oldIb = nullptr;
-	IDirect3DVertexDeclaration9* oldDecl = nullptr;
-	if (FAILED(dev->GetVertexDeclaration(&oldDecl)))
-		oldDecl = nullptr;
-	DWORD oldFvf = 0;
-	dev->GetFVF(&oldFvf);
-	for (UINT i = 0; i < kStreams; i++)
-		if (oldFreq[i] != 1)
-			dev->SetStreamSourceFreq(i, 1);
-
-	const DWORD rs[][2] = {
-		{ D3DRS_ZENABLE, FALSE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_STENCILENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE },
-		{ D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_SEPARATEALPHABLENDENABLE, FALSE }, { D3DRS_CULLMODE, D3DCULL_NONE },
-		{ D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_COLORWRITEENABLE, 0xF }, { D3DRS_SRGBWRITEENABLE, FALSE },
-		{ D3DRS_FOGENABLE, FALSE }, { D3DRS_CLIPPLANEENABLE, 0 }, { D3DRS_FILLMODE, D3DFILL_SOLID },
-		{ D3DRS_TWOSIDEDSTENCILMODE, FALSE }, { D3DRS_POINTSPRITEENABLE, FALSE }, { D3DRS_MULTISAMPLEANTIALIAS, FALSE },
-	};
-	for (const auto& r : rs)
-		dev->SetRenderState((D3DRENDERSTATETYPE)r[0], r[1]);
+	g_state.Save(dev);
+	g_state.BeginPasses(dev, g_decl, g_vs);
+	dev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, FALSE);
 	Sampler(dev, 0, D3DTEXF_POINT, D3DTADDRESS_CLAMP);  // depth
 	Sampler(dev, 1, D3DTEXF_POINT, D3DTADDRESS_CLAMP);  // shadow atlas
 	Sampler(dev, 2, D3DTEXF_LINEAR, D3DTADDRESS_WRAP);  // cloud shadows
 	Sampler(dev, 3, D3DTEXF_POINT, D3DTADDRESS_CLAMP);  // fog
 	Sampler(dev, 4, D3DTEXF_LINEAR, D3DTADDRESS_CLAMP); // scene colour
 	Sampler(dev, 5, D3DTEXF_LINEAR, D3DTADDRESS_BORDER); // shafts
-	dev->SetDepthStencilSurface(nullptr);
-	for (DWORD i = 1; i < 4; i++)
-		if (oldRt[i])
-			D.SetRenderTarget(dev, i, nullptr);
-	dev->SetVertexDeclaration(g_decl);
-	D.SetVertexShader(dev, g_vs);
 	for (DWORD i = 0; i < 8; i++)
 		dev->SetTexture(i, nullptr);
 
@@ -798,78 +730,56 @@ static void Apply(IDirect3DDevice9* dev)
 		// Ray march -> fog[0]; blur across -> fog[1]; blur down -> fog[0].
 		dev->SetTexture(1, shadowed ? F.atlas : nullptr);
 		dev->SetTexture(2, clouds ? F.cloudTex : nullptr);
-		SetTarget(dev, g_fogSurf[0], g_lw, g_lh);
+		core::SetTarget(dev, g_fog[0].surf, g_lw, g_lh);
 		D.SetPixelShader(dev, g_psMarch);
-		Fullscreen(dev);
+		core::DrawFullscreen(dev);
 		dev->SetTexture(1, nullptr);
 		dev->SetTexture(2, nullptr);
 		D.SetPixelShader(dev, g_psBlur);
 		const float across[4] = { 1, 0, 0, 0 }, down[4] = { 0, 1, 0, 0 };
 		dev->SetPixelShaderConstantF(25, across, 1);
-		SetTarget(dev, g_fogSurf[1], g_lw, g_lh);
-		dev->SetTexture(3, g_fogTex[0]);
-		Fullscreen(dev);
+		core::SetTarget(dev, g_fog[1].surf, g_lw, g_lh);
+		dev->SetTexture(3, g_fog[0].tex);
+		core::DrawFullscreen(dev);
 		dev->SetPixelShaderConstantF(25, down, 1);
-		SetTarget(dev, g_fogSurf[0], g_lw, g_lh);
-		dev->SetTexture(3, g_fogTex[1]);
-		Fullscreen(dev);
+		core::SetTarget(dev, g_fog[0].surf, g_lw, g_lh);
+		dev->SetTexture(3, g_fog[1].tex);
+		core::DrawFullscreen(dev);
 	}
 	if (shafts)
 	{
 		// Sky mask -> shafts[0]; radial blur, coarse steps -> shafts[1]; fine steps -> shafts[0].
 		dev->SetTexture(4, sceneTex);
-		SetTarget(dev, g_shaftSurf[0], g_sw, g_sh);
+		core::SetTarget(dev, g_shaft[0].surf, g_sw, g_sh);
 		D.SetPixelShader(dev, g_psMask);
-		Fullscreen(dev);
+		core::DrawFullscreen(dev);
 		dev->SetTexture(4, nullptr);
 		D.SetPixelShader(dev, g_psRadial);
 		const float coarse[4] = { sunUv[0], sunUv[1], g_set.shaftsLength / 16.0f, g_set.shaftsDecay };
 		const float fine[4] = { sunUv[0], sunUv[1], g_set.shaftsLength / 256.0f, 1.0f };
 		dev->SetPixelShaderConstantF(26, coarse, 1);
-		SetTarget(dev, g_shaftSurf[1], g_sw, g_sh);
-		dev->SetTexture(5, g_shaftTex[0]);
-		Fullscreen(dev);
+		core::SetTarget(dev, g_shaft[1].surf, g_sw, g_sh);
+		dev->SetTexture(5, g_shaft[0].tex);
+		core::DrawFullscreen(dev);
 		dev->SetPixelShaderConstantF(26, fine, 1);
-		SetTarget(dev, g_shaftSurf[0], g_sw, g_sh);
-		dev->SetTexture(5, g_shaftTex[1]);
-		Fullscreen(dev);
+		core::SetTarget(dev, g_shaft[0].surf, g_sw, g_sh);
+		dev->SetTexture(5, g_shaft[1].tex);
+		core::DrawFullscreen(dev);
 	}
 
 	// Composite: scene = scene * transmittance + scattered light + shafts (colour channels only).
-	SetTarget(dev, g_scene, g_w, g_h);
-	dev->SetTexture(3, g_fogTex[0]);
-	dev->SetTexture(5, g_shaftTex[0]);
+	core::SetTarget(dev, g_scene, g_w, g_h);
+	dev->SetTexture(3, g_fog[0].tex);
+	dev->SetTexture(5, g_shaft[0].tex);
 	dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
 	dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
 	dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_SRCALPHA);
 	dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
 	dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
 	D.SetPixelShader(dev, g_psComposite);
-	Fullscreen(dev);
+	core::DrawFullscreen(dev);
 
-	// Restore.
-	for (DWORD i = 0; i < 4; i++)
-		if (i == 0 || oldRt[i])
-			D.SetRenderTarget(dev, i, oldRt[i]);
-	dev->SetDepthStencilSurface(oldDs);
-	g_state->Apply();
-	if (oldDecl)
-		dev->SetVertexDeclaration(oldDecl);
-	else
-		dev->SetFVF(oldFvf);
-	for (UINT i = 0; i < kStreams; i++)
-	{
-		dev->SetStreamSource(i, oldVb[i], oldOffset[i], oldStride[i]);
-		dev->SetStreamSourceFreq(i, oldFreq[i]);
-		if (oldVb[i])
-			oldVb[i]->Release();
-	}
-	dev->SetIndices(oldIb);
-	Rel(oldIb);
-	Rel(oldDecl);
-	for (DWORD i = 0; i < 4; i++)
-		Rel(oldRt[i]);
-	Rel(oldDs);
+	g_state.Restore(dev);
 	depthTex->Release();
 	Rel(sceneTex);
 	ReleaseFrameRefs();

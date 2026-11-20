@@ -22,7 +22,6 @@ volatile bool g_fxPassthrough = false;
 
 static bool g_gi = false, g_vol = false, g_taa = false; // configured on (hooks and shader rewrites set up)
 static bool g_volMenu = false;
-static FxDeviceFns g_fns;
 
 bool Fx_Init()
 {
@@ -40,45 +39,6 @@ void Fx_Flush()
 	ssgi::Menu_Flush();
 	vol::Menu_Flush();
 	taa::Menu_Flush();
-}
-
-void Fx_SetDeviceFns(const FxDeviceFns& f)
-{
-	g_fns = f;
-
-	ssgi::GiDeviceFns gi;
-	gi.SetRenderTarget = f.SetRenderTarget;
-	gi.SetDepthStencilSurface = f.SetDepthStencilSurface;
-	gi.SetTexture = f.SetTexture;
-	gi.DrawPrimitiveUP = f.DrawPrimitiveUP;
-	gi.SetVertexShader = f.SetVertexShader;
-	gi.SetPixelShader = f.SetPixelShader;
-	gi.CreatePixelShader = f.CreatePixelShader;
-	gi.CreateVertexShader = f.CreateVertexShader;
-	gi.StretchRect = f.StretchRect;
-	ssgi::GI_SetDeviceFns(gi);
-
-	vol::DeviceFns v;
-	v.SetRenderTarget = f.SetRenderTarget;
-	v.SetViewport = f.SetViewport;
-	v.DrawPrimitiveUP = f.DrawPrimitiveUP;
-	v.SetVertexShader = f.SetVertexShader;
-	v.SetPixelShader = f.SetPixelShader;
-	v.CreateVertexShader = f.CreateVertexShader;
-	v.CreatePixelShader = f.CreatePixelShader;
-	vol::Vol_SetDeviceFns(v);
-
-	taa::TaaDeviceFns t;
-	t.SetRenderTarget = f.SetRenderTarget;
-	t.SetDepthStencilSurface = f.SetDepthStencilSurface;
-	t.SetTexture = f.SetTexture;
-	t.SetSamplerState = f.SetSamplerState;
-	t.DrawPrimitiveUP = f.DrawPrimitiveUP;
-	t.SetVertexShader = f.SetVertexShader;
-	t.SetVertexShaderConstantF = f.SetVertexShaderConstantF;
-	t.CreateVertexShader = f.CreateVertexShader;
-	t.CreateTexture = f.CreateTexture;
-	taa::Taa_SetDeviceFns(t);
 }
 
 // ---- MSAA warning ------------------------------------------------------------------------------

@@ -39,20 +39,7 @@ TaaSettings Taa_GetSettings();
 void Taa_SetSettings(const TaaSettings& s);
 const char* Taa_Status(); // one line for the menu: working, off, waiting for a 3D scene...
 
-// The original (unhooked) device functions, so our own calls don't go through the hooks.
-struct TaaDeviceFns
-{
-	HRESULT(__stdcall* SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetDepthStencilSurface)(IDirect3DDevice9*, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
-	HRESULT(__stdcall* SetSamplerState)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
-	HRESULT(__stdcall* DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
-	HRESULT(__stdcall* SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
-	HRESULT(__stdcall* SetVertexShaderConstantF)(IDirect3DDevice9*, UINT, const float*, UINT);
-	HRESULT(__stdcall* CreateVertexShader)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
-	HRESULT(__stdcall* CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
-};
-void Taa_SetDeviceFns(const TaaDeviceFns& fns);
+// Our own device calls go to the original (unhooked) functions (core/fxpass.h).
 void Taa_OnDeviceCreated(IDirect3D9* d3d, UINT adapter, IDirect3DDevice9* dev);
 
 // Vertex shaders: returns true with `out` set when the shader should be created from `out`.

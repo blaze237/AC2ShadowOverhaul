@@ -16,17 +16,7 @@
 namespace vol
 {
 
-// Original device functions (our own draws go straight to them, not through our hooks).
-struct DeviceFns
-{
-	HRESULT(__stdcall* SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
-	HRESULT(__stdcall* SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
-	HRESULT(__stdcall* DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
-	HRESULT(__stdcall* SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
-	HRESULT(__stdcall* SetPixelShader)(IDirect3DDevice9*, IDirect3DPixelShader9*);
-	HRESULT(__stdcall* CreateVertexShader)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
-	HRESULT(__stdcall* CreatePixelShader)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
-};
+// Our own draws go to the original device functions, not through the hooks (core/fxpass.h).
 
 // Settings. Written by the ini loader, the hotkey thread and the menu; read on the render thread.
 struct VolSettings
@@ -60,7 +50,6 @@ extern VolSettings g_set;
 bool Vol_Init();          // reads the ini; false if both effects are disabled
 void Vol_LoadSettings();  // (re)reads the tunable values from the ini
 void Vol_ClampSettings();
-void Vol_SetDeviceFns(const DeviceFns& fns);
 
 // Hooks (render thread).
 void Vol_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code);
