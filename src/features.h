@@ -1,0 +1,75 @@
+// The merged effects behind the one Direct3D hook layer (framedump.cpp's hooks call these).
+//
+// AC2 Shadow Overhaul used to be four plugins (shadows + AO, SSGI, volumetrics, TAA), each with
+// its own hooks chained in ASI load order. Now there is one set of hooks, and each device call is
+// passed to the effects here in a fixed order:
+//
+//   end of the opaque pass:  ambient occlusion + contact shadows, then SSGI (traces the AO'd image)
+//   after the sky:           volumetric fog + sun shafts
+//   first read of the scene: TAA resolve (so everything above is anti-aliased)
+//
+// Every effect draws its own passes through the original device functions, below the hooks, so no
+// effect ever sees another's draws. Text overlays (the menus, the MSAA warning) go through the
+// device's vtable, so the hooks pass straight through while g_fxPassthrough is set.
+#pragma once
+
+#include <windows.h>
+#include <d3d9.h>
+#include <vector>
+
+extern volatile bool g_fxPassthrough;
+
+// The original (unhooked) device functions.
+struct FxDeviceFns
+{
+	HRESULT(__stdcall* Reset)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+	HRESULT(__stdcall* CreateTexture)(IDirect3DDevice9*, UINT, UINT, UINT, DWORD, D3DFORMAT, D3DPOOL, IDirect3DTexture9**, HANDLE*);
+	HRESULT(__stdcall* StretchRect)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
+	HRESULT(__stdcall* ColorFill)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, D3DCOLOR);
+	HRESULT(__stdcall* SetRenderTarget)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+	HRESULT(__stdcall* SetDepthStencilSurface)(IDirect3DDevice9*, IDirect3DSurface9*);
+	HRESULT(__stdcall* SetViewport)(IDirect3DDevice9*, const D3DVIEWPORT9*);
+	HRESULT(__stdcall* SetTexture)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
+	HRESULT(__stdcall* SetSamplerState)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
+	HRESULT(__stdcall* DrawPrimitiveUP)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
+	HRESULT(__stdcall* CreateVertexShader)(IDirect3DDevice9*, const DWORD*, IDirect3DVertexShader9**);
+	HRESULT(__stdcall* SetVertexShader)(IDirect3DDevice9*, IDirect3DVertexShader9*);
+	HRESULT(__stdcall* SetVertexShaderConstantF)(IDirect3DDevice9*, UINT, const float*, UINT);
+	HRESULT(__stdcall* CreatePixelShader)(IDirect3DDevice9*, const DWORD*, IDirect3DPixelShader9**);
+	HRESULT(__stdcall* SetPixelShader)(IDirect3DDevice9*, IDirect3DPixelShader9*);
+};
+
+// Startup: reads the ini of every merged effect and their menus. Returns true if any of them
+// needs the device hooks.
+bool Fx_Init();
+void Fx_Flush(); // at exit: saves pending menu changes
+
+void Fx_SetDeviceFns(const FxDeviceFns& fns);
+void Fx_OnDeviceCreated(IDirect3D9* d3d, UINT adapter, IDirect3DDevice9* dev, DWORD behaviourFlags, const D3DPRESENT_PARAMETERS* pp);
+void Fx_OnLostDevice();                                   // before Reset
+void Fx_OnResetDevice(IDirect3DDevice9* dev, const D3DPRESENT_PARAMETERS* pp); // after a successful Reset
+
+// Device calls. Before* may run effect passes first.
+void Fx_BeforePresent(IDirect3DDevice9* dev);
+void Fx_DrawOverlays(IDirect3DDevice9* dev, unsigned bbWidth, unsigned bbHeight); // menus + warnings, just before Present
+void Fx_BeforeCopyFrom(IDirect3DDevice9* dev, IDirect3DSurface9* src, bool stretchRect); // StretchRect / GetRenderTargetData
+void Fx_BeforeOther(IDirect3DDevice9* dev);              // ColorFill, Clear, EndScene
+void Fx_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
+void Fx_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0);
+void Fx_AfterSetViewport(const D3DVIEWPORT9* vp);
+void Fx_BeforeSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);
+void Fx_AfterSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);
+DWORD Fx_SamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value); // value to pass on
+void Fx_AfterVertexConstants(IDirect3DDevice9* dev, UINT start, UINT count);
+void Fx_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps);
+void Fx_AfterSetVertexShader(IDirect3DVertexShader9* vs);
+void Fx_AfterSetPixelShader(IDirect3DPixelShader9* ps);
+
+// Shaders. RewriteVS returns true with `out` set when the vertex shader should be created from it
+// (TAA jitter); `state` is passed back to OnCreateVertexShader.
+bool Fx_RewriteVS(const DWORD* code, std::vector<DWORD>& out, void*& state);
+void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode, void* state);
+// Adds the SSGI bounce light to `code` (the game's shader, possibly already rewritten for soft
+// shadows and AO). Returns false (out untouched) if it doesn't apply.
+bool Fx_RewritePSForGI(const DWORD* code, uint32_t hash, std::vector<DWORD>& out);
+void Fx_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* gameCode);

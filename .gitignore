@@ -1,0 +1,31 @@
+# Build outputs and runtime output
+/dist/
+*.exe
+*.dll
+*.asi
+*.addon32
+*.obj
+*.log
+*.png
+AC2ShadowOverhaul_FrameDump_*
+AC2Shadows_FrameDump_*
+softshadow_*_w*.txt
+__pycache__/
+
+# Local-only material: the game itself, disassembly and data extracted from it, toolchains,
+# downloaded sources, scratch builds. None of this belongs in the repo.
+/AssassinsCreedIIGame.exe
+/AC2Shadows/
+/OldAttempt/
+/EaglePatchPlus-master/
+/re/*.asm
+/re/shaders/
+/re/tools/
+/re/reshade/
+/re/build/
+/re/orig/
+
+# ReShade depth add-on: kept locally, not part of the repo
+/addon/
+/tests/abi/
+/tools/gen_depthcopy_ps.c
