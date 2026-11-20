@@ -6,10 +6,11 @@
 #include <string>
 #include <vector>
 
-// Reads [SoftShadows] from the ini and starts the toggle hotkey. Soft shadows are always on
-// (the toggle key switches to the game's filter for comparisons); returns true.
+// Reads [SoftShadows] from the ini; returns true. FilterWidth=0 starts with the game's own filter
+// (the menu's width 0).
 bool SoftShadows_Init();
-bool SoftShadows_Active();  // currently toggled on (rewritten shaders are used)
+bool SoftShadows_Active();  // currently on (rewritten shaders are used)
+void SoftShadows_SetActive(bool on);
 
 // Rewrites ps_3_0 bytecode that does AC2's 4-tap shadow filter so it uses a wider filter of
 // `width` texels (1 = same footprint as the game). Returns false (with a reason) if the shader

@@ -56,9 +56,7 @@ static std::string ReadDump(const char* pattern)
 	return text;
 }
 
-// No interactive desktop here, so fake the hotkey by replacing the asi's GetAsyncKeyState import.
-static bool g_keyDown = false;
-static volatile bool g_f6Down = false;
+// No interactive desktop here, so fake the menu keys by replacing the asi's GetAsyncKeyState import.
 // The mock device can't back a real D3DX font, so hide D3DXCreateFontA from the asi.
 static FARPROC WINAPI FakeGetProcAddress(HMODULE m, LPCSTR name)
 {
@@ -69,9 +67,16 @@ static FARPROC WINAPI FakeGetProcAddress(HMODULE m, LPCSTR name)
 static volatile bool g_keys[256];
 static SHORT WINAPI FakeGetAsyncKeyState(int vk)
 {
-	if (vk > 0 && vk < 256 && g_keys[vk])
-		return (SHORT)0x8000;
-	return ((vk == VK_F8 && g_keyDown) || (vk == VK_F6 && g_f6Down)) ? (SHORT)0x8000 : 0;
+	return vk > 0 && vk < 256 && g_keys[vk] ? (SHORT)0x8000 : 0;
+}
+
+// The menu reads its keys at Present: hold a key over one Present, release it over the next.
+static void MenuPress(IDirect3DDevice9* dev, int vk)
+{
+	g_keys[vk] = true;
+	dev->Present(NULL, NULL, NULL, NULL);
+	g_keys[vk] = false;
+	dev->Present(NULL, NULL, NULL, NULL);
 }
 
 static bool PatchAsiImport(HMODULE mod, const char* func, void* repl)
@@ -103,11 +108,6 @@ static HWND g_wnd;
 static HWND WINAPI FakeGetForegroundWindow()
 {
 	return g_wnd;
-}
-
-static void Tap(WORD, bool down)
-{
-	g_keyDown = down;
 }
 
 int main()
@@ -203,10 +203,10 @@ int main()
 
 	for (int frame = 0; frame < 6; frame++)
 	{
-		if (frame == 1)
-			Tap(VK_F8, true);
-		if (frame == 2)
-			Tap(VK_F8, false);
+		// The menu (shown at start): Up wraps to its last item, "Frame dump"; Right asks for a dump,
+		// which starts after this frame's Present.
+		g_keys[VK_UP] = frame == 0;
+		g_keys[VK_RIGHT] = frame == 1;
 		dev->BeginScene();
 		dev->SetVertexShader(vs);
 		dev->SetRenderTarget(0, sceneSurf);
@@ -264,6 +264,7 @@ int main()
 			IDirect3DSurface9* lastRt0;
 			DWORD lastBlendOp, lastAlphaBlend;
 			IDirect3DPixelShader9* lastPs;
+			int instancedUpDraws;
 		};
 		typedef MockAoStats*(WINAPI * PFN_Stats)();
 		HMODULE mock = GetModuleHandleA("d3d9.dll");
@@ -274,7 +275,8 @@ int main()
 		const char* litSrc =
 			"float4 g_FogColor : register(c16);\n"
 			"float4 g_AmbientCube[6] : register(c24);\n"
-			"float4 g_SunColor : register(c53);\n"
+			"struct Light { float3 m_Direction; float3 m_Color; };\n"
+			"Light g_ShadowedDirect : register(c52);\n"
 			"sampler2D g_Diffuse : register(s1);\n"
 			"sampler2D g_WorldLightMapSampler : register(s12);\n"
 			"sampler2D g_ShadowSampler : register(s15);\n"
@@ -285,7 +287,7 @@ int main()
 			"  float3 amb = n.x * n.x * g_AmbientCube[0].rgb + n.y * n.y * g_AmbientCube[2].rgb + n.z * n.z * g_AmbientCube[4].rgb;\n"
 			"  float3 lm = tex2D(g_WorldLightMapSampler, uv * 0.5).rgb;\n"
 			"  float3 indirect = lerp(amb, lm, 0.3) * albedo * n.x;\n" // the game scales indirect albedo by a vertex AO term
-			"  float3 sun = saturate(dot(n, float3(0, 0, 1))) * g_SunColor.rgb * albedo;\n"
+			"  float3 sun = saturate(dot(n, g_ShadowedDirect.m_Direction)) * g_ShadowedDirect.m_Color * albedo;\n"
 			"  float3 lit = sun * shadow + indirect;\n"
 			"  Out o; o.c0 = float4(lerp(lit, g_FogColor.rgb, fog), 1); o.c1 = float4(zw.x / zw.y, 0, 0, 1); return o; }\n";
 		Blob* litCode = Compile(litSrc, "ps_3_0");
@@ -331,11 +333,15 @@ int main()
 		dev->BeginScene();
 		dev->SetRenderTarget(0, sceneSurf);
 		dev->SetRenderTarget(1, zSurf);
-		bool bound = SUCCEEDED(dev->GetRenderTarget(2, &rt2)) && rt2;
+		IDirect3DSurface9* rt3 = nullptr;
+		bool bound = SUCCEEDED(dev->GetRenderTarget(2, &rt2)) && rt2 && SUCCEEDED(dev->GetRenderTarget(3, &rt3)) && rt3 && rt3 != rt2;
 		dev->SetVertexShader(aoVs);
 		dev->SetVertexShaderConstantF(0, wvp, 4);
 		dev->SetVertexShaderConstantF(8, world, 4);
 		dev->SetPixelShader(litPs);
+		const float sunDir[4] = { 0.0f, 0.6f, 0.8f, 0.0f }, sunColour[4] = { 1.2f, 1.1f, 0.9f, 0.0f };
+		dev->SetPixelShaderConstantF(52, sunDir, 1);
+		dev->SetPixelShaderConstantF(53, sunColour, 1);
 		for (int i = 0; i < 3; i++)
 			dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
 		// Between batches the game unbinds render target 1, resets 2 and 3, and rebinds 1: the pass
@@ -345,17 +351,29 @@ int main()
 		dev->SetRenderTarget(3, NULL);
 		int midBefore = stats->draws;
 		dev->SetRenderTarget(1, zSurf);
-		bool rebound = SUCCEEDED(dev->GetRenderTarget(2, &cur)) && cur == rt2;
+		IDirect3DSurface9* cur3 = nullptr;
+		bool rebound = SUCCEEDED(dev->GetRenderTarget(2, &cur)) && cur == rt2 && SUCCEEDED(dev->GetRenderTarget(3, &cur3)) && cur3 == rt3;
 		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
 		printf("ao: pass continues across the game's render target resets between batches: %s\n",
 			rebound && stats->draws - midBefore == 1 ? "yes" : "NO");
 		dev->SetRenderTarget(1, NULL);
-		bool unbound = FAILED(dev->GetRenderTarget(2, &cur)) || !cur;
+		bool unbound = (FAILED(dev->GetRenderTarget(2, &cur)) || !cur) && (FAILED(dev->GetRenderTarget(3, &cur)) || !cur);
 		int before = stats->draws;
 		dev->SetPixelShader(ps);
-		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V)); // the sky: AO runs first
+		// The draw that ends the pass may be instanced foliage: AO must draw with instancing off and
+		// hand the game its stream frequencies back.
+		dev->SetStreamSourceFreq(0, D3DSTREAMSOURCE_INDEXEDDATA | 4);
+		dev->SetStreamSourceFreq(1, D3DSTREAMSOURCE_INSTANCEDATA | 1);
+		dev->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0, 3, 0, 1); // AO runs first
+		UINT f0 = 0, f1 = 0;
+		dev->GetStreamSourceFreq(0, &f0);
+		dev->GetStreamSourceFreq(1, &f1);
+		printf("ao: passes drawn with instancing off, game's instancing restored after: %s\n",
+			stats->instancedUpDraws == 0 && f0 == (D3DSTREAMSOURCE_INDEXEDDATA | 4) && f1 == (D3DSTREAMSOURCE_INSTANCEDATA | 1) ? "yes" : "NO");
+		dev->SetStreamSourceFreq(0, 1);
+		dev->SetStreamSourceFreq(1, 1);
 		int aoDraws = stats->draws - before - 1;
-		printf("ao: indirect light target bound as render target 2 during the pass: %s\n", bound && unbound ? "yes" : "NO");
+		printf("ao: indirect and sun light targets bound as render targets 2 and 3 during the pass: %s\n", bound && unbound ? "yes" : "NO");
 		printf("ao: 4 passes drawn before the sky (%d): %s\n", aoDraws, aoDraws == 4 ? "yes" : "NO");
 		IDirect3DSurface9* back = nullptr;
 		dev->GetRenderTarget(0, &back);
@@ -380,12 +398,14 @@ int main()
 			printf("%s\n", at == std::string::npos ? "(no camera line)" : log.substr(at, 160).c_str());
 		}
 		printf("ao: first frame applied (logged): %s\n", log.find("Ambient occlusion: first frame applied") != std::string::npos ? "yes" : "NO");
+		printf("contact shadows: sun direction read from g_ShadowedDirect: %s\n",
+			log.find("Contact shadows: sun direction found (0.000, 0.600, 0.800)") != std::string::npos ? "yes" : "NO");
 
-		// F5 turns AO off: next frame nothing is bound or drawn.
-		g_keys[VK_F5] = true;
-		Sleep(150);
-		g_keys[VK_F5] = false;
-		Sleep(50);
+		// The menu turns AO (6) and contact shadows (9) off: next frame nothing is bound or drawn.
+		MenuPress(dev, '6');
+		MenuPress(dev, VK_LEFT);
+		MenuPress(dev, '9');
+		MenuPress(dev, VK_LEFT);
 		dev->BeginScene();
 		dev->SetRenderTarget(0, sceneSurf);
 		dev->SetRenderTarget(1, zSurf);
@@ -396,11 +416,20 @@ int main()
 		dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
 		dev->EndScene();
 		dev->Present(NULL, NULL, NULL, NULL);
-		printf("ao: F5 off: nothing bound or drawn: %s\n", !boundOff && stats->draws - before == 1 ? "yes" : "NO");
-		g_keys[VK_F5] = true;
-		Sleep(150);
-		g_keys[VK_F5] = false;
-		Sleep(50);
+		printf("ao: menu AO + contact shadows off: nothing bound or drawn: %s\n", !boundOff && stats->draws - before == 1 ? "yes" : "NO");
+		MenuPress(dev, '6');
+		MenuPress(dev, VK_RIGHT);
+		MenuPress(dev, '9');
+		MenuPress(dev, VK_RIGHT);
+		char ini[MAX_PATH];
+		GetFullPathNameA("scripts\\AC2ShadowOverhaul.ini", MAX_PATH, ini, nullptr);
+		Sleep(1100);
+		dev->Present(NULL, NULL, NULL, NULL); // saves them, a second after the last change
+		printf("ao: menu on/off saved to the ini: %s\n",
+			GetPrivateProfileIntA("AmbientOcclusion", "StartEnabled", -1, ini) == 1 &&
+					GetPrivateProfileIntA("ContactShadows", "StartEnabled", -1, ini) == 1
+				? "yes"
+				: "NO");
 		dev->SetRenderTarget(0, bb);
 	}
 
@@ -431,10 +460,12 @@ int main()
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		printf("soft shadows on : device has the shader the game set: %s\n", cur == gp ? "yes" : "NO");
-		g_f6Down = true;
-		Sleep(150);
-		g_f6Down = false;
-		Sleep(100);
+		// Menu: "5 Soft shadow width" down to 0 = off (the game's filter).
+		auto press = [&](int vk) { MenuPress(dev, vk); };
+		press('5');
+		press(VK_LEFT);
+		press(VK_LEFT);
+		press(VK_LEFT);
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		UINT curSize = 0;
@@ -443,19 +474,9 @@ int main()
 		printf("soft shadows off: device has the game's filter (%u bytes, AO output added; soft %u): %s\n", curSize, got,
 			cur != gp && curSize > bytes && curSize < got ? "yes" : "NO");
 
-		// Debug menu: F6 back on, then select "5 Soft shadow width" and press Down (3 -> 2).
-		g_f6Down = true;
-		Sleep(150);
-		g_f6Down = false;
-		Sleep(100);
-		auto press = [&](int vk) {
-			g_keys[vk] = true;
-			dev->Present(NULL, NULL, NULL, NULL);
-			g_keys[vk] = false;
-			dev->Present(NULL, NULL, NULL, NULL);
-		};
-		press('5');
-		press(VK_SUBTRACT);
+		// Back on: Right twice (0 -> 2).
+		press(VK_RIGHT);
+		press(VK_RIGHT);
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		UINT w2 = 0;
@@ -463,18 +484,18 @@ int main()
 			cur->GetFunction(nullptr, &w2);
 		printf("debug menu width 2: device has another variant (%u bytes; width 3 %u, original %u): %s\n", w2, got, curSize,
 			cur != gp && w2 != got && w2 > curSize ? "yes" : "NO");
-		press(VK_OEM_PLUS);
+		press(VK_RIGHT);
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		printf("debug menu width 3 again: device has the game's shader: %s\n", cur == gp ? "yes" : "NO");
 		press('1');
-		press(VK_OEM_PLUS);
+		press(VK_RIGHT);
 
 		// Saving: width 3 -> 2, then the ini is written a second after the last key press.
 		char ini[MAX_PATH];
 		GetFullPathNameA("scripts\\AC2ShadowOverhaul.ini", MAX_PATH, ini, nullptr);
 		press('5');
-		press(VK_SUBTRACT);
+		press(VK_LEFT);
 		int before = GetPrivateProfileIntA("SoftShadows", "FilterWidth", -1, ini);
 		Sleep(1200);
 		dev->Present(NULL, NULL, NULL, NULL);
@@ -483,6 +504,33 @@ int main()
 			before == 3 && after == 2 ? "yes" : "NO");
 		WritePrivateProfileStringA("SoftShadows", "FilterWidth", "3", ini); // leave the test ini as it was
 	} while (0);
+
+	// [Debug] FrameDumpKey (F8 here; off by default): a second dump without the menu.
+	{
+		auto dumps = [] {
+			int n = 0;
+			WIN32_FIND_DATAA fd;
+			HANDLE h = FindFirstFileA("scripts\\AC2ShadowOverhaul_FrameDump_*.txt", &fd);
+			if (h != INVALID_HANDLE_VALUE)
+			{
+				do
+					n += strstr(fd.cFileName, "_shaders") == nullptr && strstr(fd.cFileName, "_ps") == nullptr &&
+						 strstr(fd.cFileName, "_vs") == nullptr;
+				while (FindNextFileA(h, &fd));
+				FindClose(h);
+			}
+			return n;
+		};
+		int before = dumps();
+		Sleep(1100); // dump file names have one-second resolution
+		g_keys[VK_F8] = true;
+		dev->Present(NULL, NULL, NULL, NULL);
+		g_keys[VK_F8] = false;
+		for (int i = 0; i < 3; i++)
+			dev->Present(NULL, NULL, NULL, NULL);
+		int after = dumps();
+		printf("frame dump hotkey: %d dump(s) before, %d after: %s\n", before, after, after == before + 1 ? "yes" : "NO");
+	}
 	autoDs->Release();
 	hr = dev->Reset(&pp);
 	printf("Reset 0x%08lX\n", hr);

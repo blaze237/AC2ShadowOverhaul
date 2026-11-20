@@ -7,7 +7,10 @@
 //  3. oC2 must equal what the ambient light contributes to the final colour, measured by running
 //     the original again with g_AmbientCube and the lightmap colour set to zero:
 //         oC2.rgb == oC0(normal) - oC0(no ambient)
-//     and shaders that weren't matched must write oC2 = 0.
+//     and shaders that weren't matched must write oC2 = 0;
+//  4. oC3 must equal what the shadowed sun light contributes: the colour minus the colour with the
+//     shadow operand of the combine zeroed, and minus the colour with the cloud shadow map black
+//     (the clouds only dim the sun); unmatched shaders write oC3 = 0.
 #include "../src/common.cpp"
 #include "../src/softshadows.cpp"
 #include "../src/aoshader.cpp"
@@ -49,8 +52,8 @@ struct Inputs
 	float misc[2][4]; // vPos, vFace
 	bool b[16];
 	uint32_t texSeed;
-	int lmSampler = -1;
-	bool noLightmapColour = false;
+	int lmSampler = -1, cloudSampler = -1;
+	bool noLightmapColour = false, noCloud = false;
 	size_t zeroAt = 0;   // before the instruction at this token index, zero the components that
 	DWORD zeroSrc = 0;   // this source token reads for x, y, z (a temp register)
 };
@@ -247,6 +250,8 @@ static bool Run(const std::vector<DWORD>& code, Inputs in, Outputs& o, std::stri
 				res[k] = TexValue(in.texSeed, smp, a[0], a[1], k);
 			if (smp == in.lmSampler && in.noLightmapColour)
 				res[0] = res[1] = res[2] = 0;
+			if (smp == in.cloudSampler && in.noCloud)
+				res[0] = res[1] = res[2] = res[3] = 0;
 			// The texture's swizzle applies to the fetched value.
 			float t[4];
 			for (int k = 0; k < 4; k++)
@@ -315,8 +320,9 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 	ReadCtabVars(code.data(), insts, vars);
 	const CtabVar* amb = FindVar(vars, "g_AmbientCube", 2);
 	const CtabVar* lm = FindVar(vars, "g_WorldLightMapSampler", 3);
+	const CtabVar* cloud = FindVar(vars, "g_CloudShadowSampler", 3);
 
-	int trials = 0, mism = 0, indBad = 0, cutBad = 0, zeroBad = 0;
+	int trials = 0, mism = 0, indBad = 0, cutBad = 0, zeroBad = 0, sunBad = 0, cloudBad = 0;
 	float worst = 0;
 	std::string err;
 	for (int n = 0; n < 400 && trials < 150; n++)
@@ -340,6 +346,7 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 					f = Rand() * 2 - 1;
 		in.texSeed = (uint32_t)(Rand() * 4e9);
 		in.lmSampler = lm ? lm->index : -1;
+		in.cloudSampler = cloud ? cloud->index : -1;
 		Outputs a, b, z;
 		if (!Run(code, in, a, err))
 			return "interpreter: " + err;
@@ -353,7 +360,7 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 		trials++;
 		if (!Run(out, in, b, err))
 			return "interpreter (rewritten): " + err;
-		if (memcmp(a.oC[0], b.oC[0], 16) || memcmp(a.oC[1], b.oC[1], 16) || !b.written[2])
+		if (memcmp(a.oC[0], b.oC[0], 16) || memcmp(a.oC[1], b.oC[1], 16) || !b.written[2] || !b.written[3])
 			mism++;
 		if (matched)
 		{
@@ -372,6 +379,39 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 				{
 					cutBad++;
 					worst = fmaxf(worst, fabsf(expect - got));
+				}
+			}
+		}
+		if (matched)
+		{
+			// The sun term: zeroing the shadow operand at the combine must remove exactly oC3.
+			Inputs cut = in;
+			cut.zeroAt = L.combineAt;
+			cut.zeroSrc = L.sunSrc;
+			Outputs zs;
+			if (!Run(code, cut, zs, err))
+				return "interpreter (sun removed): " + err;
+			for (int k = 0; k < 3; k++)
+			{
+				float expect = a.oC[0][k] - zs.oC[0][k], got = b.oC[3][k];
+				if (!(fabsf(expect - got) <= 2e-4f * (1.0f + fabsf(a.oC[0][k]) + fabsf(got))))
+				{
+					sunBad++;
+					worst = fmaxf(worst, fabsf(expect - got));
+				}
+			}
+			if (cloud)
+			{
+				Inputs dark = in;
+				dark.noCloud = true;
+				Outputs zd;
+				if (!Run(code, dark, zd, err))
+					return "interpreter (no cloud): " + err;
+				for (int k = 0; k < 3; k++)
+				{
+					float expect = a.oC[0][k] - zd.oC[0][k], got = b.oC[3][k];
+					if (!(fabsf(expect - got) <= 2e-4f * (1.0f + fabsf(a.oC[0][k]) + fabsf(got))))
+						cloudBad++;
 				}
 			}
 		}
@@ -396,22 +436,32 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 				}
 			}
 		}
-		if (!matched && (b.oC[2][0] != 0 || b.oC[2][1] != 0 || b.oC[2][2] != 0 || b.oC[2][3] != 0))
+		if (!matched && (b.oC[2][0] != 0 || b.oC[2][1] != 0 || b.oC[2][2] != 0 || b.oC[2][3] != 0 || b.oC[3][0] != 0 ||
+							b.oC[3][1] != 0 || b.oC[3][2] != 0 || b.oC[3][3] != 0))
 			zeroBad++;
 	}
 	char buf[200];
-	if (mism || indBad || cutBad || zeroBad || !trials)
+	// Shaders with an if (an omni light) add that light into the same register as the shadowed sun
+	// before the combine, so there oC3 also holds the omni light: noted, not a failure.
+	bool branches = false;
+	for (const Inst& in : insts)
+		branches |= in.op == OP_IF || in.op == OP_IFC;
+	std::string note = branches && cloudBad ? " (sun term includes the branch's omni light)" : "";
+	if (branches)
+		cloudBad = 0;
+	if (mism || indBad || cutBad || zeroBad || sunBad || cloudBad || !trials)
 	{
 		failed = true;
-		snprintf(buf, sizeof(buf), "FAILED (%d trials: %d changed oC0/oC1, %d term / %d ambient mismatches (worst %g), %d non-zero)",
-			trials, mism, cutBad, indBad, worst, zeroBad);
+		snprintf(buf, sizeof(buf),
+			"FAILED (%d trials: %d changed oC0/oC1, %d term / %d ambient / %d sun / %d cloud mismatches (worst %g), %d non-zero)", trials,
+			mism, cutBad, indBad, sunBad, cloudBad, worst, zeroBad);
 		return buf;
 	}
 	if (matched)
-		snprintf(buf, sizeof(buf), "indirect found, temp r%d, %d trials ok%s", L.temp, trials,
-			amb ? "" : " (ambient cube from the vertex shader: term check only)");
+		snprintf(buf, sizeof(buf), "indirect + sun found, temps r%d/r%d, %d trials ok%s%s", L.temp, L.sunTemp, trials,
+			amb ? "" : " (ambient cube from the vertex shader: term check only)", note.c_str());
 	else
-		snprintf(buf, sizeof(buf), "oC2 = 0 (%s), %d trials ok", reason.c_str(), trials);
+		snprintf(buf, sizeof(buf), "oC2 = oC3 = 0 (%s), %d trials ok", reason.c_str(), trials);
 	return buf;
 }
 
@@ -469,7 +519,7 @@ int main(int argc, char** argv)
 		printf("%.8s %s | soft w3: %s%s\n", fd.cFileName, plain.c_str(), softText.c_str(), m1 != m2 ? "  MATCH DIFFERS" : "");
 	} while (FindNextFileA(h, &fd));
 	FindClose(h);
-	printf("\n%d shaders: %d with the indirect light found, %d writing oC2 = 0, %d with failures\n", shaders, matchedCount, zeroCount,
+	printf("\n%d shaders: %d with the indirect and sun light found, %d writing oC2 = oC3 = 0, %d with failures\n", shaders, matchedCount, zeroCount,
 		failures);
 	return failures ? 3 : 0;
 }

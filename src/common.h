@@ -50,15 +50,18 @@ bool Shadows_TweaksOn();
 void Shadows_SetTweaksOn(bool on);
 float Shadows_GetSetting(int which);
 void Shadows_SetSetting(int which, float value);
-// Debug menu (number keys select a setting, +/- change it, drawn top right).
+// In-game menu ([Menu] MenuKey shows it top right; Up/Down or 1-0 select, Left/Right change).
 bool Tuning_Init();
-void Tuning_Flush(); // writes unsaved debug menu changes to the ini
+void Tuning_Flush(); // writes unsaved menu changes to the ini
 bool Tuning_Enabled();
 struct IDirect3DDevice9;
 void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned backBufferWidth, unsigned backBufferHeight);
 void Tuning_OnLostDevice();
 void Tuning_OnResetDevice();
 void FrameDump_Init(bool deviceHooksNeeded);
+bool FrameDump_Available(); // [Debug] FrameDump=1 and the hooks are in
+bool FrameDump_Busy();      // a dump is requested or being written
+void FrameDump_Request();   // dump the next frame(s) (the menu's "Frame dump" item)
 void CrashLog_Init();
 void CrashLog_Detach(bool processExit);
 void LogMemoryState(const char* when);

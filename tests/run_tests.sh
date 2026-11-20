@@ -1,7 +1,7 @@
 #!/bin/sh
 # Offline tests (no game or GPU needed, except where noted). Usage: ./run_tests.sh [path-to-llvm-mingw/bin]
 #  1. mock end-to-end test: loads the built .asi into a test exe with a fake d3d9.dll, then checks the
-#     shader rewrite, the F6 toggle, the debug menu keys and the ini saving.
+#     shader rewrite, the menu keys (frame dump, on/off switches, soft shadow width) and the ini saving.
 #  2. AO shader test: runs the WARP software renderer (part of Windows) over the real AO shaders on a
 #     synthetic scene and checks where occlusion appears.
 #  3. soft shadow and AO output shader tests: run the rewriters over real shaders exported by the F8
@@ -25,6 +25,7 @@ echo "== mock end-to-end test"
 echo "== AO shaders on WARP"
 $CXX $FLAGS -o ao_warp_test.exe ao_warp_test.cpp -ld3d11
 ./ao_warp_test.exe
+./ao_warp_test.exe pitched
 
 SHADERS="${SHADERS:-../re/shaders/dump}"
 if [ -d "$SHADERS" ]; then

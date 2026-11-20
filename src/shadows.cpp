@@ -41,8 +41,8 @@ static float g_DetailDrawScale = 1.0f;     // small/medium object draw distance 
 static uintptr_t g_SunShadowCascades_Return = 0;
 static void ReportDroppedListEntries();
 
-// Configured scales, so the hotkey can switch between them and vanilla (1.0). The hooks read the
-// globals above every frame, so a change takes effect on the next frame.
+// Configured scales, so the menu's "All effects" can switch between them and vanilla (1.0). The
+// hooks read the globals above every frame, so a change takes effect on the next frame.
 static float g_cfgDistance = 1.0f, g_cfgSplit = 1.0f, g_cfgCaster = 1.0f, g_cfgDraw = 1.0f;
 static volatile bool g_shadowTweaksOn = true;
 
@@ -53,27 +53,6 @@ static void ApplyShadowTweaks(bool on)
 	g_ShadowSplitScale = on ? g_cfgSplit : 1.0f;
 	g_ShadowCasterScale = on ? g_cfgCaster : 1.0f;
 	g_DetailDrawScale = on ? g_cfgDraw : 1.0f;
-}
-
-static int g_toggleKey = 0;
-
-static DWORD WINAPI ToggleThread(void*)
-{
-	bool wasDown = false;
-	for (;;)
-	{
-		Sleep(30);
-		bool down = (GetAsyncKeyState(g_toggleKey) & 0x8000) != 0;
-		if (down && !wasDown && GameHasFocus())
-		{
-			bool on = !g_shadowTweaksOn;
-			ApplyShadowTweaks(on);
-			LogInfo("Shadow tweaks toggled %s.", on ? "ON" : "OFF (vanilla)");
-			Beep(on ? 880 : 440, 120); // high = on, low = vanilla
-		}
-		wasDown = down;
-	}
-	return 0;
 }
 
 static float ClampScale(float scale, float fallback)
@@ -505,14 +484,4 @@ void Shadows_Init(HMODULE patternModule, bool forceInstall)
 	g_cfgSplit = g_ShadowSplitScale;
 	g_cfgCaster = g_ShadowCasterScale;
 	g_cfgDraw = g_DetailDrawScale;
-	g_toggleKey = IniInt(S, "ToggleKey", VK_F7);
-	if (g_toggleKey > 0 && g_toggleKey < 256 && (cascades || visDist))
-	{
-		if (!IniInt(S, "StartEnabled", 1))
-			ApplyShadowTweaks(false);
-		HANDLE t = CreateThread(NULL, 0, ToggleThread, NULL, 0, NULL);
-		if (t)
-			CloseHandle(t);
-		LogInfo("Shadow tweak toggle key: 0x%02X (starting %s).", g_toggleKey, g_shadowTweaksOn ? "on" : "off");
-	}
 }

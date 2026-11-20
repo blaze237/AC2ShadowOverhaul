@@ -64,7 +64,9 @@ static const D3DFORMAT kFmtINTZ = (D3DFORMAT)MAKEFOURCC('I', 'N', 'T', 'Z');
 static bool g_readableDepth = false;
 static bool g_intzSupported = false;
 
-static int g_hotkey = VK_F8;
+static bool g_dumpEnabled = false;            // [Debug] FrameDump
+static volatile bool g_dumpRequested = false; // from the menu; starts at the next Present
+static int g_dumpKey = 0;                      // [Debug] FrameDumpKey: optional hotkey, 0 = none (the default)
 static int g_framesToCapture = 1;
 
 static CRITICAL_SECTION g_lock;
@@ -1414,12 +1416,29 @@ static void EndCapture(IDirect3DDevice9* dev)
 			{
 				Out("  %s: %s", img.name.c_str(), AnalyseFloats(img.v, img.w, img.h, FormatName(d.Format).c_str(), png).c_str());
 				if (d.Format == D3DFMT_R32F)
+				{
+					// Raw copy ("AC2F", width, height, then floats row by row) for replaying the frame offline
+					// (tests/ao_warp_test.cpp replay <file>).
+					char raw[MAX_PATH];
+					snprintf(raw, sizeof(raw), "%s_%s.f32", base, img.name.c_str());
+					if (FILE* f = fopen(raw, "wb"))
+					{
+						const uint32_t hdr[3] = { 0x46324341u, img.w, img.h };
+						fwrite(hdr, 4, 3, f);
+						fwrite(img.v.data(), 4, img.v.size(), f);
+						fclose(f);
+						Out("    raw floats: %s", FileName(raw));
+					}
 					screenFloats.push_back(std::move(img));
+				}
 			}
 			n++;
 		}
 		if (!n)
 			Out("  (none)");
+		Out("");
+		Out("Ambient occlusion / contact shadow inputs (pixel shader constants c0-c7 of the last pass):");
+		Out("  %s", AO_FrameInfo().c_str());
 
 		Out("");
 		Out("Depth buffers used this frame (draws / depth-writing / colour-off, viewport depth range of the depth writes):");
@@ -1511,7 +1530,7 @@ static void NoteAO(bool applied)
 
 static void BeforeDraw(IDirect3DDevice9* dev)
 {
-	NoteAO(AO_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs));
+	NoteAO(AO_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps));
 	if (AO_InPass() && g_ps)
 	{
 		static int logged = 0;
@@ -1552,7 +1571,7 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 	if (first)
 	{
 		first = false;
-		LogInfo("First Present seen; frame dump hotkey is 0x%02X.", g_hotkey);
+		LogInfo("First Present seen%s.", g_dumpEnabled ? "; frame dump available from the menu" : "");
 	}
 	NoteAO(AO_BeforePresent(dev));
 	if (g_capturing)
@@ -1571,11 +1590,16 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 		Tuning_OnPresent(dev, g_bbW, g_bbH);
 	HRESULT hr = o_Present(dev, a, b, w, r);
 
-	static bool wasDown = false;
-	bool down = g_hotkey && (GetAsyncKeyState(g_hotkey) & 0x8000) != 0;
-	if (down && !wasDown && !g_capturing && GameHasFocus())
+	static bool keyWas = false;
+	bool key = g_dumpKey > 0 && g_dumpKey < 256 && (GetAsyncKeyState(g_dumpKey) & 0x8000) != 0;
+	if (key && !keyWas && GameHasFocus())
+		g_dumpRequested = true;
+	keyWas = key;
+	if (g_dumpRequested && !g_capturing)
+	{
+		g_dumpRequested = false;
 		BeginCapture();
-	wasDown = down;
+	}
 	return hr;
 }
 
@@ -1931,12 +1955,13 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 		}
 		g_gameCode.erase(*out);
 		g_aoOutput[*out] = aoKind != 0;
+		AO_OnCreatePixelShader(*out, code);
 		if (haveSet)
 		{
 			g_softOriginal[*out] = set;
 			g_softAny = true;
 		}
-		if (g_hotkey && (haveSet || aoKind))
+		if (g_dumpEnabled && (haveSet || aoKind))
 		{
 			std::vector<DWORD>& keep = g_gameCode[*out];
 			for (size_t i = 0; i < (1u << 20); i++)
@@ -2118,6 +2143,14 @@ static void LogD3D9Module()
 		LogInfo("ReShade32.dll is loaded.");
 }
 
+bool FrameDump_Available() { return g_dumpEnabled && o_Direct3DCreate9; }
+bool FrameDump_Busy() { return g_dumpRequested || g_capturing; }
+void FrameDump_Request()
+{
+	if (FrameDump_Available())
+		g_dumpRequested = true;
+}
+
 void FrameDump_Init(bool deviceHooksNeeded)
 {
 	bool dump = IniInt("Debug", "FrameDump", 1) != 0;
@@ -2127,7 +2160,10 @@ void FrameDump_Init(bool deviceHooksNeeded)
 		if (!deviceHooksNeeded)
 			return;
 	}
-	g_hotkey = dump ? IniInt("Debug", "FrameDumpKey", VK_F8) : 0;
+	g_dumpEnabled = dump;
+	g_dumpKey = dump ? IniInt("Debug", "FrameDumpKey", 0) : 0;
+	if (g_dumpKey > 0 && g_dumpKey < 256)
+		LogInfo("Frame dump hotkey: 0x%02X.", g_dumpKey);
 	g_readableDepth = dump && IniInt("Debug", "FrameDumpDepth", 1) != 0;
 	g_framesToCapture = IniInt("Debug", "FrameDumpFrames", 1);
 	if (g_framesToCapture < 1)
@@ -2146,7 +2182,7 @@ void FrameDump_Init(bool deviceHooksNeeded)
 	}
 	o_Direct3DCreate9 = (PFN_Direct3DCreate9)prev;
 	if (dump)
-		LogInfo("Frame dump ready: press key 0x%02X in game to write AC2ShadowOverhaul_FrameDump_*.txt (%d frame(s)).", g_hotkey, g_framesToCapture);
+		LogInfo("Frame dump ready: choose \"Frame dump\" in the menu to write AC2ShadowOverhaul_FrameDump_*.txt (%d frame(s)).", g_framesToCapture);
 	else
 		LogInfo("Direct3D hooks installed (needed by soft shadows).");
 }

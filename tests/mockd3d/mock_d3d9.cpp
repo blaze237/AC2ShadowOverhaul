@@ -192,6 +192,7 @@ struct MockAoStats
 	IDirect3DSurface9* lastRt0; // target of the last draw
 	DWORD lastBlendOp, lastAlphaBlend;
 	IDirect3DPixelShader9* lastPs;
+	int instancedUpDraws;      // DrawPrimitiveUP with a stream frequency set (invalid in D3D9)
 };
 static MockAoStats g_stats;
 extern "C" __declspec(dllexport) MockAoStats* WINAPI MockGetStats() { return &g_stats; }
@@ -285,8 +286,28 @@ struct MockDevice : Gen_IDirect3DDevice9
 	}
 	// Drawing an INTZ texture into a target marks it as a depth copy, which GetRenderTargetData then
 	// fills with the fake depth minus an "object" (to test the dump's depth comparison).
+	UINT freq[8] = { 1, 1, 1, 1, 1, 1, 1, 1 };
+	STDMETHOD(SetStreamSourceFreq)(UINT i, UINT f) override
+	{
+		if (i < 8)
+			freq[i] = f;
+		return S_OK;
+	}
+	STDMETHOD(GetStreamSourceFreq)(UINT i, UINT* f) override
+	{
+		*f = i < 8 ? freq[i] : 1;
+		return S_OK;
+	}
+	// Like the real runtime, nothing restores stream state here except explicit calls (the mock
+	// state block only covers the pixel shader).
 	STDMETHOD(DrawPrimitiveUP)(D3DPRIMITIVETYPE, UINT, const void*, UINT) override
 	{
+		for (UINT f : freq)
+			if (f != 1)
+			{
+				g_stats.instancedUpDraws++;
+				break;
+			}
 		NoteDraw();
 		auto t = static_cast<MockTexture*>(static_cast<IDirect3DTexture9*>(tex0));
 		if (t && rt0 && t->count && t->levels[0]->desc.Format == kINTZ)

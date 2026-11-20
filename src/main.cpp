@@ -51,6 +51,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 	Shadows_Init(NULL, tuning);
 	bool soft = SoftShadows_Init();
 	bool ao = AO_Init();
+	ao = CS_Init() || ao;
 	FrameDump_Init(soft || tuning || ao);
 	return TRUE;
 }

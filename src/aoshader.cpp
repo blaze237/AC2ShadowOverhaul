@@ -1,4 +1,5 @@
-// AO shader rewrite: adds oC2 = indirect light x (1 - fog) to the main opaque pass's pixel shaders.
+// AO / contact shadow shader rewrite: adds oC2 = indirect light x (1 - fog) and oC3 = shadowed sun
+// light x (1 - fog) to the main opaque pass's pixel shaders.
 //
 // AC2's lit shaders compute (with many compiled variations)
 //     indirect = lerp(g_AmbientCube(normal) * albedo, lightmap.rgb * albedo, w)     (+ more terms)
@@ -9,14 +10,17 @@
 // We follow two taints through the straight-line code: AMB (read from g_AmbientCube or the world
 // lightmap) and SH (read from the shadow or cloud shadow map). The combine is the first mad or add
 // that adds a term carrying only AMB to a term carrying only SH: the AMB term is the complete
-// indirect light. From there the lit colour may only have terms added to it (mad with the lit
-// colour as addend, add, mov) until the final mad into oC0, which gives the fog factor.
+// indirect light, the SH term the shadowed sun light. From there the lit colour may only have
+// terms added to it (mad with the lit colour as addend, add, mov) until the final mad into oC0,
+// which gives the fog factor.
 //
-// Inserted code (fresh temp T, constant K = (0, 1, 0, 0)):
-//     before the combine:   mov rT.xyz, <indirect term>   (mul rT.xyz, a, b if it is a mad's product)
-//     before the final:     mad rT.xyz, rT, -fog, rT ; mov rT.w, K.x ; mov oC2, rT
-// Shaders that write oC1 but don't match get "mov oC2, K.x" at the top, so the target never keeps
-// a value from a surface hidden behind them. Nothing else in the shader changes.
+// Inserted code (fresh temps T and S, constant K = (0, 1, 0, 0)):
+//     before the combine:   mov rT.xyz, <indirect term> ; mov rS.xyz, <sun term>
+//                           (mul instead of mov for a term that is a mad's product)
+//     before the final:     mad rT.xyz, rT, -fog, rT ; mad rS.xyz, rS, -fog, rS ;
+//                           mov rT.w, K.x ; mov rS.w, K.x ; mov oC2, rT ; mov oC3, rS
+// Shaders that write oC1 but don't match get "mov oC2, K.x ; mov oC3, K.x" at the top, so the
+// targets never keep a value from a surface hidden behind them. Nothing else in the shader changes.
 
 #include "ao.h"
 #include "sm3.h"
@@ -127,7 +131,7 @@ bool IdentityXyz(DWORD s) { return SwzComp(s, 0) == 0 && SwzComp(s, 1) == 1 && S
 
 // Finds the combine and final instructions. fogSrc = 0 when the final instruction has no fog.
 bool FindIndirect(const DWORD* code, const std::vector<Inst>& insts, const std::vector<CtabVar>& vars, size_t& combI,
-	size_t& finalI, DWORD indirect[2], DWORD& ambSrc, DWORD& fogSrc, std::string& why)
+	size_t& finalI, DWORD indirect[2], DWORD& ambSrc, DWORD sun[2], DWORD& sunSrc, DWORD& fogSrc, std::string& why)
 {
 	Taint t;
 	if (const CtabVar* v = FindVar(vars, "g_AmbientCube", 2))
@@ -233,11 +237,24 @@ bool FindIndirect(const DWORD* code, const std::vector<Inst>& insts, const std::
 				indirect[0] = p[1];
 				indirect[1] = p[2];
 				ambSrc = (st[0] & T_AMB) ? p[1] : p[2];
+				sun[0] = sunSrc = p[3];
+				sun[1] = 0;
 			}
 			else if (found >= 0 && SrcMod(p[1 + found]) == 0)
 			{
 				indirect[0] = ambSrc = p[1 + found];
 				indirect[1] = 0;
+				if (found == 2)
+				{
+					sun[0] = p[1];
+					sun[1] = p[2];
+					sunSrc = (st[0] & T_SH) ? p[1] : p[2];
+				}
+				else
+				{
+					sun[0] = sunSrc = p[1 + (1 - found)];
+					sun[1] = 0;
+				}
 			}
 			else
 				found = -1;
@@ -387,21 +404,21 @@ bool AO_RewritePS(const DWORD* code, std::vector<DWORD>& result, bool& matched, 
 		reason = "relative constant addressing";
 		return false;
 	}
-	const int T = maxTemp + 1;
+	const int T = maxTemp + 1, S = maxTemp + 2;
 	int K = -1;
 	for (int r = 223; r >= 0 && K < 0; r--)
 		if (!constUsed[r])
 			K = r;
-	if (T > 31 || K < 0)
+	if (S > 31 || K < 0)
 	{
-		reason = T > 31 ? "no free temp register" : "no free constant register";
+		reason = S > 31 ? "no free temp register" : "no free constant register";
 		return false;
 	}
 
 	size_t combI = 0, finalI = 0;
-	DWORD indirect[2] = {}, ambSrc = 0, fogSrc = 0;
+	DWORD indirect[2] = {}, ambSrc = 0, sun[2] = {}, sunSrc = 0, fogSrc = 0;
 	std::string why;
-	matched = FindIndirect(code, insts, vars, combI, finalI, indirect, ambSrc, fogSrc, why);
+	matched = FindIndirect(code, insts, vars, combI, finalI, indirect, ambSrc, sun, sunSrc, fogSrc, why);
 	if (!matched)
 		reason = why;
 
@@ -424,33 +441,58 @@ bool AO_RewritePS(const DWORD* code, std::vector<DWORD>& result, bool& matched, 
 		}
 		out.insert(out.end(), code + firstReal, code + at);
 		e.I(OP_MOV, { Dst(REG_COLOROUT, 2, 0xF), Src(REG_CONST, K, Rep(0)) });
+		e.I(OP_MOV, { Dst(REG_COLOROUT, 3, 0xF), Src(REG_CONST, K, Rep(0)) });
 		out.insert(out.end(), code + at, code + endPos + 1);
 	}
 	else
 	{
 		const size_t combPos = insts[combI].pos, finalPos = insts[finalI].pos;
 		out.insert(out.end(), code + firstReal, code + combPos);
-		if (indirect[1])
-			e.I(OP_MUL, { Dst(REG_TEMP, T, X | Y | Z), indirect[0], indirect[1] });
-		else
-			e.I(OP_MOV, { Dst(REG_TEMP, T, X | Y | Z), indirect[0] });
-		out.insert(out.end(), code + combPos, code + finalPos);
-		if (fogSrc)
+		const DWORD* terms[2] = { indirect, sun };
+		const int regs[2] = { T, S };
+		for (int k = 0; k < 2; k++)
 		{
-			DWORD negFog = 0;
-			NegateSrc(fogSrc, negFog);
-			e.I(OP_MAD, { Dst(REG_TEMP, T, X | Y | Z), Src(REG_TEMP, T, kIdentity), negFog, Src(REG_TEMP, T, kIdentity) });
+			if (terms[k][1])
+				e.I(OP_MUL, { Dst(REG_TEMP, regs[k], X | Y | Z), terms[k][0], terms[k][1] });
+			else
+				e.I(OP_MOV, { Dst(REG_TEMP, regs[k], X | Y | Z), terms[k][0] });
 		}
-		e.I(OP_MOV, { Dst(REG_TEMP, T, W), Src(REG_CONST, K, Rep(0)) });
+		out.insert(out.end(), code + combPos, code + finalPos);
+		for (int k = 0; k < 2; k++)
+		{
+			const int R = regs[k];
+			if (fogSrc)
+			{
+				DWORD negFog = 0;
+				NegateSrc(fogSrc, negFog);
+				e.I(OP_MAD, { Dst(REG_TEMP, R, X | Y | Z), Src(REG_TEMP, R, kIdentity), negFog, Src(REG_TEMP, R, kIdentity) });
+			}
+			e.I(OP_MOV, { Dst(REG_TEMP, R, W), Src(REG_CONST, K, Rep(0)) });
+		}
 		e.I(OP_MOV, { Dst(REG_COLOROUT, 2, 0xF), Src(REG_TEMP, T, kIdentity) });
+		e.I(OP_MOV, { Dst(REG_COLOROUT, 3, 0xF), Src(REG_TEMP, S, kIdentity) });
 		out.insert(out.end(), code + finalPos, code + endPos + 1);
 		g_aoLastLayout.combineAt = combPos;
 		g_aoLastLayout.addend = ambSrc;
+		g_aoLastLayout.sunSrc = sunSrc;
 		g_aoLastLayout.finalAt = finalPos;
 	}
 	g_aoLastLayout.matched = matched;
 	g_aoLastLayout.temp = T;
+	g_aoLastLayout.sunTemp = S;
 	g_aoLastLayout.constReg = K;
 	result.swap(out);
 	return true;
+}
+
+int AO_SunRegister(const DWORD* code)
+{
+	std::vector<Inst> insts;
+	size_t endPos = 0;
+	if (!code || !Parse(code, insts, endPos))
+		return -1;
+	std::vector<CtabVar> vars;
+	ReadCtabVars(code, insts, vars);
+	const CtabVar* v = FindVar(vars, "g_ShadowedDirect", 2);
+	return v ? v->index : -1; // m_Direction is its first member
 }

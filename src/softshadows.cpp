@@ -442,56 +442,36 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& resul
 	return true;
 }
 
-// ---- Settings and toggle -----------------------------------------------------------------------
+// ---- Settings ----------------------------------------------------------------------------------
 
 static bool g_allWidths = false;
 static volatile bool g_active = true;
 static volatile int g_liveWidth = 3;
-static int g_width = 3, g_toggleKey = 0;
+static int g_width = 3;
 
 bool SoftShadows_Active() { return g_active; }
+void SoftShadows_SetActive(bool on) { g_active = on; }
 int SoftShadows_Width() { return g_width; }
 int SoftShadows_LiveWidth() { return g_liveWidth; }
 void SoftShadows_SetLiveWidth(int width) { g_liveWidth = width < 1 ? 1 : width > 4 ? 4 : width; }
 void SoftShadows_SetBuildAllWidths(bool all) { g_allWidths = all; }
 bool SoftShadows_BuildAllWidths() { return g_allWidths; }
 
-static DWORD WINAPI SoftShadowsToggleThread(void*)
-{
-	bool wasDown = false;
-	for (;;)
-	{
-		Sleep(30);
-		bool down = (GetAsyncKeyState(g_toggleKey) & 0x8000) != 0;
-		if (down && !wasDown && GameHasFocus())
-		{
-			g_active = !g_active;
-			LogInfo("Soft shadows toggled %s.", g_active ? "ON" : "OFF (game filter)");
-			Beep(g_active ? 988 : 494, 120);
-		}
-		wasDown = down;
-	}
-	return 0;
-}
-
 bool SoftShadows_Init()
 {
 	const char* S = "SoftShadows";
 	g_width = IniInt(S, "FilterWidth", 3);
+	// 0 = off: the game keeps its own filter (the shaders are still rewritten, at width 1, so the
+	// menu can switch soft shadows on without a restart).
+	g_active = g_width != 0;
 	if (g_width < 1)
 		g_width = 1;
 	if (g_width > 4)
 		g_width = 4;
 	g_liveWidth = g_width;
-	g_active = true; // always on; the toggle key switches to the game's filter for comparisons
-	g_toggleKey = IniInt(S, "ToggleKey", VK_F6);
-	if (g_toggleKey > 0 && g_toggleKey < 256)
-	{
-		HANDLE h = CreateThread(NULL, 0, SoftShadowsToggleThread, NULL, 0, NULL);
-		if (h)
-			CloseHandle(h);
-	}
-	LogInfo("Soft shadows: filter width %d texels (%d taps), toggle key 0x%02X.", g_width, (g_width + 1) * (g_width + 1),
-		g_toggleKey);
+	if (g_active)
+		LogInfo("Soft shadows: filter width %d texels (%d taps).", g_width, (g_width + 1) * (g_width + 1));
+	else
+		LogInfo("Soft shadows: off (FilterWidth=0); the game's own filter is used.");
 	return true;
 }
