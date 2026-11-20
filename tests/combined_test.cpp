@@ -9,7 +9,10 @@
 // Usage: AssassinsCreedIIGame.exe <mode>
 //   order    the frame order: ambient occlusion, then SSGI at the end of the opaque pass (before the
 //            sky draw), the volumetrics after the sky (before the transparents), the TAA resolve
-//            right before the first draw that reads the scene colour; nothing else is drawn
+//            right before the first draw that reads the scene colour; nothing else is drawn. The
+//            geometry prep AO and SSGI share runs once, before both; SSGI's radiance pass reads the
+//            scene colour after the AO / contact shadow composite wrote it; contact shadows and the
+//            volumetrics use the same sun
 //   menus    only one menu is open at a time: F9 (shadows) then F3 (SSGI) hides the F9 menu, and so
 //            on through F1 (TAA) and F11 (volumetrics); the arrows only reach the menu shown last
 //   msaa     a multisampled scene colour and z/w target: the MSAA warning is logged and no effect
@@ -398,6 +401,28 @@ static int TestOrder()
 	Check(post.ps == g.postPs && post.rt[0] == g.bb && post.tex[0] == g.sceneTex && post.tex[1] == g.bloomTex && post.colorWrite == 0xF,
 		"post draw: the game's shader, target, textures and colour mask");
 	Check(E2E_LogCount("(MSAA) is on") == 0 && E2E_LogCount("multisampled") == 0, "no MSAA warning");
+
+	// SSGI's bounce comes from the occluded light: its radiance pass (the only SSGI pass that reads the
+	// lit colour) samples the scene colour after the AO composite (AO and contact shadows) has drawn
+	// into it, and nothing draws into the scene colour in between.
+	{
+		size_t composite = 0, radiance = 0;
+		for (size_t i = t.begin; i < t.end; i++)
+		{
+			const char* name = E2E_PassName(L.draws[i]);
+			if (name && !strcmp(name, "ao-composite") && L.draws[i].rt[0] == g.scene)
+				composite = i;
+			if (name && !strcmp(name, "gi-radiance"))
+				radiance = i;
+		}
+		bool ok = composite && radiance > composite;
+		bool reads = false;
+		for (IDirect3DBaseTexture9* tex : radiance ? L.draws[radiance].tex : L.draws[t.begin].tex)
+			reads |= radiance && tex == g.sceneTex;
+		for (size_t i = composite + 1; ok && i < radiance; i++)
+			ok &= L.draws[i].rt[0] != g.scene;
+		Check(ok && reads, "SSGI reads the scene colour (its radiance pass) after the AO / contact shadow composite wrote it");
+	}
 
 	// One sun for everything (core/scene.h reads g_ShadowedDirect once): the contact shadows' view-space
 	// direction (GTAO pass, c6) is the volumetrics' world direction (march pass, c21) seen through the
