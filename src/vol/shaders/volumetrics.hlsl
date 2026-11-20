@@ -42,7 +42,8 @@ float4 c_Cloud    : register(c20); // cloud shadow uv = world xy * xy + zw (g_Cl
 float4 c_SunDir   : register(c21); // direction towards the sun (world), Henyey-Greenstein g
 float4 c_SunCol   : register(c22); // sun colour x sun scattering strength
 float4 c_Ambient  : register(c23); // sky light scattered by the fog (the game's fog colour x ambient strength)
-float4 c_Medium   : register(c24); // density at and below the base height (1/m; 0 = fog off), height falloff (1/m), base height (m)
+float4 c_Medium   : register(c24); // density at and below the base height (1/m; 0 = fog off), height falloff (1/m), base height (m),
+                                   //   noise frame offset (0 for now: the same jitter every frame)
 float4 c_Blur     : register(c25); // blur direction (fog-res pixels)
 float4 c_Shafts   : register(c26); // sun position (screen uv), step (share of the way to the sun), decay per step
 float4 c_Shafts2  : register(c27); // sky brightness threshold, sun falloff exponent
@@ -160,7 +161,7 @@ float4 PS_FogMarch(VPOS_T vposIn : VPOS) : COLOR
 	float3 sunLight = c_SunCol.rgb * Phase(dot(dir, c_SunDir.xyz), c_SunDir.w);
 
 	float steps = c_Right.w;
-	float jitter = Noise(lp);
+	float jitter = Noise(lp + c_Medium.w * 5.588238);
 	float transmittance = 1.0;
 	float3 scattered = 0;
 	// Samples crowd near the camera (t ~ x^2), where shafts and the fog's height change matter most.

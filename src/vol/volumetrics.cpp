@@ -715,7 +715,7 @@ static void Apply(IDirect3DDevice9* dev)
 	set4(22, F.sunCol[0] * sunI, F.sunCol[1] * sunI, F.sunCol[2] * sunI, 0);
 	if (F.fog)
 		set4(23, F.fogColor[0] * ambI, F.fogColor[1] * ambI, F.fogColor[2] * ambI, 0);
-	set4(24, fog ? fmaxf(g_set.density, 1e-7f) : 0.0f, g_set.heightFalloff, g_set.baseHeight, 0);
+	set4(24, fog ? fmaxf(g_set.density, 1e-7f) : 0.0f, g_set.heightFalloff, g_set.baseHeight, 0); // w: noise frame offset (0 until TAA-aware)
 	set4(26, sunUv[0], sunUv[1], 0, 0);
 	set4(27, g_set.shaftsThreshold, g_set.shaftsFalloff, 0, 0);
 	const float shaftI = g_set.shaftsIntensity * shaftFade;

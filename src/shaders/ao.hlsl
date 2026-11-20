@@ -13,7 +13,7 @@
 float4 c_Full   : register(c0); // full-res width, height, 1/width, 1/height
 float4 c_Half   : register(c1); // AO-res width, height, 1/width, 1/height
 float4 c_Proj   : register(c2); // A, B (z/w = A + B / z), P00, P11
-float4 c_Proj2  : register(c3); // P02, P12 (off-centre), 0, 0
+float4 c_Proj2  : register(c3); // P02, P12 (off-centre), noise frame offset (0 for now: see PS_GTAO), 0
 float4 c_Params : register(c4); // radius (m), pixels per (metre / z) [0.5 * P00 * width], max radius (px), falloff share
 float4 c_Params2: register(c5); // AO strength (exponent; 0 = AO off), view mode, blur direction x, y
 float4 c_Sun    : register(c6); // direction towards the sun (view space), contact shadow length (m; 0 = off)
@@ -112,6 +112,22 @@ float ContactShadow(float3 P, float3 N, float z, float noise)
 // ---- GTAO + contact shadows (half res) ---------------------------------------------------------
 // Output: r = AO visibility (about 1 = open; noisy, may exceed 1), g = view z of the full-res pixel,
 // b = contact shadow (1 = lit).
+//
+// Why AO isn't taken from SSGI's trace when SSGI is on (it would save this slice loop: 3 x 6 x 2
+// depth fetches per pixel). It would fit - an extra "newly covered share within the AO radius" sum
+// in PS_Trace compiles to 30 of 32 temps, 386 slots - but:
+//  - order: the AO must be in the scene before SSGI reads the lit colour, so that the bounce comes
+//    from occluded light; AO from this frame's trace would only exist after that read (and last
+//    frame's, reprojected, would trail behind moving objects);
+//  - contact shadows need this pass anyway (the position, normal and their own march), and they
+//    are on by default, so the pass would stay;
+//  - density: with SSGI's defaults (10 m radius, 8 steps per side, t^2 spacing) about 3 samples
+//    per side and slice fall within 1.5 m, against GTAO's 6, and they move with SSGI's settings;
+//  - the occlusion differs: SSGI's sector mask gives every sample a finite thickness (0.5 m) and
+//    bridges between samples, GTAO's horizon treats everything in front as solid;
+//  - SSGI's history and blur carry light + frame count in all four channels; AO would need
+//    another target through the temporal and blur passes.
+// So the traces stay separate and share only the geometry prep.
 
 float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 {
@@ -132,8 +148,11 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 	float3 N = tex2Dlod(s_Geo, float4((vpos + 0.5) * c_Half.zw, 0, 0)).xyz;
 
 	// Per-pixel rotation and step offset (interleaved gradient noise; the blur removes the pattern).
-	float noiseA = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715))));
-	float noiseB = frac(52.9829189 * frac(dot(vpos + float2(17.0, 31.0), float2(0.06711056, 0.00583715))));
+	// c_Proj2.z shifts the pattern per frame; 0 for now (the same pattern every frame, as the blur
+	// expects). With TAA resolving the image it can vary by frame, as SSGI's does.
+	float2 seed = vpos + c_Proj2.z * 5.588238;
+	float noiseA = frac(52.9829189 * frac(dot(seed, float2(0.06711056, 0.00583715))));
+	float noiseB = frac(52.9829189 * frac(dot(seed + float2(17.0, 31.0), float2(0.06711056, 0.00583715))));
 
 	float contact = ContactShadow(P, N, z, noiseB);
 

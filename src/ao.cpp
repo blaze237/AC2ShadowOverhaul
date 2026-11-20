@@ -435,7 +435,7 @@ static void Composite(IDirect3DDevice9* dev)
 		{ (float)g_w, (float)g_h, 1.0f / g_w, 1.0f / g_h },
 		{ (float)g_hw, (float)g_hh, 1.0f / g_hw, 1.0f / g_hh },
 		{ cam.A, cam.B, cam.P00, cam.P11 },
-		{ cam.P02, cam.P12, 0, 0 },
+		{ cam.P02, cam.P12, 0, 0 }, // z: noise frame offset, 0 until the effects are made TAA-aware
 		{ g_radius, 0.5f * cam.P00 * g_w, 0.1f * g_h, 0.6f },
 		{ aoStrength, view, 1, 0 },
 		{ sunView[0], sunView[1], sunView[2], cs ? g_csLength : 0.0f },

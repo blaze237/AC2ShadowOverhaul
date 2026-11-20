@@ -139,6 +139,8 @@ float Cover(float lo, float hi, inout float4 occ0, inout float4 occ1, inout floa
 	return dot(n0 + n1 + n2 + n3, 0.0625);
 }
 
+// (The ambient occlusion keeps its own GTAO trace rather than reading one from this: see the
+// comment above PS_GTAO in src/shaders/ao.hlsl.)
 float4 PS_Trace(VPOS_T vposIn : VPOS) : COLOR
 {
 	float2 j = PIXEL(vposIn);
