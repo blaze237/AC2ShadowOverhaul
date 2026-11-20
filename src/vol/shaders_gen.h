@@ -1,4 +1,4 @@
-// Generated from src/shaders/volumetrics.hlsl by tools/gen_shaders.c - do not edit.
+// Generated from src/vol/shaders/volumetrics.hlsl by tools/gen_shaders.c - do not edit.
 #pragma once
 #include <windows.h>
 

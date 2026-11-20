@@ -116,10 +116,12 @@ load the built .asi into a fake `AssassinsCreedIIGame.exe` over a mock `d3d9.dll
 for the shadows and AO, SSGI (`tests/ssgi`), the volumetrics (`tests/vol`) and TAA (`tests/taa`),
 each alone and with every effect on, plus a combined test (`tests/combined_test.cpp`: the frame order
 of all effects, one menu at a time, MSAA, refusal next to an old plugin); the effects' shaders run on
-Windows' software renderer (WARP) over synthetic scenes; unit tests of the maths, menus and vertex
-shader jitter; and, if you have exported shaders (`re/shaders/dump`, `re/shaders/vs`), tests that run
-the soft shadow, AO, SSGI and TAA rewriters over real game shaders. After editing `src/shaders/ao.hlsl`,
-regenerate `src/shaders_gen.h` with `tools/gen_shaders.c` (instructions at its top). See the comments
+Windows' software renderer (WARP) over synthetic scenes; unit tests of the shared core (`tests/core`:
+camera maths, shader constant tables, the menu engine) and of the vertex shader jitter; and, if you
+have exported shaders (`re/shaders/dump`, `re/shaders/vs`), tests that run the soft shadow, AO, SSGI and
+TAA rewriters over real game shaders. After editing an effect's HLSL (`src/shaders/ao.hlsl`,
+`src/ssgi/shaders/ssgi.hlsl`, `src/vol/shaders/volumetrics.hlsl`, `src/taa/shaders/taa.hlsl`),
+regenerate its `shaders_gen.h` with `tools/gen_shaders.c` (instructions at its top). See the comments
 at the top of each file in `tests/` for the others.
 
 `re/` holds the small scripts used to find the hook sites in the exe. They work on a disassembly you
@@ -138,7 +140,11 @@ generate yourself from your own copy of the game; none of the game's code or dat
   are computed from the game's own z/w target, blurred, and the occluded share of each light is
   subtracted from the scene, before the sky and transparents are drawn.
 - `src/framedump.cpp` hooks D3D9 (through `Direct3DCreate9`, so it works under ReShade) to rewrite
-  shaders as they are created and to produce the frame dump.
+  shaders as they are created and to produce the frame dump. It feeds every device call to the
+  effects through `src/features.cpp` (SSGI in `src/ssgi`, volumetrics in `src/vol`, TAA in `src/taa`).
+- `src/core` is what the effects share: shader constant tables (`shaderinfo`), the camera and its
+  reprojection maths (`camera`), the main-pass and per-frame camera tracker (`scene`), the menu
+  engine behind all four menus (`menu`), and the fullscreen-pass plumbing (`fxpass`).
 - `src/crashlog.cpp` logs the faulting address, stack and address-space use when the game crashes.
 
 ## Disclaimer

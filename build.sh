@@ -2,7 +2,7 @@
 # Builds dist/scripts/AC2ShadowOverhaul.asi with llvm-mingw (32-bit target).
 # Usage: ./build.sh [path-to-llvm-mingw/bin]   (or set LLVM_MINGW; falls back to the copy in
 # ../re/tools, then to whatever is on PATH)
-# After editing an effect's HLSL, regenerate its shaders_gen.h (see tools/gen_all_shaders.sh).
+# After editing an effect's HLSL, regenerate its shaders_gen.h with tools/gen_shaders.c (see its top).
 set -e
 cd "$(dirname "$0")"
 TC="${1:-$LLVM_MINGW}"

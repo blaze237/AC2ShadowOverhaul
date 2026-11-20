@@ -1,4 +1,4 @@
-// Generated from src/shaders/ssgi.hlsl by tools/gen_shaders.c - do not edit.
+// Generated from src/ssgi/shaders/ssgi.hlsl by tools/gen_shaders.c - do not edit.
 #pragma once
 #include <windows.h>
 
