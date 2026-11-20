@@ -2,7 +2,10 @@
 //
 // Compiled by tools/gen_shaders.c into src/shaders_gen.h - run it after editing this file.
 //
-//  PS_Prep     (half res, 2 targets) view-space normal + view z; lit colour (2x2 average, clamped)
+//  (geometry)  view-space normal + view z at half res: the prep shared with ambient occlusion
+//              (src/core/shaders/geoprep.hlsl, core/geoprep.h), computed once per frame
+//  PS_Radiance (half res)  lit colour (2x2 average, clamped), read after the ambient occlusion and
+//                          contact shadows are composited, so the bounce comes from occluded light
 //  PS_Trace    (half res)  gathers light from the screen around each pixel: per slice through the
 //                          view direction, march out both ways; each sample covers the angles between
 //                          its front face and a point `thickness` behind it. A 16-sector mask over the
@@ -35,16 +38,15 @@ float4 c_Reproj2  : register(c8);  //                                     -> w (
 float4 c_Temporal : register(c9);  // minimum blend, depth tolerance (relative), history valid, maximum frame count
 float4 c_Blur     : register(c10); // direction (half-res texels per tap), 1 = last pass (apply intensity), 0
 
-sampler2D s_Depth   : register(s0); // Prep: game z/w (point)
-sampler2D s_Colour  : register(s1); // Prep: game scene colour (linear)
-sampler2D s_Geo     : register(s0); // Trace/Temporal/Blur: prep output (normal, z) (point)
-sampler2D s_Rad     : register(s1); // Trace: prep radiance (point)
+sampler2D s_Colour  : register(s1); // Radiance: game scene colour (linear)
+sampler2D s_Geo     : register(s0); // Trace/Temporal/Blur: the shared geometry prep (normal, z; z = 0: sky) (point)
+sampler2D s_Rad     : register(s1); // Trace: radiance (point)
 sampler2D s_Raw     : register(s1); // Temporal: trace output (point)
 sampler2D s_Hist    : register(s2); // Temporal: last frame's history (point)
-sampler2D s_PrevGeo : register(s3); // Temporal: last frame's prep output (point)
+sampler2D s_PrevGeo : register(s3); // Temporal: last frame's geometry prep (point)
 sampler2D s_Src     : register(s1); // Blur: input (point)
 sampler2D s_Out     : register(s1); // Debug: a half-res result (linear)
-sampler2D s_Normals : register(s2); // Debug: prep output (point)
+sampler2D s_Normals : register(s2); // Debug: the geometry prep (point)
 
 // tests/ssgi_warp_test.cpp runs these on D3D11 (WARP), where the pixel position is the pixel centre.
 #ifdef SSGI_D3D11
@@ -58,17 +60,10 @@ sampler2D s_Normals : register(s2); // Debug: prep output (point)
 static const float PI = 3.14159265;
 static const float HALF_PI = 1.57079633;
 
-float LinearZ(float d) { return c_Proj.y / (d - c_Proj.x); }
-
 float3 ViewPos(float2 px, float z) // full-res pixel, view z
 {
 	float2 ndc = float2(px.x * 2.0 * c_Full.z - 1.0, 1.0 - px.y * 2.0 * c_Full.w);
 	return float3((ndc - c_Proj2.xy) / c_Proj.zw * z, z);
-}
-
-float FetchZ(float2 px) // full-res
-{
-	return LinearZ(tex2Dlod(s_Depth, float4((px + 0.5) * c_Full.zw, 0, 0)).x);
 }
 
 float2 HalfUv(float2 j) { return (j + 0.5) * c_Half.zw; }
@@ -85,44 +80,16 @@ float4 VS_Fullscreen(float4 p : POSITION) : POSITION
 	return p;
 }
 
-// ---- Prep --------------------------------------------------------------------------------------
+// ---- Radiance ----------------------------------------------------------------------------------
 
-struct PrepOut
+float4 PS_Radiance(VPOS_T vposIn : VPOS) : COLOR
 {
-	float4 geo : COLOR0; // view normal, view z (0 = sky)
-	float4 rad : COLOR1; // lit colour
-};
-
-PrepOut PS_Prep(VPOS_T vposIn : VPOS)
-{
-	float2 j = PIXEL(vposIn);
-	float2 px = j * 2.0;
-	PrepOut o;
+	float2 px = PIXEL(vposIn) * 2.0;
 	// Centre of the 2x2 block with bilinear filtering = its average. NaN / negative values from the
 	// game's HDR targets are dropped, very bright ones clamped (they'd make the noise flicker).
 	float3 rad = tex2Dlod(s_Colour, float4((px + 1.0) * c_Full.zw, 0, 0)).rgb;
 	rad = min(max(rad, 0), c_Proj2.w);
-	o.rad = float4(rad, 1);
-	float d = tex2Dlod(s_Depth, float4((px + 0.5) * c_Full.zw, 0, 0)).x;
-	if (d >= 1.0)
-	{
-		o.geo = float4(0, 0, -1, 0);
-		return o;
-	}
-	float z = LinearZ(d);
-	float3 P = ViewPos(px, z);
-	// Normal from the neighbouring pixels: on each axis the side with the smaller depth step, so
-	// silhouettes don't bend it.
-	float3 pl = ViewPos(px - float2(1, 0), FetchZ(px - float2(1, 0)));
-	float3 pr = ViewPos(px + float2(1, 0), FetchZ(px + float2(1, 0)));
-	float3 pu = ViewPos(px - float2(0, 1), FetchZ(px - float2(0, 1)));
-	float3 pd = ViewPos(px + float2(0, 1), FetchZ(px + float2(0, 1)));
-	float3 dx = abs(pr.z - P.z) < abs(P.z - pl.z) ? pr - P : P - pl;
-	float3 dy = abs(pd.z - P.z) < abs(P.z - pu.z) ? pd - P : P - pu;
-	float3 N = normalize(cross(dx, dy));
-	N = dot(N, P) > 0 ? -N : N;
-	o.geo = float4(N, z);
-	return o;
+	return float4(rad, 1);
 }
 
 // ---- Trace -------------------------------------------------------------------------------------

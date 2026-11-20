@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 #include "mockd3d/mock_api.h"
+#include "core/shaders_gen.h" // the geometry prep AO and SSGI share
 #include "shaders_gen.h"      // ambient occlusion + contact shadows (src/shaders_gen.h)
 #include "ssgi/shaders_gen.h"
 #include "vol/shaders_gen.h"
@@ -171,14 +172,15 @@ static int E2E_LogCount(const char* what)
 
 enum E2EEffect
 {
-	FX_NONE, // the game (or anything else)
-	FX_AO,   // ambient occlusion + contact shadows
+	FX_NONE,   // the game (or anything else)
+	FX_SHARED, // the geometry prep AO and SSGI share (core/geoprep.h), run by whichever comes first
+	FX_AO,     // ambient occlusion + contact shadows
 	FX_SSGI,
 	FX_VOL,
 	FX_TAA,
 	FX_COUNT
 };
-static const char* const kE2EEffectNames[FX_COUNT] = { "game", "AO", "SSGI", "volumetrics", "TAA" };
+static const char* const kE2EEffectNames[FX_COUNT] = { "game", "shared", "AO", "SSGI", "volumetrics", "TAA" };
 
 struct E2EShader
 {
@@ -188,10 +190,11 @@ struct E2EShader
 	const char* name;
 };
 static const E2EShader kE2EShaders[] = {
+	{ core::kGeoPrepPs, sizeof(core::kGeoPrepPs), FX_SHARED, "geo-prep" },
 	{ kAoGtaoPs, sizeof(kAoGtaoPs), FX_AO, "gtao" },
 	{ kAoBlurPs, sizeof(kAoBlurPs), FX_AO, "ao-blur" },
 	{ kAoCompositePs, sizeof(kAoCompositePs), FX_AO, "ao-composite" },
-	{ ssgi::kGiPrepPs, sizeof(ssgi::kGiPrepPs), FX_SSGI, "gi-prep" },
+	{ ssgi::kGiRadiancePs, sizeof(ssgi::kGiRadiancePs), FX_SSGI, "gi-radiance" },
 	{ ssgi::kGiTracePs, sizeof(ssgi::kGiTracePs), FX_SSGI, "gi-trace" },
 	{ ssgi::kGiTemporalPs, sizeof(ssgi::kGiTemporalPs), FX_SSGI, "gi-temporal" },
 	{ ssgi::kGiBlurPs, sizeof(ssgi::kGiBlurPs), FX_SSGI, "gi-blur" },
@@ -229,7 +232,7 @@ static const char* E2E_PassName(const MockDraw& d)
 struct E2EPassCount
 {
 	int n[FX_COUNT] = {};
-	int Effects() const { return n[FX_AO] + n[FX_SSGI] + n[FX_VOL] + n[FX_TAA]; }
+	int Effects() const { return n[FX_SHARED] + n[FX_AO] + n[FX_SSGI] + n[FX_VOL] + n[FX_TAA]; }
 };
 static E2EPassCount E2E_CountPasses(const MockLog* log, size_t from, size_t to)
 {

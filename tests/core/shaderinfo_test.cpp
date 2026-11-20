@@ -12,6 +12,7 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include "core/shaders_gen.h" // the geometry prep AO and SSGI share
 #include "shaders_gen.h" // ambient occlusion (src/shaders_gen.h)
 #include "ssgi/shaders_gen.h"
 #include "vol/shaders_gen.h"
@@ -227,7 +228,8 @@ static void CheckOwnShaders()
 		{ "kAoBlurPs", kAoBlurPs },
 		{ "kAoCompositePs", kAoCompositePs },
 		{ "kDepthToColourPs", kDepthToColourPs },
-		{ "kGiPrepPs", ssgi::kGiPrepPs },
+		{ "kGeoPrepPs", core::kGeoPrepPs },
+		{ "kGiRadiancePs", ssgi::kGiRadiancePs },
 		{ "kGiTracePs", ssgi::kGiTracePs },
 		{ "kGiTemporalPs", ssgi::kGiTemporalPs },
 		{ "kGiBlurPs", ssgi::kGiBlurPs },

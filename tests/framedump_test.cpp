@@ -363,7 +363,7 @@ int main()
 		dev->SetStreamSourceFreq(1, 1);
 		int aoDraws = stats->draws - before - 1;
 		printf("ao: indirect and sun light targets bound as render targets 2 and 3 during the pass: %s\n", bound && unbound ? "yes" : "NO");
-		printf("ao: 4 passes drawn before the sky (%d): %s\n", aoDraws, aoDraws == 4 ? "yes" : "NO");
+		printf("ao: 5 passes drawn before the sky (geometry prep, GTAO, 2 blurs, composite) (%d): %s\n", aoDraws, aoDraws == 5 ? "yes" : "NO");
 		IDirect3DSurface9* back = nullptr;
 		dev->GetRenderTarget(0, &back);
 		printf("ao: game's render target and state restored after the passes: %s\n",

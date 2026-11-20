@@ -56,11 +56,14 @@ static PFN_Reflect g_reflect;
 static std::string g_src;
 static const GUID kIID_Reflection = { 0x8d536ca1, 0x0cca, 0x4956, { 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84 } };
 
-static ID3DBlob* CompileEntry(const char* entry, const char* profile)
+static std::string g_geoSrc; // src/core/shaders/geoprep.hlsl: the geometry prep shared with ambient occlusion
+
+static ID3DBlob* CompileEntry(const char* entry, const char* profile, bool geo = false)
 {
-	const D3D_SHADER_MACRO defs[] = { { "SSGI_D3D11", "1" }, { nullptr, nullptr } };
+	const D3D_SHADER_MACRO defs[] = { { "SSGI_D3D11", "1" }, { "GEO_D3D11", "1" }, { nullptr, nullptr } };
 	ID3DBlob *code = nullptr, *err = nullptr;
-	HRESULT hr = g_compile(g_src.data(), g_src.size(), "ssgi.hlsl", defs, nullptr, entry, profile,
+	const std::string& src = geo ? g_geoSrc : g_src;
+	HRESULT hr = g_compile(src.data(), src.size(), geo ? "geoprep.hlsl" : "ssgi.hlsl", defs, nullptr, entry, profile,
 		D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
 	if (FAILED(hr))
 		printf("%s: compile failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
@@ -328,9 +331,9 @@ struct Shader
 	std::vector<uint8_t> cb;
 	std::vector<std::pair<std::string, UINT>> vars, textures, samplers;
 };
-static bool Load(Shader& s, const char* entry)
+static bool Load(Shader& s, const char* entry, bool geo = false)
 {
-	s.code = CompileEntry(entry, "ps_4_0");
+	s.code = CompileEntry(entry, "ps_4_0", geo);
 	if (!s.code)
 		return false;
 	dev->CreatePixelShader(s.code->GetBufferPointer(), s.code->GetBufferSize(), nullptr, &s.ps);
@@ -447,14 +450,17 @@ static void Avg(const std::vector<float>& img, float px, float py, float out[4],
 int main()
 {
 	setvbuf(stdout, nullptr, _IONBF, 0);
-	FILE* f = fopen("../../src/ssgi/shaders/ssgi.hlsl", "rb");
-	if (!f)
-		return printf("run from tests/ssgi\n"), 1;
-	char buf[4096];
-	size_t n;
-	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-		g_src.append(buf, n);
-	fclose(f);
+	for (int k = 0; k < 2; k++)
+	{
+		FILE* f = fopen(k ? "../../src/core/shaders/geoprep.hlsl" : "../../src/ssgi/shaders/ssgi.hlsl", "rb");
+		if (!f)
+			return printf("run from tests/ssgi\n"), 1;
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+			(k ? g_geoSrc : g_src).append(buf, n);
+		fclose(f);
+	}
 	HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
 	g_compile = dc ? (PFN_Compile)GetProcAddress(dc, "D3DCompile") : nullptr;
 	g_reflect = dc ? (PFN_Reflect)GetProcAddress(dc, "D3DReflect") : nullptr;
@@ -465,8 +471,8 @@ int main()
 		return printf("no WARP device\n"), 1;
 
 	ID3DBlob* vsCode = CompileEntry("VS_Fullscreen", "vs_4_0");
-	Shader prep, trace, temporal, blur, debug;
-	if (!vsCode || !Load(prep, "PS_Prep") || !Load(trace, "PS_Trace") || !Load(temporal, "PS_Temporal") || !Load(blur, "PS_Blur") ||
+	Shader geoPrep, radiance, trace, temporal, blur, debug;
+	if (!vsCode || !Load(geoPrep, "PS_GeoPrep", true) || !Load(radiance, "PS_Radiance") || !Load(trace, "PS_Trace") || !Load(temporal, "PS_Temporal") || !Load(blur, "PS_Blur") ||
 		!Load(debug, "PS_Debug"))
 		return 1;
 	dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_vs);
@@ -525,8 +531,14 @@ int main()
 		{ 1.5f, 0, 0, 0 },
 	} };
 
+	// The geometry prep shared with AO (normals + depth), then SSGI's radiance pass, as the mod runs them.
+	auto prep = [&](const Target& geo, const Target& depthT) {
+		Pass(geoPrep, k, { &geo }, { { "s_Depth", &depthT } });
+		Pass(radiance, k, { &tRad }, { { "s_Colour", &tColour } });
+	};
+
 	// ---- Prep + trace, averaged over 8 noise frames (the game averages over frames too)
-	Pass(prep, k, { &tGeo[0], &tRad }, { { "s_Depth", &tDepth }, { "s_Colour", &tColour } });
+	prep(tGeo[0], tDepth);
 	std::vector<float> geo = ReadBack(tGeo[0]);
 
 	std::vector<float> gi((size_t)HW * HH * 4, 0.0f);
@@ -628,7 +640,7 @@ int main()
 	// ---- Temporal, static camera: frame 1 has no history, frame 2 accumulates.
 	k.c[9][2] = 0; // no history
 	Pass(temporal, k, { &tHist[0] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tRaw }, { "s_Hist", &tHist[1] }, { "s_PrevGeo", &tGeo[1] } });
-	Pass(prep, k, { &tGeo[1], &tRad }, { { "s_Depth", &tDepth }, { "s_Colour", &tColour } }); // same frame again
+	prep(tGeo[1], tDepth); // same frame again
 	k.c[9][2] = 1;
 	Pass(temporal, k, { &tHist[1] }, { { "s_Geo", &tGeo[1] }, { "s_Raw", &tRaw }, { "s_Hist", &tHist[0] }, { "s_PrevGeo", &tGeo[0] } });
 	std::vector<float> h1 = ReadBack(tHist[1]);
@@ -683,8 +695,8 @@ int main()
 				}
 			}
 		Target tPattern = MakeTarget(HW, HH, F, pattern.data(), HW * 16);
-		Pass(prep, k, { &tGeo[0], &tRad }, { { "s_Depth", &tDepth }, { "s_Colour", &tColour } });
-		Pass(prep, k, { &tGeo[1], &tRad }, { { "s_Depth", &tDepth1 }, { "s_Colour", &tColour } });
+		prep(tGeo[0], tDepth);
+		prep(tGeo[1], tDepth1);
 		// The new frame's "trace" is all zeros, the blend weight is 0.2 (count 5 -> 6, max(1/6, 0.1)):
 		// output = history x 5/6.
 		std::vector<float> zeros((size_t)HW * HH * 4, 0.0f);
@@ -743,7 +755,7 @@ int main()
 
 	// ---- Blur + intensity: one run of the full chain on frame 0's trace.
 	{
-		Pass(prep, k, { &tGeo[0], &tRad }, { { "s_Depth", &tDepth }, { "s_Colour", &tColour } });
+		prep(tGeo[0], tDepth);
 		std::vector<float> avg(gi);
 		Target tAvg = MakeTarget(HW, HH, F, avg.data(), HW * 16);
 		Pass(blur, k, { &tTmp }, { { "s_Geo", &tGeo[0] }, { "s_Src", &tAvg } });

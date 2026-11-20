@@ -14,6 +14,7 @@
 #include "shaders_gen.h"
 #include "core/scene.h"
 #include "core/fxpass.h"
+#include "core/geoprep.h"
 #include "core/shaderinfo.h"
 #include <math.h>
 #include <stdio.h>
@@ -410,10 +411,18 @@ static void Composite(IDirect3DDevice9* dev)
 
 	g_state.Save(dev);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
+	const core::CameraFloats& cam = core::Scene().camera.f;
+	// Normals at half res, shared with SSGI (which runs next and reuses them).
+	IDirect3DTexture9* geo = core::Geo_Ensure(dev, depthTex, g_w, g_h, cam);
+	if (!geo)
+	{
+		g_state.Restore(dev);
+		depthTex->Release();
+		return;
+	}
 	for (DWORD s = 0; s < 4; s++)
 		core::SetSamplerClamp(dev, s, D3DTEXF_POINT);
 
-	const core::CameraFloats& cam = core::Scene().camera.f;
 	const float view = (float)g_view;
 	// Sun direction in view space; contact shadows off = length 0. AO off = strength 0 (AO^0 = 1).
 	float sunView[3] = { 0, 0, 0 };
@@ -438,6 +447,7 @@ static void Composite(IDirect3DDevice9* dev)
 
 	// GTAO -> ao[0]; blur across -> ao[1]; blur down -> ao[0]
 	D.SetTexture(dev, 0, depthTex);
+	D.SetTexture(dev, 1, geo);
 	core::SetTarget(dev, g_ao[0].surf, g_hw, g_hh);
 	D.SetPixelShader(dev, g_psGtao);
 	core::DrawFullscreen(dev);

@@ -9,7 +9,8 @@
 //
 // Device side: while the game has its z/w target bound as render target 1, our float16 "indirect"
 // target is bound as render target 2. When the opaque pass ends (render target 1 unbound, before
-// the next draw: the sky), GTAO is computed at half resolution from the z/w target, blurred, and
+// the next draw: the sky), GTAO is computed at half resolution from the z/w target (normals from the geometry
+// prep shared with SSGI, core/geoprep.h), blurred, and
 // (1 - AO) x indirect is subtracted from the scene colour. Fog, sun light, sky and everything
 // drawn later (transparents, effects) are untouched.
 #pragma once

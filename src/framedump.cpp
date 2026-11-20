@@ -21,6 +21,7 @@
 #include "core/shaderinfo.h"
 #include "core/scene.h"
 #include "core/fxpass.h"
+#include "core/geoprep.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -1505,6 +1506,7 @@ static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* p
 {
 	LogInfo("Device Reset: %s", DescribePresent(pp).c_str());
 	core::Scene_OnLostDevice();
+	core::Geo_OnLostDevice();
 	AO_OnLostDevice();
 	Fx_OnLostDevice();
 	HRESULT hr = o_Reset(dev, pp);

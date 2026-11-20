@@ -1,11 +1,12 @@
 /* Compiles every effect's HLSL with the system d3dcompiler_47.dll and writes its shaders_gen.h
    (bytecode arrays plus their disassembly):
+       src/core/shaders/geoprep.hlsl       -> src/core/shaders_gen.h  (namespace core: the shared geometry prep)
        src/shaders/ao.hlsl                 -> src/shaders_gen.h       (ambient occlusion, contact shadows)
        src/ssgi/shaders/ssgi.hlsl          -> src/ssgi/shaders_gen.h  (namespace ssgi)
        src/vol/shaders/volumetrics.hlsl    -> src/vol/shaders_gen.h   (namespace vol)
        src/taa/shaders/taa.hlsl            -> src/taa/shaders_gen.h   (namespace taa)
-   Run from the repo root after editing an HLSL file; name effects (ao, ssgi, vol, taa) to do only those:
-       x86_64-w64-mingw32-clang -O1 -o tools/gen_shaders.exe tools/gen_shaders.c && tools/gen_shaders.exe [ao ssgi vol taa]
+   Run from the repo root after editing an HLSL file; name effects (core, ao, ssgi, vol, taa) to do only those:
+       x86_64-w64-mingw32-clang -O1 -o tools/gen_shaders.exe tools/gen_shaders.c && tools/gen_shaders.exe [core ao ssgi vol taa]
    A header whose HLSL doesn't compile is deleted (restore it with git). The same compiler gives the
    same bytecode, so an unchanged HLSL file regenerates the same arrays. */
 #include <windows.h>
@@ -45,6 +46,9 @@ typedef struct
 	size_t count;
 } Effect;
 
+static const Shader kCore[] = {
+	{ "PS_GeoPrep", "ps_3_0", "kGeoPrepPs" }, /* runs inside AO's / SSGI's passes, with their vertex shader */
+};
 static const Shader kAo[] = {
 	{ "VS_Fullscreen", "vs_3_0", "kAoFullscreenVs" },
 	{ "PS_GTAO", "ps_3_0", "kAoGtaoPs" },
@@ -54,7 +58,7 @@ static const Shader kAo[] = {
 };
 static const Shader kSsgi[] = {
 	{ "VS_Fullscreen", "vs_3_0", "kGiFullscreenVs" },
-	{ "PS_Prep", "ps_3_0", "kGiPrepPs" },
+	{ "PS_Radiance", "ps_3_0", "kGiRadiancePs" },
 	{ "PS_Trace", "ps_3_0", "kGiTracePs" },
 	{ "PS_Temporal", "ps_3_0", "kGiTemporalPs" },
 	{ "PS_Blur", "ps_3_0", "kGiBlurPs" },
@@ -75,6 +79,7 @@ static const Shader kTaa[] = {
 };
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 static const Effect kEffects[] = {
+	{ "core", "src/core/shaders/geoprep.hlsl", "src/core/shaders_gen.h", "core", kCore, N(kCore) },
 	{ "ao", "src/shaders/ao.hlsl", "src/shaders_gen.h", NULL, kAo, N(kAo) },
 	{ "ssgi", "src/ssgi/shaders/ssgi.hlsl", "src/ssgi/shaders_gen.h", "ssgi", kSsgi, N(kSsgi) },
 	{ "vol", "src/vol/shaders/volumetrics.hlsl", "src/vol/shaders_gen.h", "vol", kVol, N(kVol) },

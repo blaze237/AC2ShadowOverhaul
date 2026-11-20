@@ -146,7 +146,8 @@ generate yourself from your own copy of the game; none of the game's code or dat
   effects through `src/features.cpp` (SSGI in `src/ssgi`, volumetrics in `src/vol`, TAA in `src/taa`).
 - `src/core` is what the effects share: shader constant tables (`shaderinfo`), the camera and its
   reprojection maths (`camera`), the main-pass and per-frame camera tracker (`scene`), the menu
-  engine behind all four menus (`menu`), and the fullscreen-pass plumbing (`fxpass`).
+  engine behind all four menus (`menu`), the fullscreen-pass plumbing (`fxpass`), and the half-res
+  normals and depth that AO and SSGI both read, made once per frame (`geoprep`).
 - `src/crashlog.cpp` logs the faulting address, stack and address-space use when the game crashes.
 
 ## Disclaimer

@@ -41,15 +41,17 @@ typedef HRESULT(WINAPI* PFN_Compile)(const void*, SIZE_T, const char*, const D3D
 typedef HRESULT(WINAPI* PFN_Reflect)(const void*, SIZE_T, REFIID, void**);
 static PFN_Compile g_compile;
 static PFN_Reflect g_reflect;
-static std::string g_src;
+static std::string g_src, g_geoSrc;
 
 static const GUID kIID_Reflection = { 0x8d536ca1, 0x0cca, 0x4956, { 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84 } };
 
-static ID3DBlob* CompileEntry(const char* entry, const char* profile)
+// From ao.hlsl, or (geo) from the shared geometry prep (src/core/shaders/geoprep.hlsl).
+static ID3DBlob* CompileEntry(const char* entry, const char* profile, bool geo = false)
 {
-	const D3D_SHADER_MACRO defs[] = { { "AO_D3D11", "1" }, { nullptr, nullptr } };
+	const D3D_SHADER_MACRO defs[] = { { "AO_D3D11", "1" }, { "GEO_D3D11", "1" }, { nullptr, nullptr } };
 	ID3DBlob *code = nullptr, *err = nullptr;
-	HRESULT hr = g_compile(g_src.data(), g_src.size(), "ao.hlsl", defs, nullptr, entry, profile,
+	const std::string& src = geo ? g_geoSrc : g_src;
+	HRESULT hr = g_compile(src.data(), src.size(), geo ? "geoprep.hlsl" : "ao.hlsl", defs, nullptr, entry, profile,
 		D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
 	if (FAILED(hr))
 		printf("%s: compile failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
@@ -347,14 +349,17 @@ int main(int argc, char** argv)
 		}
 		printf("replay: %ux%u, sun (%.3f, %.3f, %.3f), contact length %.2f m\n", W, H, rc[6][0], rc[6][1], rc[6][2], rc[6][3]);
 	}
-	FILE* f = fopen("../src/shaders/ao.hlsl", "rb");
-	if (!f)
-		return printf("run from tests/\n"), 1;
-	char buf[4096];
-	size_t n;
-	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-		g_src.append(buf, n);
-	fclose(f);
+	for (int k = 0; k < 2; k++)
+	{
+		FILE* f = fopen(k ? "../src/core/shaders/geoprep.hlsl" : "../src/shaders/ao.hlsl", "rb");
+		if (!f)
+			return printf("run from tests/\n"), 1;
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+			(k ? g_geoSrc : g_src).append(buf, n);
+		fclose(f);
+	}
 	HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
 	g_compile = dc ? (PFN_Compile)GetProcAddress(dc, "D3DCompile") : nullptr;
 	g_reflect = dc ? (PFN_Reflect)GetProcAddress(dc, "D3DReflect") : nullptr;
@@ -371,10 +376,12 @@ int main(int argc, char** argv)
 	ID3DBlob* gtaoCode = CompileEntry("PS_GTAO", "ps_4_0");
 	ID3DBlob* blurCode = CompileEntry("PS_Blur", "ps_4_0");
 	ID3DBlob* compCode = CompileEntry("PS_Composite", "ps_4_0");
-	if (!vsCode || !gtaoCode || !blurCode || !compCode)
+	ID3DBlob* geoCode = CompileEntry("PS_GeoPrep", "ps_4_0", true);
+	if (!vsCode || !gtaoCode || !blurCode || !compCode || !geoCode)
 		return 1;
 	ID3D11VertexShader* vs = nullptr;
-	ID3D11PixelShader *gtao = nullptr, *blur = nullptr, *comp = nullptr;
+	ID3D11PixelShader *gtao = nullptr, *blur = nullptr, *comp = nullptr, *geoPs = nullptr;
+	dev->CreatePixelShader(geoCode->GetBufferPointer(), geoCode->GetBufferSize(), nullptr, &geoPs);
 	dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs);
 	dev->CreatePixelShader(gtaoCode->GetBufferPointer(), gtaoCode->GetBufferSize(), nullptr, &gtao);
 	dev->CreatePixelShader(blurCode->GetBufferPointer(), blurCode->GetBufferSize(), nullptr, &blur);
@@ -407,6 +414,7 @@ int main(int argc, char** argv)
 	Target tSun = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, sunLight.data(), W * 16);
 	Target tScene = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, scene.data(), W * 16);
 	Target tAo[2] = { MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT), MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT) };
+	Target tGeo = MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT); // the shared geometry prep, as the mod makes it
 
 	D3D11_SAMPLER_DESC smp = {};
 	smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -414,7 +422,7 @@ int main(int argc, char** argv)
 	smp.MaxLOD = D3D11_FLOAT32_MAX;
 	ID3D11SamplerState* point = nullptr;
 	dev->CreateSamplerState(&smp, &point);
-	ID3D11SamplerState* samplers[4] = { point, point, point, point };
+	ID3D11SamplerState* samplers[5] = { point, point, point, point, point };
 	D3D11_BLEND_DESC bl = {};
 	bl.RenderTarget[0].BlendEnable = TRUE;
 	bl.RenderTarget[0].SrcBlend = bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
@@ -471,13 +479,13 @@ int main(int argc, char** argv)
 			D3D11_SUBRESOURCE_DATA cd = { c.data.data(), 0, 0 };
 			dev->CreateBuffer(&cbd, &cd, &cb);
 		}
-		ID3D11ShaderResourceView* none[4] = {};
-		ctx->PSSetShaderResources(0, 4, none);
+		ID3D11ShaderResourceView* none[5] = {};
+		ctx->PSSetShaderResources(0, 5, none);
 		ctx->OMSetRenderTargets(1, &out.rtv, nullptr);
-		static const char* const names[4] = { "s_Depth", "s_AO", "s_Indirect", "s_Sun" };
+		static const char* const names[5] = { "s_Depth", "s_AO", "s_Indirect", "s_Sun", "s_Geo" };
 		for (auto& t : c.textures)
-			for (int k = 0; k < 4; k++)
-				if (t.first == names[k] && t.second < 4)
+			for (int k = 0; k < 5; k++)
+				if (t.first == names[k] && t.second < 5)
 					ctx->PSSetShaderResources(t.second, 1, &srvs[k]);
 		D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
 		ctx->RSSetViewports(1, &vp);
@@ -488,7 +496,7 @@ int main(int argc, char** argv)
 		ctx->VSSetShader(vs, nullptr, 0);
 		ctx->PSSetShader(ps, nullptr, 0);
 		ctx->PSSetConstantBuffers(0, 1, &cb);
-		ctx->PSSetSamplers(0, 4, samplers);
+		ctx->PSSetSamplers(0, 5, samplers);
 		float zero[4] = {};
 		ctx->OMSetBlendState(blend ? subtract : nullptr, zero, 0xFFFFFFFF);
 		ctx->Draw(3, 0);
@@ -496,7 +504,9 @@ int main(int argc, char** argv)
 			cb->Release();
 	};
 	const float across[4] = { strength, 0, 1, 0 }, down[4] = { strength, 0, 0, 1 };
-	ID3D11ShaderResourceView* s0[4] = { tDepth.srv, nullptr, nullptr, nullptr };
+	ID3D11ShaderResourceView* sGeo[5] = { tDepth.srv, nullptr, nullptr, nullptr, nullptr };
+	pass(geoCode, geoPs, tGeo, HW, HH, sGeo, across, false);
+	ID3D11ShaderResourceView* s0[5] = { tDepth.srv, nullptr, nullptr, nullptr, tGeo.srv };
 	pass(gtaoCode, gtao, tAo[0], HW, HH, s0, across, false);
 	if (getenv("AO_DEBUG_COLUMN"))
 	{
@@ -525,11 +535,11 @@ int main(int argc, char** argv)
 		ctx->Unmap(st, 0);
 		st->Release();
 	}
-	ID3D11ShaderResourceView* s1[4] = { tDepth.srv, tAo[0].srv, nullptr, nullptr };
+	ID3D11ShaderResourceView* s1[5] = { tDepth.srv, tAo[0].srv, nullptr, nullptr, nullptr };
 	pass(blurCode, blur, tAo[1], HW, HH, s1, across, false);
-	ID3D11ShaderResourceView* s2[4] = { tDepth.srv, tAo[1].srv, nullptr, nullptr };
+	ID3D11ShaderResourceView* s2[5] = { tDepth.srv, tAo[1].srv, nullptr, nullptr, nullptr };
 	pass(blurCode, blur, tAo[0], HW, HH, s2, down, false);
-	ID3D11ShaderResourceView* s3[4] = { tDepth.srv, tAo[0].srv, tInd.srv, tSun.srv };
+	ID3D11ShaderResourceView* s3[5] = { tDepth.srv, tAo[0].srv, tInd.srv, tSun.srv, nullptr };
 	pass(compCode, comp, tScene, W, H, s3, across, true);
 
 	// The blurred AO and contact shadows (R16G16B16A16_FLOAT, read as halves).
@@ -659,6 +669,103 @@ int main(int argc, char** argv)
 			   "(picture: tests/ao_warp_contact.png)\n",
 			100.0f * frac, 100.0f * wallFrac, ok ? "yes" : "NO");
 		return ok ? 0 : 3;
+	}
+	// The shared geometry prep: every texel against the same rule on the CPU (from the same z/w
+	// values), and at the probe points against the scene's real normals.
+	{
+		std::vector<float> geoHalf(HW * HH * 4);
+		{
+			D3D11_TEXTURE2D_DESC d;
+			tGeo.tex->GetDesc(&d);
+			d.BindFlags = 0;
+			d.Usage = D3D11_USAGE_STAGING;
+			d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			ID3D11Texture2D* st = nullptr;
+			dev->CreateTexture2D(&d, nullptr, &st);
+			ctx->CopyResource(st, tGeo.tex);
+			D3D11_MAPPED_SUBRESOURCE m;
+			ctx->Map(st, 0, D3D11_MAP_READ, 0, &m);
+			auto half = [](uint16_t hbits) {
+				uint32_t sign = (hbits >> 15) & 1, e = (hbits >> 10) & 31, mant = hbits & 1023;
+				float v = e == 0 ? ldexpf((float)mant, -24) : ldexpf((float)(mant | 1024), (int)e - 25);
+				return sign ? -v : v;
+			};
+			for (UINT y = 0; y < HH; y++)
+				for (UINT x = 0; x < HW * 4; x++)
+					geoHalf[(size_t)y * HW * 4 + x] = half(((const uint16_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch))[x]);
+			ctx->Unmap(st, 0);
+			st->Release();
+		}
+		auto zAt = [&](int x, int y) {
+			x = x < 0 ? 0 : x >= (int)W ? W - 1 : x;
+			y = y < 0 ? 0 : y >= (int)H ? H - 1 : y;
+			return B / (depth[(size_t)y * W + x] - A);
+		};
+		auto viewPos = [&](int x, int y, float z, float p[3]) {
+			p[0] = (x * 2.0f / W - 1.0f) / P00 * z;
+			p[1] = (1.0f - y * 2.0f / H) / P11 * z;
+			p[2] = z;
+		};
+		int texels = 0, zBad = 0, nBad = 0;
+		for (UINT j = 0; j < HH; j++)
+			for (UINT i = 0; i < HW; i++)
+			{
+				const float* g = &geoHalf[((size_t)j * HW + i) * 4];
+				int x = 2 * i, y = 2 * j;
+				if (depth[(size_t)y * W + x] >= 1.0f)
+				{
+					zBad += g[3] != 0.0f;
+					continue;
+				}
+				texels++;
+				float z = zAt(x, y), P[3], l[3], r[3], u[3], dn[3], dx[3], dy[3];
+				viewPos(x, y, z, P);
+				viewPos(x - 1, y, zAt(x - 1, y), l);
+				viewPos(x + 1, y, zAt(x + 1, y), r);
+				viewPos(x, y - 1, zAt(x, y - 1), u);
+				viewPos(x, y + 1, zAt(x, y + 1), dn);
+				bool right = fabsf(r[2] - P[2]) < fabsf(P[2] - l[2]), down_ = fabsf(dn[2] - P[2]) < fabsf(P[2] - u[2]);
+				for (int k = 0; k < 3; k++)
+				{
+					dx[k] = right ? r[k] - P[k] : P[k] - l[k];
+					dy[k] = down_ ? dn[k] - P[k] : P[k] - u[k];
+				}
+				float N[3] = { dx[1] * dy[2] - dx[2] * dy[1], dx[2] * dy[0] - dx[0] * dy[2], dx[0] * dy[1] - dx[1] * dy[0] };
+				float len = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+				float flip = N[0] * P[0] + N[1] * P[1] + N[2] * P[2] > 0 ? -1.0f : 1.0f;
+				zBad += !(fabsf(g[3] - z) <= 1e-3f * z);
+				float err = 0;
+				for (int k = 0; k < 3; k++)
+					err = fmaxf(err, fabsf(g[k] - flip * N[k] / len));
+				// Ties between the two sides of an axis can go either way in float: a few silhouette texels.
+				nBad += err > 4e-3f;
+			}
+		float nFrac = texels ? (float)nBad / texels : 1.0f;
+		bool ok = texels > 0 && zBad == 0 && nFrac < 0.002f;
+		fails += !ok;
+		printf("  shared geometry prep: %d texels, %d with z off by more than 1/1000, %.3f%% with the normal off the CPU reconstruction "
+			   "(same rule) by more than 0.004: %s\n",
+			texels, zBad, 100.0f * nFrac, ok ? "yes" : "NO");
+		struct Probe
+		{
+			const char* what;
+			float x, y, z, n[3];
+		} const probes[] = {
+			{ "floor", 2.0f, -1.6f, 4.5f, { 0, 1, 0 } },
+			{ "back wall", 1.5f, 1.0f, 10.0f, { 0, 0, -1 } },
+			{ "left wall", -3.0f, 0.5f, 7.0f, { 1, 0, 0 } },
+			{ "box top", 0.1f, -0.6f, 4.6f, { 0, 1, 0 } },
+		};
+		for (const Probe& pr : probes)
+		{
+			int px, py;
+			Project(pr.x, pr.y, pr.z, px, py);
+			const float* g = &geoHalf[((size_t)(py / 2) * HW + px / 2) * 4];
+			float err = fmaxf(fmaxf(fabsf(g[0] - pr.n[0]), fabsf(g[1] - pr.n[1])), fabsf(g[2] - pr.n[2]));
+			bool pok = err < 0.01f;
+			fails += !pok;
+			printf("  shared geometry prep normal on the %-10s (%.3f, %.3f, %.3f): %s\n", pr.what, g[0], g[1], g[2], pok ? "yes" : "NO");
+		}
 	}
 	printf("ao (WARP): GTAO, contact shadows, blur and composite on a synthetic scene (AO values)\n");
 	check("open floor", aoAt(2.0f, -1.6f, 4.5f), 0.9f, 1.15f);

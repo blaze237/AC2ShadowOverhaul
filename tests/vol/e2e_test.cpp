@@ -397,7 +397,8 @@ int main(int argc, char** argv)
 			printf("  %s draws this frame: %zu\n", e == FX_NONE ? "unknown" : kE2EEffectNames[e], others[e].size());
 	Check(others[FX_NONE].empty(), "no draws other than the game's and the effects' passes");
 	if (!all)
-		Check(others[FX_AO].empty() && others[FX_SSGI].empty() && others[FX_TAA].empty(), "alone: no other effect's passes");
+		Check(others[FX_SHARED].empty() && others[FX_AO].empty() && others[FX_SSGI].empty() && others[FX_TAA].empty(),
+			"alone: no other effect's passes (not even the geometry prep AO and SSGI share)");
 	else
 	{
 		auto within = [](const std::vector<int>& v, int after, int before) {
@@ -406,6 +407,9 @@ int main(int argc, char** argv)
 				ok &= i > after && i < before;
 			return ok;
 		};
+		Check(others[FX_SHARED].size() == 1 && within(others[FX_SHARED], lastOpaque, sky) && !others[FX_AO].empty() &&
+				others[FX_SHARED].front() < others[FX_AO].front(),
+			"the geometry prep AO and SSGI share runs once, before both");
 		Check(others[FX_AO].size() == 4 && within(others[FX_AO], lastOpaque, sky),
 			"ambient occlusion (4 passes) runs after the opaque pass and before the sky");
 		Check(others[FX_SSGI].size() == 5 && within(others[FX_SSGI], lastOpaque, sky) && !others[FX_AO].empty() &&

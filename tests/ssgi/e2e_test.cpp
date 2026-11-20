@@ -11,8 +11,8 @@
 //
 // Usage: AssassinsCreedIIGame.exe [all]
 //   (default) SSGI alone: ambient occlusion, contact shadows, volumetrics and TAA Enabled=0
-//   all       every effect on: the AO passes (4) run too, before ours, and the game's shaders get
-//             both the AO output and the bounce light
+//   all       every effect on: the AO passes (4) run too, before ours, the geometry prep they share
+//             runs once (before both), and the game's shaders get both the AO output and the bounce light
 #include <windows.h>
 #include <d3d9.h>
 #include <stdio.h>
@@ -201,6 +201,7 @@ int main(int argc, char** argv)
 		UINT postS13;
 		IDirect3DPixelShader9* skyPs;
 		bool aoBeforeOurs;              // every AO pass came before our first one
+		bool sharedFirst;               // the shared geometry prep came before both
 	};
 	IDirect3DPixelShader9* skyPsSet = gamePs.empty() ? nullptr : gamePs[0];
 	auto frame = [&](const Mat4& vp) {
@@ -239,37 +240,47 @@ int main(int argc, char** argv)
 		dev->Present(nullptr, nullptr, nullptr, nullptr);
 		r.up = st->upDraws - up0;
 		r.fx = E2E_CountPasses(log, d0, log->draws.size());
-		size_t lastAo = 0, firstOurs = (size_t)-1;
+		size_t lastAo = 0, firstOurs = (size_t)-1, firstAo = (size_t)-1, shared = (size_t)-1;
 		for (size_t i = d0; i < log->draws.size(); i++)
 		{
 			E2EEffect e = E2E_Effect(log->draws[i]);
 			if (e == FX_AO)
 				lastAo = i;
+			if (e == FX_AO && firstAo == (size_t)-1)
+				firstAo = i;
 			if (e == FX_SSGI && firstOurs == (size_t)-1)
 				firstOurs = i;
+			if (e == FX_SHARED)
+				shared = i;
 		}
 		r.aoBeforeOurs = !r.fx.n[FX_AO] || lastAo < firstOurs;
+		// The shared geometry prep comes before everything that reads it.
+		r.sharedFirst = !r.fx.n[FX_SHARED] || (shared < firstAo && shared < firstOurs);
 		return r;
 	};
-	const int ours = 5;              // prep, trace, temporal, blur x2
+	const int ours = 5;              // radiance, trace, temporal, blur x2
 	const int ao = all ? 4 : 0;      // GTAO, blur x2, composite
 	// Our passes, and everything else: alone, nothing else draws; with every effect on, the AO
-	// passes run too, before ours. The volumetrics and TAA don't run in this frame (no sky is drawn
-	// with a 1..1 viewport and the scene colour is never read as a texture).
+	// passes run too, before ours. Either way the geometry prep shared with AO runs once, first
+	// (whichever effect runs first asks for it), and not at all when neither runs. The volumetrics
+	// and TAA don't run in this frame (no sky is drawn with a 1..1 viewport and the scene colour is
+	// never read as a texture).
 	auto passesOk = [&](const FrameResult& r, int expectOurs) {
-		return r.fx.n[FX_SSGI] == expectOurs && r.fx.n[FX_AO] == ao && r.aoBeforeOurs && r.up == expectOurs + ao;
+		const int shared = expectOurs || ao ? 1 : 0;
+		return r.fx.n[FX_SSGI] == expectOurs && r.fx.n[FX_AO] == ao && r.fx.n[FX_SHARED] == shared && r.aoBeforeOurs && r.sharedFirst &&
+			r.up == expectOurs + ao + shared;
 	};
 	auto describe = [&](const FrameResult& r) {
-		char buf[160];
-		snprintf(buf, sizeof(buf), "%d fullscreen passes (SSGI %d, AO %d, volumetrics %d, TAA %d)", r.up, r.fx.n[FX_SSGI], r.fx.n[FX_AO],
-			r.fx.n[FX_VOL], r.fx.n[FX_TAA]);
+		char buf[180];
+		snprintf(buf, sizeof(buf), "%d fullscreen passes (shared geometry prep %d, SSGI %d, AO %d, volumetrics %d, TAA %d)", r.up,
+			r.fx.n[FX_SHARED], r.fx.n[FX_SSGI], r.fx.n[FX_AO], r.fx.n[FX_VOL], r.fx.n[FX_TAA]);
 		return std::string(buf);
 	};
 
 	Mat4 vp0 = ViewProj(100, 200, 30), vp1 = ViewProj(100.2, 200.5, 30.05);
 	FrameResult f0 = frame(vp0);
 	printf("frame 1: %s, s13 width %u during the opaque pass\n", describe(f0).c_str(), f0.opaqueS13);
-	CHECK(passesOk(f0, ours), "frame 1: %s, expected SSGI %d, AO %d (before SSGI)", describe(f0).c_str(), ours, ao);
+	CHECK(passesOk(f0, ours), "frame 1: %s, expected the shared prep once first, SSGI %d, AO %d (before SSGI)", describe(f0).c_str(), ours, ao);
 	CHECK(f0.opaqueS13 == 1, "frame 1: s13 should be black (1x1), is %u wide", f0.opaqueS13);
 	CHECK(f0.skyRt0 == colour && f0.skyRt1 == nullptr, "frame 1: targets not restored for the sky");
 	CHECK(f0.skyFreq1 == (D3DSTREAMSOURCE_INSTANCEDATA | 1), "frame 1: stream frequency not restored (%u)", f0.skyFreq1);
@@ -284,7 +295,7 @@ int main(int argc, char** argv)
 		for (int c = 0; c < 4; c++)
 			worst = fmaxf(worst, fabsf(f1.rows[r][c] - expect[r][c]) / (1e-3f + fabsf(expect[r][c])));
 	printf("frame 2: %s, s13 width %u, reprojection rows off by %.2g (relative)\n", describe(f1).c_str(), f1.opaqueS13, worst);
-	CHECK(passesOk(f1, ours), "frame 2: %s, expected SSGI %d, AO %d (before SSGI)", describe(f1).c_str(), ours, ao);
+	CHECK(passesOk(f1, ours), "frame 2: %s, expected the shared prep once first, SSGI %d, AO %d (before SSGI)", describe(f1).c_str(), ours, ao);
 	CHECK(f1.opaqueS13 == (W + 1) / 2, "frame 2: s13 should be the GI texture, is %u wide", f1.opaqueS13);
 	CHECK(worst < 1e-3f, "frame 2: c216-c218 don't hold the reprojection rows");
 	CHECK(f1.postS13 != (W + 1) / 2, "frame 2: the GI texture stays bound outside the scene colour");

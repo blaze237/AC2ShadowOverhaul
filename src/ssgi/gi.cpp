@@ -13,6 +13,7 @@
 #include "shaders_gen.h"
 #include "core/scene.h"
 #include "core/fxpass.h"
+#include "core/geoprep.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -117,21 +118,21 @@ static const core::Camera& Cam() { return core::Scene().camera; }
 
 static const core::DeviceFns& D = core::Orig();
 
-static core::RenderTarget g_prep[2], g_rad, g_raw, g_hist[2], g_tmp, g_out[2], g_black, g_colourCopy;
+static core::RenderTarget g_rad, g_raw, g_hist[2], g_tmp, g_out[2], g_black, g_colourCopy;
 static D3DFORMAT g_colourCopyFmt = D3DFMT_UNKNOWN;
 static UINT g_w, g_h, g_hw, g_hh;
 static core::PassState g_state;
 static IDirect3DVertexShader9* g_vsFull;
-static IDirect3DPixelShader9 *g_psPrep, *g_psTrace, *g_psTemporal, *g_psBlur, *g_psDebug;
+static IDirect3DPixelShader9 *g_psRadiance, *g_psTrace, *g_psTemporal, *g_psBlur, *g_psDebug;
 static IDirect3DVertexDeclaration9* g_decl;
 static bool g_failed = false;
 static bool g_capsChecked = false;
 
 // Frame-to-frame state.
-static int g_cur = 0;             // prep / history written this frame; 1 - g_cur = last frame's
+static int g_cur = 0;             // history written this frame; 1 - g_cur = last frame's
 static int g_outBound = 0;        // GI texture the game's shaders read this frame
 static bool g_outValid = false;   // g_out[g_outBound] holds a result
-static bool g_histValid = false;  // g_hist[1 - g_cur], g_prep[1 - g_cur] hold last frame's
+static bool g_histValid = false;  // g_hist[1 - g_cur] holds last frame's (its geometry: core::Geo_Previous())
 static bool g_wroteThisFrame = false;
 static unsigned g_frame = 0;
 
@@ -221,7 +222,6 @@ static void ReleaseTargets()
 		t.Release();
 	for (int i = 0; i < 2; i++)
 	{
-		g_prep[i].Release();
 		g_hist[i].Release();
 		g_out[i].Release();
 	}
@@ -252,16 +252,16 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 		g_capsChecked = true;
 		D3DCAPS9 caps = {};
 		dev->GetDeviceCaps(&caps);
-		if (caps.NumSimultaneousRTs < 2 || caps.PixelShaderVersion < D3DPS_VERSION(3, 0))
+		if (caps.PixelShaderVersion < D3DPS_VERSION(3, 0))
 		{
-			Fail("the GPU lacks pixel shader 3.0 or 2 render targets", 0);
+			Fail("the GPU lacks pixel shader 3.0", 0);
 			return false;
 		}
 	}
 	if (!g_vsFull)
 	{
 		HRESULT hr;
-		if (FAILED(hr = D.CreateVertexShader(dev, kGiFullscreenVs, &g_vsFull)) || FAILED(hr = D.CreatePixelShader(dev, kGiPrepPs, &g_psPrep)) ||
+		if (FAILED(hr = D.CreateVertexShader(dev, kGiFullscreenVs, &g_vsFull)) || FAILED(hr = D.CreatePixelShader(dev, kGiRadiancePs, &g_psRadiance)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kGiTracePs, &g_psTrace)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kGiTemporalPs, &g_psTemporal)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kGiBlurPs, &g_psBlur)) || FAILED(hr = D.CreatePixelShader(dev, kGiDebugPs, &g_psDebug)) ||
@@ -279,7 +279,7 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 	bool ok = SUCCEEDED(g_rad.Create(dev, hw, hh, F)) && SUCCEEDED(g_raw.Create(dev, hw, hh, F)) && SUCCEEDED(g_tmp.Create(dev, hw, hh, F)) &&
 		SUCCEEDED(g_black.Create(dev, 1, 1, F));
 	for (int i = 0; i < 2 && ok; i++)
-		ok = SUCCEEDED(g_prep[i].Create(dev, hw, hh, F)) && SUCCEEDED(g_hist[i].Create(dev, hw, hh, F)) && SUCCEEDED(g_out[i].Create(dev, hw, hh, F));
+		ok = SUCCEEDED(g_hist[i].Create(dev, hw, hh, F)) && SUCCEEDED(g_out[i].Create(dev, hw, hh, F));
 	HRESULT hr = ok ? g_state.Create(dev) : E_FAIL;
 	if (!ok || FAILED(hr))
 	{
@@ -579,14 +579,16 @@ static void RunPasses(IDirect3DDevice9* dev)
 	g_state.Save(dev);
 	IDirect3DTexture9* colourTex = ColourTexture(dev);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
-	dev->SetRenderState(D3DRS_COLORWRITEENABLE1, 0xF); // the prep pass writes two targets
+	const core::CameraFloats& cam = Cam().f;
+	// Normals and depth at half res: ambient occlusion's, if it ran this frame, else made here.
+	IDirect3DTexture9* geo = colourTex ? core::Geo_Ensure(dev, depthTex, g_w, g_h, cam) : nullptr;
+	IDirect3DTexture9* prevGeo = core::Geo_Previous();
 	for (DWORD s = 0; s < 4; s++)
 		core::SetSamplerClamp(dev, s, D3DTEXF_POINT);
 
 	const int cur = g_cur, prev = 1 - g_cur;
 	float rows[3][4];
-	const core::CameraFloats& cam = Cam().f;
-	bool reproject = g_histValid && !g_cut && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
+	bool reproject = g_histValid && prevGeo && !g_cut && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
 	if (!reproject)
 		core::IdentityRows(g_w, g_h, rows);
 	const float c[11][4] = {
@@ -605,23 +607,21 @@ static void RunPasses(IDirect3DDevice9* dev)
 	dev->SetPixelShaderConstantF(0, &c[0][0], 11);
 	g_frame++;
 
-	GpuTiming* timing = colourTex ? BeginTiming(dev) : nullptr;
-	if (colourTex)
+	GpuTiming* timing = geo ? BeginTiming(dev) : nullptr;
+	if (geo)
 	{
-		// Prep: normals + depth, and the lit colour at half res.
-		core::SetTarget(dev, g_prep[cur].surf, g_hw, g_hh);
-		D.SetRenderTarget(dev, 1, g_rad.surf);
-		D.SetTexture(dev, 0, depthTex);
+		// The lit colour at half res: the scene colour now, after the ambient occlusion and contact
+		// shadows (composited just before this), so the bounce light comes from the occluded light.
+		core::SetTarget(dev, g_rad.surf, g_hw, g_hh);
 		D.SetTexture(dev, 1, colourTex);
 		core::SetSamplerClamp(dev, 1, D3DTEXF_LINEAR);
-		D.SetPixelShader(dev, g_psPrep);
+		D.SetPixelShader(dev, g_psRadiance);
 		core::DrawFullscreen(dev);
-		D.SetRenderTarget(dev, 1, nullptr);
 		core::SetSamplerClamp(dev, 1, D3DTEXF_POINT);
 
 		// Trace.
 		core::SetTarget(dev, g_raw.surf, g_hw, g_hh);
-		D.SetTexture(dev, 0, g_prep[cur].tex);
+		D.SetTexture(dev, 0, geo);
 		D.SetTexture(dev, 1, g_rad.tex);
 		D.SetPixelShader(dev, g_psTrace);
 		core::DrawFullscreen(dev);
@@ -630,7 +630,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 		core::SetTarget(dev, g_hist[cur].surf, g_hw, g_hh);
 		D.SetTexture(dev, 1, g_raw.tex);
 		D.SetTexture(dev, 2, g_hist[prev].tex);
-		D.SetTexture(dev, 3, g_prep[prev].tex);
+		D.SetTexture(dev, 3, reproject ? prevGeo : nullptr);
 		D.SetPixelShader(dev, g_psTemporal);
 		core::DrawFullscreen(dev);
 		D.SetTexture(dev, 2, nullptr);
@@ -653,7 +653,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 		{
 			core::SetTarget(dev, g_colourSurf, g_w, g_h);
 			D.SetTexture(dev, 1, g_view == 2 ? g_raw.tex : g_out[next].tex);
-			D.SetTexture(dev, 2, g_prep[cur].tex);
+			D.SetTexture(dev, 2, geo);
 			core::SetSamplerClamp(dev, 1, D3DTEXF_LINEAR);
 			D.SetPixelShader(dev, g_psDebug);
 			core::DrawFullscreen(dev);

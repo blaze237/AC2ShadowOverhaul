@@ -363,11 +363,13 @@ static int TestOrder()
 		return ok;
 	};
 	// The game's draws are all there, and nothing but them and the effects' passes.
-	size_t game = t.end - t.begin - at[FX_AO].size() - at[FX_SSGI].size() - at[FX_VOL].size() - at[FX_TAA].size();
+	size_t game = t.end - t.begin - at[FX_SHARED].size() - at[FX_AO].size() - at[FX_SSGI].size() - at[FX_VOL].size() - at[FX_TAA].size();
 	Check(game == 9, "the game's 9 draws are all there (%zu)", game);
-	Check(at[FX_AO].size() == 4 && at[FX_SSGI].size() == 5 && at[FX_VOL].size() == 7 && at[FX_TAA].size() == 2,
-		"passes: AO 4, SSGI 5, volumetrics 7, TAA 2 (got %zu, %zu, %zu, %zu)", at[FX_AO].size(), at[FX_SSGI].size(), at[FX_VOL].size(),
-		at[FX_TAA].size());
+	Check(at[FX_SHARED].size() == 1 && at[FX_AO].size() == 4 && at[FX_SSGI].size() == 5 && at[FX_VOL].size() == 7 && at[FX_TAA].size() == 2,
+		"passes: shared geometry prep 1, AO 4, SSGI 5, volumetrics 7, TAA 2 (got %zu, %zu, %zu, %zu, %zu)", at[FX_SHARED].size(),
+		at[FX_AO].size(), at[FX_SSGI].size(), at[FX_VOL].size(), at[FX_TAA].size());
+	Check(between(at[FX_SHARED], t.lastOpaque, t.sky) && !at[FX_AO].empty() && at[FX_SHARED].front() < at[FX_AO].front(),
+		"the geometry prep AO and SSGI share: once, after the opaque pass, before both");
 	Check(between(at[FX_AO], t.lastOpaque, t.sky), "ambient occlusion: after the opaque pass, before the sky");
 	Check(between(at[FX_SSGI], t.lastOpaque, t.sky) && !at[FX_AO].empty() && at[FX_SSGI].front() > at[FX_AO].back(),
 		"SSGI: after the ambient occlusion (it traces the AO'd image), before the sky");
@@ -383,7 +385,7 @@ static int TestOrder()
 				firstRead = i;
 	Check(firstRead == t.post, "the first game draw that reads the scene colour is the post draw (%zu)", firstRead - t.begin);
 	bool allBefore = true;
-	for (int e = FX_AO; e < FX_COUNT; e++)
+	for (int e = FX_SHARED; e < FX_COUNT; e++)
 		for (size_t i : at[e])
 			allBefore &= i < firstRead;
 	Check(allBefore, "every effect pass comes before the first read of the scene colour");

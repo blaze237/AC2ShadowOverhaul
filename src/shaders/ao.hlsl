@@ -1,6 +1,7 @@
 // AC2ShadowOverhaul ambient occlusion and contact shadows: GTAO ("Practical Real-Time Strategies
 // for Accurate Indirect Occlusion", Jimenez et al. 2016; integration as in Intel's XeGTAO) and a
-// short ray march towards the sun, both at half resolution from the game's z/w target, a
+// short ray march towards the sun, both at half resolution from the game's z/w target (normals from
+// the geometry prep shared with SSGI, src/core/shaders/geoprep.hlsl), a
 // depth-aware blur, and a composite that removes the occluded share of the indirect light and the
 // contact-shadowed share of the sun light from the scene colour.
 //
@@ -19,7 +20,8 @@ float4 c_Sun    : register(c6); // direction towards the sun (view space), conta
 float4 c_Contact: register(c7); // thickness (m) = x + y * distance, strength, depth bias per metre of distance
 
 sampler2D s_Depth    : register(s0); // game z/w, R32F, full res (point)
-sampler2D s_AO       : register(s1); // r = AO, g = view z, b = contact shadow (point)
+sampler2D s_Geo      : register(s1); // GTAO: the shared geometry prep (core/geoprep.h): view normal, view z (point)
+sampler2D s_AO       : register(s1); // Blur / Composite: r = AO, g = view z, b = contact shadow (point)
 sampler2D s_Indirect : register(s2); // indirect light x (1 - fog), full res (point)
 sampler2D s_Sun      : register(s3); // shadowed sun light x (1 - fog), full res (point)
 
@@ -123,16 +125,11 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 	float3 P = ViewPos(px, z);
 	float3 V = normalize(-P);
 
-	// Normal from the neighbouring pixels: on each axis the side with the smaller depth step, so
-	// silhouettes don't bend it.
-	float3 pl = ViewPos(px - float2(1, 0), FetchZ(px - float2(1, 0)));
-	float3 pr = ViewPos(px + float2(1, 0), FetchZ(px + float2(1, 0)));
-	float3 pu = ViewPos(px - float2(0, 1), FetchZ(px - float2(0, 1)));
-	float3 pd = ViewPos(px + float2(0, 1), FetchZ(px + float2(0, 1)));
-	float3 dx = abs(pr.z - P.z) < abs(P.z - pl.z) ? pr - P : P - pl;
-	float3 dy = abs(pd.z - P.z) < abs(P.z - pu.z) ? pd - P : P - pu;
-	float3 N = normalize(cross(dx, dy));
-	N = dot(N, V) < 0 ? -N : N;
+	// The normal from the shared geometry prep (the same full-res pixel 2 x vpos, the same
+	// reconstruction this pass used to do itself). The position stays from the full-precision z/w
+	// target: the prep's half-float z is off by up to 1/2048 of the distance, which next to the
+	// full-precision depths of the samples would tilt the horizons on distant surfaces.
+	float3 N = tex2Dlod(s_Geo, float4((vpos + 0.5) * c_Half.zw, 0, 0)).xyz;
 
 	// Per-pixel rotation and step offset (interleaved gradient noise; the blur removes the pattern).
 	float noiseA = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715))));
