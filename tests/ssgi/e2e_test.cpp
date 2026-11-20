@@ -22,7 +22,9 @@
 #include <vector>
 #include "e2e_common.h"
 #include "ssgi/gi.h"
+#include "core/camera.h"
 using namespace ssgi;
+using namespace core;
 
 static int g_fail = 0;
 #define CHECK(cond, ...)                                                                                                              \

@@ -144,20 +144,20 @@ bool StillHolds(const DWORD* code, const std::vector<Inst>& insts, DWORD src, si
 
 // Finds the combine and the albedo. Mirrors AC2ShadowOverhaul's FindIndirect, so both mods agree on
 // which shaders and which term.
-bool FindCombine(const DWORD* code, const std::vector<Inst>& insts, const std::vector<CtabVar>& vars, Found& f, std::string& why)
+bool FindCombine(const DWORD* code, const std::vector<Inst>& insts, const core::ConstantTable& vars, Found& f, std::string& why)
 {
 	Taint t;
-	if (const CtabVar* v = FindVar(vars, "g_AmbientCube", 2))
+	if (const core::ShaderConstant* v = vars.Find("g_AmbientCube", core::RS_FLOAT4))
 	{
-		t.ambLo = v->index;
-		t.ambHi = v->index + v->count;
+		t.ambLo = v->reg;
+		t.ambHi = v->reg + v->count;
 	}
-	if (const CtabVar* v = FindVar(vars, "g_WorldLightMapSampler", 3))
-		t.lmSampler = v->index;
-	if (const CtabVar* v = FindVar(vars, "g_ShadowSampler", 3))
-		t.shadowSampler = v->index;
-	if (const CtabVar* v = FindVar(vars, "g_CloudShadowSampler", 3))
-		t.cloudSampler = v->index;
+	if (const core::ShaderConstant* v = vars.Find("g_WorldLightMapSampler", core::RS_SAMPLER))
+		t.lmSampler = v->reg;
+	if (const core::ShaderConstant* v = vars.Find("g_ShadowSampler", core::RS_SAMPLER))
+		t.shadowSampler = v->reg;
+	if (const core::ShaderConstant* v = vars.Find("g_CloudShadowSampler", core::RS_SAMPLER))
+		t.cloudSampler = v->reg;
 	if (t.ambLo < 0 && t.lmSampler < 0)
 	{
 		why = "no ambient light inputs";
@@ -532,8 +532,8 @@ bool GI_RewritePS(const DWORD* code, std::vector<DWORD>& result, std::string& re
 		reason = "not an opaque pass shader";
 		return false;
 	}
-	std::vector<CtabVar> vars;
-	ReadCtabVars(code, insts, vars);
+	core::ConstantTable vars;
+	core::ReadConstantTable(code, vars);
 	int maxTemp;
 	bool constUsed[256];
 	if (!RegisterUsage(code, insts, vars, maxTemp, constUsed))

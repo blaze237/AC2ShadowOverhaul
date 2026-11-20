@@ -17,6 +17,8 @@
 #include "ao.h"
 #include "features.h"
 #include "shaders_gen.h"
+#include "core/shaderinfo.h"
+#include "core/scene.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -1243,75 +1245,6 @@ static std::string CompareDepth(const std::vector<float>& dv, const DepthUse& us
 	return result;
 }
 
-// ---- Shader constant tables --------------------------------------------------------------------
-
-struct CtabEntry
-{
-	std::string name;
-	int set = 0, reg = 0, count = 0, cls = 0, rows = 0, cols = 0;
-};
-
-// Reads the constant table (names of uniforms and their registers) the HLSL compiler embeds.
-static std::vector<CtabEntry> ReadCtab(const DWORD* code, size_t count)
-{
-	std::vector<CtabEntry> out;
-	for (size_t i = 1; i < count;)
-	{
-		DWORD tok = code[i];
-		if (tok == 0x0000FFFF)
-			break;
-		if ((tok & 0xFFFF) != 0xFFFE)
-		{
-			i += 1 + ((tok >> 24) & 0xF);
-			continue;
-		}
-		size_t len = (tok >> 16) & 0x7FFF;
-		if (len < 8 || i + 1 + len > count || code[i + 1] != MAKEFOURCC('C', 'T', 'A', 'B'))
-		{
-			i += 1 + len;
-			continue;
-		}
-		const unsigned char* base = (const unsigned char*)&code[i + 2];
-		size_t size = (len - 1) * 4;
-		auto rd32 = [&](size_t off) -> DWORD {
-			DWORD v = 0;
-			if (off + 4 <= size)
-				memcpy(&v, base + off, 4);
-			return v;
-		};
-		auto rd16 = [&](size_t off) -> int {
-			WORD v = 0;
-			if (off + 2 <= size)
-				memcpy(&v, base + off, 2);
-			return v;
-		};
-		DWORD constants = rd32(12), info = rd32(16);
-		for (DWORD c = 0; c < constants && c < 4096; c++)
-		{
-			size_t e = info + (size_t)c * 20;
-			if (e + 20 > size)
-				break;
-			CtabEntry ce;
-			DWORD nameOff = rd32(e), type = rd32(e + 12);
-			ce.set = rd16(e + 4);
-			ce.reg = rd16(e + 6);
-			ce.count = rd16(e + 8);
-			for (size_t p = nameOff; p < size && base[p]; p++)
-				ce.name += (char)base[p];
-			if (type + 8 <= size)
-			{
-				ce.cls = rd16(type);
-				ce.rows = rd16(type + 4);
-				ce.cols = rd16(type + 6);
-			}
-			out.push_back(ce);
-		}
-		break;
-	}
-	return out;
-}
-
-
 // Writes every vertex / pixel shader drawn this capture: bytecode (<base>_allshaders\vs_ / ps_<hash>.cso)
 // and, in <base>_vs.txt / <base>_ps.txt, the value of each named constant at the shader's first draw
 // followed by its disassembly.
@@ -1351,7 +1284,9 @@ static void ExportShaderSnaps(const char* base)
 			text += line;
 			text += "Constants at the first draw:\n";
 			int regs = vertex ? kVsConsts : kPsConsts;
-			for (const CtabEntry& ce : ReadCtab(code.data(), code.size()))
+			core::ConstantTable table;
+			core::ReadConstantTable(code.data(), table, code.size());
+			for (const core::ShaderConstant& ce : table.constants)
 			{
 				snprintf(line, sizeof(line), "  %s %s  %s%d..%d  %s%s\n", ce.set < 4 ? kSet[ce.set] : "?", ce.name.c_str(),
 					ce.set == 3 ? "s" : ce.set == 2 ? "c" : ce.set == 1 ? "i" : "b", ce.reg, ce.reg + ce.count - 1,
@@ -1528,6 +1463,7 @@ static void AfterDeviceReady(IDirect3DDevice9* dev)
 	IDirect3DSurface9 *bb, *ds;
 	RegisterSwapChain(dev, &bb, &ds);
 	ResetTrackedState(bb, ds);
+	core::Scene_OnDeviceReady(bb);
 }
 
 // Ambient occlusion runs inside the hooks below (right after the opaque pass); dumps note where.
@@ -1542,7 +1478,8 @@ static void NoteAO(bool applied)
 
 static void BeforeDraw(IDirect3DDevice9* dev)
 {
-	NoteAO(AO_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps));
+	core::Scene_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs);
+	NoteAO(AO_BeforeDraw(dev, (IDirect3DPixelShader9*)g_ps));
 	Fx_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps);
 	if (AO_InPass() && g_ps)
 	{
@@ -1566,6 +1503,7 @@ static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* p
 {
 	LogInfo("Device Reset: %s", DescribePresent(pp).c_str());
 	Tuning_OnLostDevice();
+	core::Scene_OnLostDevice();
 	AO_OnLostDevice();
 	Fx_OnLostDevice();
 	HRESULT hr = o_Reset(dev, pp);
@@ -1590,6 +1528,7 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 	}
 	NoteAO(AO_BeforePresent(dev));
 	Fx_BeforePresent(dev);
+	core::Scene_EndFrame(); // after every effect used this frame's camera
 	if (g_capturing)
 	{
 		bool done;
@@ -1737,6 +1676,8 @@ static HRESULT __stdcall h_SetRenderTarget(IDirect3DDevice9* dev, DWORD index, I
 	NoteAO(AO_BeforeSetRenderTarget(dev, index, s));
 	Fx_BeforeSetRenderTarget(dev, index, s);
 	HRESULT hr = o_SetRenderTarget(dev, index, s);
+	if (SUCCEEDED(hr))
+		core::Scene_AfterSetRenderTarget(index, s);
 	if (SUCCEEDED(hr) && index < 4)
 	{
 		bool changed = g_rt[index] != s;
@@ -1836,7 +1777,7 @@ static HRESULT __stdcall h_SetViewport(IDirect3DDevice9* dev, const D3DVIEWPORT9
 			Event(buf, CALLER);
 		}
 		g_vp = *vp;
-		Fx_AfterSetViewport(vp);
+		core::Scene_AfterSetViewport(vp);
 	}
 	return hr;
 }
@@ -2083,9 +2024,8 @@ static HRESULT __stdcall h_CreateVertexShader(IDirect3DDevice9* dev, const DWORD
 	FX_PASSTHROUGH(CreateVertexShader, code, out);
 	// TAA: shaders that transform geometry get the sub-pixel jitter added to their position.
 	std::vector<DWORD> jittered;
-	void* state = nullptr;
 	HRESULT hr = E_FAIL;
-	if (Fx_RewriteVS(code, jittered, state))
+	if (Fx_RewriteVS(code, jittered))
 	{
 		hr = o_CreateVertexShader(dev, jittered.data(), out);
 		static bool warned = false;
@@ -2097,7 +2037,7 @@ static HRESULT __stdcall h_CreateVertexShader(IDirect3DDevice9* dev, const DWORD
 	}
 	if (FAILED(hr))
 		hr = o_CreateVertexShader(dev, code, out);
-	Fx_OnCreateVertexShader(SUCCEEDED(hr) && out ? *out : nullptr, code, state);
+	Fx_OnCreateVertexShader(SUCCEEDED(hr) && out ? *out : nullptr, code);
 	if (SUCCEEDED(hr) && code && out && *out)
 	{
 		uint32_t h = HashShader(code);
@@ -2105,7 +2045,7 @@ static HRESULT __stdcall h_CreateVertexShader(IDirect3DDevice9* dev, const DWORD
 			Lock l;
 			g_vsHash[*out] = h;
 		}
-		AO_OnCreateVertexShader(*out, code);
+		core::Scene_OnCreateVertexShader(*out, code);
 	}
 	return hr;
 }

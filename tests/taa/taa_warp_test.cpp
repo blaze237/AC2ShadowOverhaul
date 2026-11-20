@@ -1,7 +1,7 @@
 // Runs the real TAA shaders (src/shaders/taa.hlsl) with D3D11's software renderer (WARP) on a
 // synthetic scene, frame after frame, the way the plugin drives them in the game: each frame is
 // rendered with the plugin's jitter sequence (a CPU ray caster stands in for the game), the camera
-// matrices go through the plugin's own C++ (Taa_CameraFromMatrices / Taa_ReprojectionMatrix, fed
+// matrices go through the plugin's own C++ (CameraFromMatrices / ReprojectionMatrix, fed
 // game-style g_WorldViewProj and g_World), and the result is compared with a 64-sample
 // supersampled reference image.
 //
@@ -17,8 +17,8 @@
 //
 // The HLSL is compiled for shader model 4 in backwards-compatibility mode with TAA_D3D11 defined
 // (pixel centres differ from D3D9's VPOS).
-#include "taa/taa.h"
-using namespace taa;
+#include "core/camera.h"
+using namespace core;
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -223,7 +223,7 @@ static void RenderReference(const Cam& c, std::vector<float>& rgb)
 }
 
 // Game-style constants: VP rows (clip = VP * world position), a world matrix, WVP = VP * World.
-static TaaCamera CameraThroughPlugin(const Cam& c, int seed)
+static Camera CameraThroughPlugin(const Cam& c, int seed)
 {
 	double V[4][4] = {}, P[4][4] = {}, VP[4][4], Wm[4][4] = {}, WVP[4][4];
 	for (int k = 0; k < 3; k++)
@@ -265,9 +265,9 @@ static TaaCamera CameraThroughPlugin(const Cam& c, int seed)
 		wvp[i] = (float)WVP[i / 4][i % 4];
 		world[i] = (float)Wm[i / 4][i % 4];
 	}
-	TaaCamera cam;
+	Camera cam;
 	char why[160] = "";
-	if (!Taa_CameraFromMatrices(wvp, world, cam, why, sizeof(why)))
+	if (!CameraFromMatrices(wvp, world, cam, why, sizeof(why)))
 		printf("camera rejected: %s\n", why);
 	return cam;
 }
@@ -546,7 +546,7 @@ struct Run
 	Target scene, depth, hist[2], out;
 	int cur = 0;
 	bool historyValid = false;
-	TaaCamera prev;
+	Camera prev;
 	Settings s;
 	std::vector<float> rgba, zw;
 
@@ -593,13 +593,13 @@ struct Run
 		g_ctx->UpdateSubresource(scene.tex, 0, nullptr, half.data(), W * 8, 0);
 		g_ctx->UpdateSubresource(depth.tex, 0, nullptr, zw.data(), W * 4, 0);
 
-		TaaCamera cam = CameraThroughPlugin(c, seed);
+		Camera cam = CameraThroughPlugin(c, seed);
 		float reproj[4][4] = {};
 		bool valid = historyValid && prev.ok && cam.ok;
 		if (valid && s.reproject)
-			Taa_ReprojectionMatrix(cam, prev, reproj);
+			ReprojectionMatrix(cam, prev, reproj);
 		else if (valid)
-			Taa_ReprojectionMatrix(cam, cam, reproj); // as if nothing moved
+			ReprojectionMatrix(cam, cam, reproj); // as if nothing moved
 		const float cSize[4] = { (float)W, (float)H, 1.0f / W, 1.0f / H };
 		const float cJitter[4] = { ox, oy, valid ? 1.0f : 0.0f, (float)s.debug };
 		const float cProj[4] = { (float)cam.A, (float)cam.B, (float)cam.P00, (float)cam.P11 };

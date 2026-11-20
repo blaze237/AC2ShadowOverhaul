@@ -33,38 +33,18 @@ struct CtabInfo
 	bool usedFloat[256] = {};
 };
 
-static bool ReadCtab(const DWORD* code, const std::vector<Inst>& insts, CtabInfo& info)
+static bool ReadCtab(const DWORD* code, CtabInfo& info)
 {
-	for (const Inst& in : insts)
-	{
-		if (in.op != OP_COMMENT || in.len < 8 || code[in.pos + 1] != 0x42415443) // 'CTAB'
-			continue;
-		const uint8_t* base = (const uint8_t*)&code[in.pos + 2];
-		size_t size = (in.len - 1) * 4;
-		auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-		auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-		DWORD count = rd32(12), infoOff = rd32(16);
-		for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-		{
-			size_t e = infoOff + 20 * k;
-			DWORD nameOff = rd32(e);
-			WORD set = rd16(e + 4), index = rd16(e + 6), regCount = rd16(e + 8);
-			char name[64] = {};
-			for (size_t c = 0; c < sizeof(name) - 1 && nameOff + c < size && base[nameOff + c]; c++)
-				name[c] = (char)base[nameOff + c];
-			if (set == 3 && strcmp(name, "g_ShadowSampler") == 0)
-				info.shadowSampler = index;
-			if (set == 2)
-			{
-				if (strcmp(name, "g_ShadowMapSize") == 0)
-					info.shadowMapSize = index;
-				for (int r = index; r < index + regCount && r < 256; r++)
-					info.usedFloat[r] = true;
-			}
-		}
-		return true;
-	}
-	return false;
+	core::ConstantTable t;
+	if (!core::ReadConstantTable(code, t))
+		return false;
+	info.shadowSampler = t.Register("g_ShadowSampler", core::RS_SAMPLER);
+	info.shadowMapSize = t.Register("g_ShadowMapSize", core::RS_FLOAT4);
+	for (const core::ShaderConstant& c : t.constants)
+		if (c.set == core::RS_FLOAT4)
+			for (int r = c.reg; r < c.reg + c.count && r < 256; r++)
+				info.usedFloat[r] = true;
+	return true;
 }
 
 // ---- Rewrite -----------------------------------------------------------------------------------
@@ -79,7 +59,7 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& resul
 		return false;
 	}
 	CtabInfo ctab;
-	if (!ReadCtab(code, insts, ctab) || ctab.shadowSampler < 0)
+	if (!ReadCtab(code, ctab) || ctab.shadowSampler < 0)
 	{
 		reason = "no shadow sampler";
 		return false;

@@ -11,6 +11,7 @@
 #include "gi.h"
 #include "common.h"
 #include "shaders_gen.h"
+#include "core/scene.h"
 #include <math.h>
 #include <stdio.h>
 #include <unordered_map>
@@ -103,121 +104,14 @@ void GI_SetSetting(int s, float v)
 	}
 }
 
-// ---- Vertex shaders: where the camera matrices are --------------------------------------------
-
-struct VsInfo
-{
-	int wvp = -1, world = -1;
-};
-static CRITICAL_SECTION g_vsLock;
-static std::unordered_map<void*, VsInfo> g_vsInfo;
-static volatile LONG g_vsLockState = 0; // 0 none, 1 initialising, 2 ready
-
-static bool LockReady()
-{
-	if (g_vsLockState == 2)
-		return true;
-	if (InterlockedCompareExchange(&g_vsLockState, 1, 0) == 0)
-	{
-		InitializeCriticalSection(&g_vsLock);
-		g_vsLockState = 2;
-	}
-	while (g_vsLockState != 2)
-		Sleep(0);
-	return true;
-}
-
-// Minimal vs_3_0 constant table reader.
-static bool FindVsMatrices(const DWORD* code, VsInfo& info)
-{
-	if (!code || (code[0] & 0xFFFF0000) != 0xFFFE0000)
-		return false;
-	for (size_t i = 1; i < 4096 && code[i] != 0x0000FFFF;)
-	{
-		DWORD tok = code[i];
-		if ((tok & 0xFFFF) != 0xFFFE) // CTAB comes first, before any instruction
-			return false;
-		size_t len = (tok >> 16) & 0x7FFF;
-		if (len >= 8 && code[i + 1] == 0x42415443)
-		{
-			const uint8_t* base = (const uint8_t*)&code[i + 2];
-			size_t size = (len - 1) * 4;
-			auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-			auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-			DWORD count = rd32(12), infoOff = rd32(16);
-			for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-			{
-				size_t e = infoOff + 20 * k;
-				DWORD nameOff = rd32(e);
-				WORD set = rd16(e + 4), index = rd16(e + 6), regs = rd16(e + 8);
-				char name[32] = {};
-				for (size_t c = 0; c < sizeof(name) - 1 && nameOff + c < size && base[nameOff + c]; c++)
-					name[c] = (char)base[nameOff + c];
-				if (set == 2 && regs == 4 && strcmp(name, "g_WorldViewProj") == 0)
-					info.wvp = index;
-				if (set == 2 && regs == 4 && strcmp(name, "g_World") == 0)
-					info.world = index;
-			}
-			return info.wvp >= 0 && info.world >= 0;
-		}
-		i += 1 + len;
-	}
-	return false;
-}
-
-void GI_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code)
-{
-	if (!g_enabled || !vs || !LockReady())
-		return;
-	VsInfo info;
-	bool found = FindVsMatrices(code, info);
-	EnterCriticalSection(&g_vsLock);
-	if (found)
-		g_vsInfo[vs] = info;
-	else
-		g_vsInfo.erase(vs); // the address may have belonged to a released shader
-	LeaveCriticalSection(&g_vsLock);
-}
-
 // ---- Camera ------------------------------------------------------------------------------------
 
-static Camera g_cam;          // this frame's (first opaque draw)
-static bool g_camWarned = false;
-
-static void CaptureCamera(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
-{
-	if (!vs || g_vsLockState != 2)
-		return;
-	VsInfo info;
-	EnterCriticalSection(&g_vsLock);
-	auto it = g_vsInfo.find(vs);
-	if (it != g_vsInfo.end())
-		info = it->second;
-	LeaveCriticalSection(&g_vsLock);
-	if (info.wvp < 0)
-		return;
-	float wvp[16], world[16];
-	if (FAILED(dev->GetVertexShaderConstantF(info.wvp, wvp, 4)) || FAILED(dev->GetVertexShaderConstantF(info.world, world, 4)))
-		return;
-	char why[160];
-	Camera cam;
-	if (CameraFromMatrices(wvp, world, cam, why, sizeof(why)))
-	{
-		static bool logged = false;
-		if (!logged)
-		{
-			logged = true;
-			LogInfo("SSGI: camera found (near %.3f m, far %.0f m, horizontal fov %.1f deg).", -cam.B / cam.A, cam.B / (1.0f - cam.A),
-				2.0 * atan(1.0 / cam.P00) * 57.29578);
-		}
-		g_cam = cam;
-	}
-	else if (!g_camWarned)
-	{
-		g_camWarned = true;
-		LogWarn("SSGI: could not read the camera from the shader constants (%s).", why);
-	}
-}
+// This frame's camera is core::Scene().camera (the first opaque draw with the camera matrices);
+// g_camOk says it was there by the time our pass drew. g_prevCam: the camera of the frame that wrote
+// g_out[g_outBound] / the history.
+static bool g_camOk = false;
+static core::Camera g_prevCam;
+static const core::Camera& Cam() { return core::Scene().camera; }
 
 // ---- Device resources --------------------------------------------------------------------------
 
@@ -261,8 +155,6 @@ static int g_cur = 0;             // prep / history written this frame; 1 - g_cu
 static int g_outBound = 0;        // GI texture the game's shaders read this frame
 static bool g_outValid = false;   // g_out[g_outBound] holds a result
 static bool g_histValid = false;  // g_hist[1 - g_cur], g_prep[1 - g_cur] hold last frame's
-static Mat4 g_prevVP;             // camera of the frame that wrote g_out[g_outBound] / the history
-static double g_prevEye[3], g_prevFwd[3];
 static bool g_wroteThisFrame = false;
 static unsigned g_frame = 0;
 
@@ -463,16 +355,10 @@ void GI_OnSetTexture(DWORD stage, IDirect3DBaseTexture9* tex)
 
 static bool IsOpaquePass(IDirect3DSurface9* s, IDirect3DSurface9* rt0, UINT& w, UINT& h)
 {
-	if (!s || !rt0)
+	const core::ZwBinding b = core::InspectRt1(s, rt0);
+	if (!b.zw)
 		return false;
-	D3DSURFACE_DESC d = {}, c = {};
-	if (FAILED(s->GetDesc(&d)) || FAILED(rt0->GetDesc(&c)))
-		return false;
-	if (d.Format != D3DFMT_R32F || !(d.Usage & D3DUSAGE_RENDERTARGET) || d.MultiSampleType != D3DMULTISAMPLE_NONE)
-		return false;
-	if (c.Width != d.Width || c.Height != d.Height)
-		return false;
-	if (c.MultiSampleType != D3DMULTISAMPLE_NONE)
+	if (b.colourMsaa)
 	{
 		static bool warned = false;
 		if (!warned)
@@ -482,12 +368,10 @@ static bool IsOpaquePass(IDirect3DSurface9* s, IDirect3DSurface9* rt0, UINT& w, 
 		}
 		return false;
 	}
-	IDirect3DTexture9* tex = nullptr;
-	if (FAILED(s->GetContainer(kIID_Texture9, (void**)&tex)) || !tex)
+	if (!b.zwTexture)
 		return false;
-	tex->Release();
-	w = d.Width;
-	h = d.Height;
+	w = b.width;
+	h = b.height;
 	return true;
 }
 
@@ -583,31 +467,24 @@ void GI_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 static void SetFrameConstants(IDirect3DDevice9* dev)
 {
 	float rows[3][4];
-	bool reproject = g_outValid && g_cam.ok && ReprojectionRows(g_prevVP, g_cam.viewProj, g_w, g_h, rows);
+	bool reproject = g_outValid && g_camOk && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
 	if (!reproject)
-		IdentityRows(g_w, g_h, rows);
+		core::IdentityRows(g_w, g_h, rows);
 	dev->SetPixelShaderConstantF(GI_CONST, &rows[0][0], 3);
 }
 
 static void CheckCut()
 {
-	if (!g_cam.ok || !g_outValid)
+	if (!g_camOk || !g_outValid)
 		return;
-	double d2 = 0, dot = 0;
-	for (int k = 0; k < 3; k++)
-	{
-		double e = g_cam.eye[k] - g_prevEye[k];
-		d2 += e * e;
-		dot += g_cam.forward[k] * g_prevFwd[k];
-	}
-	if (d2 > 4.0 * 4.0 || dot < 0.85) // 4 m or about 32 degrees in one frame
+	if (core::IsCameraCut(Cam(), g_prevCam))
 	{
 		g_cut = true;
 		g_histValid = false;
 	}
 }
 
-bool GI_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
+bool GI_BeforeDraw(IDirect3DDevice9* dev)
 {
 	if (g_pending)
 	{
@@ -617,15 +494,12 @@ bool GI_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
 	if (g_inPass)
 	{
 		g_passDraws++;
-		if (!g_cam.ok)
+		if (!g_camOk && Cam().ok)
 		{
-			// The first opaque draw with the camera matrices sets this frame's camera.
-			CaptureCamera(dev, vs);
-			if (g_cam.ok)
-			{
-				CheckCut();
-				g_constsDirty = true;
-			}
+			// The first opaque draw with the camera matrices set this frame's camera.
+			g_camOk = true;
+			CheckCut();
+			g_constsDirty = true;
 		}
 	}
 	if (!g_constsDirty || !g_colourSurf || !g_black.tex)
@@ -643,10 +517,10 @@ bool GI_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
 	}
 	if (!scene)
 		return false;
-	if (g_cam.ok)
+	if (g_camOk)
 		SetFrameConstants(dev);
-	BindGi(dev, g_cam.ok);
-	g_constsDirty = !g_cam.ok && g_inPass; // try the camera again on the next draw
+	BindGi(dev, g_camOk);
+	g_constsDirty = !g_camOk && g_inPass; // try the camera again on the next draw
 	return false;
 }
 
@@ -670,17 +544,12 @@ bool GI_BeforePresent(IDirect3DDevice9* dev)
 		g_outValid = true;
 		g_histValid = true;
 		g_cur = 1 - g_cur;
-		g_prevVP = g_cam.viewProj;
-		for (int k = 0; k < 3; k++)
-		{
-			g_prevEye[k] = g_cam.eye[k];
-			g_prevFwd[k] = g_cam.forward[k];
-		}
+		g_prevCam = Cam();
 	}
 	if (!GI_Active())
 		g_outValid = g_histValid = false;
 	g_done = g_pending = g_wroteThisFrame = g_cut = false;
-	g_cam.ok = false;
+	g_camOk = false;
 	g_passDraws = 0;
 	return ran;
 }
@@ -740,7 +609,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 	g_done = true;
 	if (!GI_Active())
 		return;
-	if (!g_cam.ok)
+	if (!g_camOk)
 	{
 		static bool warned = false;
 		if (!warned)
@@ -811,15 +680,16 @@ static void RunPasses(IDirect3DDevice9* dev)
 
 	const int cur = g_cur, prev = 1 - g_cur;
 	float rows[3][4];
-	bool reproject = g_histValid && !g_cut && ReprojectionRows(g_prevVP, g_cam.viewProj, g_w, g_h, rows);
+	const core::CameraFloats& cam = Cam().f;
+	bool reproject = g_histValid && !g_cut && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
 	if (!reproject)
-		IdentityRows(g_w, g_h, rows);
+		core::IdentityRows(g_w, g_h, rows);
 	const float c[11][4] = {
 		{ (float)g_w, (float)g_h, 1.0f / g_w, 1.0f / g_h },
 		{ (float)g_hw, (float)g_hh, 1.0f / g_hw, 1.0f / g_hh },
-		{ g_cam.A, g_cam.B, g_cam.P00, g_cam.P11 },
-		{ g_cam.P02, g_cam.P12, (float)(g_frame % 64), g_radianceClamp },
-		{ g_radius, 0.5f * g_cam.P00 * g_w, g_maxScreenRadius * g_h, g_thickness },
+		{ cam.A, cam.B, cam.P00, cam.P11 },
+		{ cam.P02, cam.P12, (float)(g_frame % 64), g_radianceClamp },
+		{ g_radius, 0.5f * cam.P00 * g_w, g_maxScreenRadius * g_h, g_thickness },
 		{ (float)g_slices, (float)g_steps, g_intensity, (float)g_view },
 		{ rows[0][0], rows[0][1], rows[0][2], rows[0][3] },
 		{ rows[1][0], rows[1][1], rows[1][2], rows[1][3] },

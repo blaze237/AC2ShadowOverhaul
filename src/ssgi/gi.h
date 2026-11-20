@@ -89,35 +89,8 @@ struct GiRewriteLayout
 };
 extern GiRewriteLayout g_giLastLayout;
 
-// ---- Reprojection maths (gimath.cpp) -----------------------------------------------------------
-
-// World -> clip matrix as the game's shaders use it: clip[r] = sum_c m[r][c] * pos[c].
-struct Mat4
-{
-	double m[4][4];
-};
-bool Invert(const Mat4& a, Mat4& out);
-Mat4 Mul(const Mat4& a, const Mat4& b);
-
-// Rows mapping (z/w, x, y, 1) of a full-res pixel (x, y integer, D3D9 pixel centres) in the current
-// frame to (u*w, v*w, w) of the same world point in a half-res texture rendered in the previous
-// frame (texel i holds full-res pixel 2i), w = its view depth then divided by its view depth now.
-// Returns false if the current matrix can't be inverted.
-bool ReprojectionRows(const Mat4& prevViewProj, const Mat4& curViewProj, unsigned w, unsigned h, float rows[3][4]);
-// The same for "no previous frame": maps each pixel onto itself (w = 1).
-void IdentityRows(unsigned w, unsigned h, float rows[3][4]);
-
-// Camera from one draw's vertex shader constants g_WorldViewProj and g_World (registers hold
-// matrix rows). ViewProj = WVP * World^-1. Fails (with a reason) for anything but a standard
-// D3D perspective projection.
-struct Camera
-{
-	bool ok = false;
-	Mat4 viewProj;
-	float A, B, P00, P11, P02, P12; // z/w = A + B / z; x_ndc = P00 x/z + P02 ...
-	double eye[3], forward[3];
-};
-bool CameraFromMatrices(const float wvp[16], const float world[16], Camera& cam, char* why, size_t whySize);
+// The camera and the reprojection rows for c216-c218 come from core/camera.h (ReprojectionRows,
+// IdentityRows), the camera of each frame from core/scene.h.
 
 // ---- Device side (called from the hooks in hooks.cpp) -------------------------------------------
 
@@ -136,12 +109,11 @@ struct GiDeviceFns
 };
 void GI_SetDeviceFns(const GiDeviceFns& fns);
 
-void GI_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code); // remembers where the matrices are
 void GI_OnSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);              // the game's own binding of our stage
 // Render target changes: Before may run the GI passes (returns true if it did); After starts/ends the pass.
 bool GI_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
 void GI_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0);
-bool GI_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs); // true if the GI passes ran first
+bool GI_BeforeDraw(IDirect3DDevice9* dev); // true if the GI passes ran first
 bool GI_InPass();
 bool GI_BeforeOther(IDirect3DDevice9* dev);   // Clear, StretchRect, ColorFill, EndScene...
 bool GI_BeforePresent(IDirect3DDevice9* dev); // also ends the frame

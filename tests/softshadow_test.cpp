@@ -6,6 +6,7 @@
 //     against a random point-sampled shadow atlas: at width 1 our filter must reproduce the game's
 //     own filter result, and at every width it must match a C reference box filter.
 #include "../src/common.cpp"
+#include "../src/core/shaderinfo.cpp"
 #include "../src/softshadows.cpp"
 #include <stdio.h>
 #include <math.h>

@@ -1,13 +1,17 @@
-// Checks the camera extraction and the reprojection rows (src/gimath.cpp) against cameras built
-// here like the game's (left-handed perspective, near 0.1 m, far ~1779 m, P00 1.317; world z up):
+// Checks the shared camera maths (src/core/camera.cpp) against cameras built here like the game's
+// (left-handed perspective, near 0.1 m, far ~1779 m, P00 1.317; world z up):
 //  - CameraFromMatrices recovers the view-projection, eye, forward and projection terms from
 //    g_WorldViewProj and g_World, for an arbitrary object world matrix;
+//  - its float terms are bit for bit what the effects computed with their own copies before they
+//    shared this one (AO / volumetrics, below as OldCamera), and TAA's reprojection matrix too;
+//  - IsCameraCut: 4 m or about 32 degrees;
 //  - ReprojectionRows maps (z/w, x, y, 1) of a pixel in the current frame to the texel of the same
 //    world point in last frame's half-res texture, and w to its view depth then / now;
 //  - IdentityRows maps each pixel onto itself.
-#include "ssgi/gi.h"
-using namespace ssgi;
+#include "core/camera.h"
+using namespace core;
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 
 static int g_fail = 0;
@@ -91,6 +95,159 @@ static bool PixelOf(const Mat4& VP, const double world[3], double& px, double& p
 	return px >= 0 && py >= 0 && px < W && py < H;
 }
 
+// ---- The effects' own camera code before core/camera (volumetrics.cpp, the superset of AO's) -------
+
+namespace old
+{
+struct Camera
+{
+	bool ok = false;
+	float A, B, P00, P11, P02, P12;
+	float right[3], up[3], forward[3];
+	float eye[3];
+	float nearZ, farZ;
+};
+
+static bool Invert4(const double m[4][4], double out[4][4])
+{
+	double a[4][8];
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 8; c++)
+			a[r][c] = c < 4 ? m[r][c] : (c - 4 == r ? 1.0 : 0.0);
+	for (int c = 0; c < 4; c++)
+	{
+		int piv = c;
+		for (int r = c + 1; r < 4; r++)
+			if (fabs(a[r][c]) > fabs(a[piv][c]))
+				piv = r;
+		if (fabs(a[piv][c]) < 1e-12)
+			return false;
+		for (int k = 0; k < 8; k++)
+		{
+			double t = a[c][k];
+			a[c][k] = a[piv][k];
+			a[piv][k] = t;
+		}
+		double inv = 1.0 / a[c][c];
+		for (int k = 0; k < 8; k++)
+			a[c][k] *= inv;
+		for (int r = 0; r < 4; r++)
+			if (r != c)
+			{
+				double f = a[r][c];
+				for (int k = 0; k < 8; k++)
+					a[r][k] -= f * a[c][k];
+			}
+	}
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+			out[r][c] = a[r][c + 4];
+	return true;
+}
+
+static double Det3(const double m[3][3])
+{
+	return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+		m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+
+static bool CameraFromMatrices(const float wvp[16], const float world[16], Camera& cam)
+{
+	double M[4][4], Wm[4][4], Wi[4][4], VP[4][4];
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+		{
+			M[r][c] = wvp[r * 4 + c];
+			Wm[r][c] = world[r * 4 + c];
+		}
+	if (!Invert4(Wm, Wi))
+		return false;
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+			VP[r][c] = M[r][0] * Wi[0][c] + M[r][1] * Wi[1][c] + M[r][2] * Wi[2][c] + M[r][3] * Wi[3][c];
+	auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+	double s = sqrt(dot3(VP[3], VP[3]));
+	if (fabs(s - 1.0) > 0.01)
+		return false;
+	double f[3] = { VP[3][0] / s, VP[3][1] / s, VP[3][2] / s };
+	double A = dot3(VP[2], f) / s, B = VP[2][3] - A * VP[3][3];
+	double p02 = dot3(VP[0], f) / s, p12 = dot3(VP[1], f) / s;
+	double r0[3], r1[3], res[3];
+	for (int k = 0; k < 3; k++)
+	{
+		r0[k] = VP[0][k] - p02 * VP[3][k];
+		r1[k] = VP[1][k] - p12 * VP[3][k];
+		res[k] = VP[2][k] - A * VP[3][k];
+	}
+	double p00 = sqrt(dot3(r0, r0)), p11 = sqrt(dot3(r1, r1));
+	double near_ = A != 0 ? -B / A : 0;
+	if (sqrt(dot3(res, res)) > 1e-3 * fabs(A) || !(A > 0.5) || !(B < 0) || !(near_ > 0) || p00 < 1e-3 || p11 < 1e-3 ||
+		fabs(dot3(r0, r1)) > 1e-3 * p00 * p11)
+		return false;
+	double sys[3][3] = { { VP[0][0], VP[0][1], VP[0][2] }, { VP[1][0], VP[1][1], VP[1][2] }, { VP[3][0], VP[3][1], VP[3][2] } };
+	double rhs[3] = { -VP[0][3], -VP[1][3], -VP[3][3] };
+	double det = Det3(sys);
+	if (fabs(det) < 1e-12)
+		return false;
+	for (int k = 0; k < 3; k++)
+	{
+		double m[3][3];
+		memcpy(m, sys, sizeof(m));
+		for (int r = 0; r < 3; r++)
+			m[r][k] = rhs[r];
+		cam.eye[k] = (float)(Det3(m) / det);
+	}
+	cam.A = (float)A;
+	cam.B = (float)B;
+	cam.P00 = (float)p00;
+	cam.P11 = (float)p11;
+	cam.P02 = (float)p02;
+	cam.P12 = (float)p12;
+	cam.nearZ = (float)near_;
+	cam.farZ = A > 1.0 ? (float)(B / (1.0 - A)) : 1e6f;
+	for (int k = 0; k < 3; k++)
+	{
+		cam.right[k] = (float)(r0[k] / p00);
+		cam.up[k] = (float)(r1[k] / p11);
+		cam.forward[k] = (float)f[k];
+	}
+	cam.ok = true;
+	return true;
+}
+
+// TAA's reprojection matrix (taa.cpp), on its own camera (VP and the projection terms in double).
+static void Mul4(const double a[4][4], const double b[4][4], double out[4][4])
+{
+	double t[4][4];
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+			t[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + a[r][3] * b[3][c];
+	memcpy(out, t, sizeof(t));
+}
+
+static bool ReprojectionMatrix(const core::Camera& cur, const core::Camera& prev, float out[4][4])
+{
+	double inv[4][4], P[4][4] = {}, M[4][4];
+	if (!Invert4(cur.viewProj.m, inv))
+		return false;
+	P[0][0] = cur.P00;
+	P[0][2] = cur.P02;
+	P[1][1] = cur.P11;
+	P[1][2] = cur.P12;
+	P[2][2] = cur.A;
+	P[2][3] = cur.B;
+	P[3][2] = 1.0;
+	Mul4(inv, P, M);
+	Mul4(prev.viewProj.m, M, M);
+	for (int r = 0; r < 4; r++)
+		for (int c = 0; c < 4; c++)
+			out[r][c] = (float)M[r][c];
+	return true;
+}
+} // namespace old
+
+static bool SameFloats(const float* a, const float* b, int n) { return memcmp(a, b, sizeof(float) * n) == 0; }
+
 int main()
 {
 	unsigned seed = 1;
@@ -139,6 +296,51 @@ int main()
 			CHECK(fabs(cam.forward[k] - fwd0[k]) < 1e-4, "forward[%d] %g vs %g", k, cam.forward[k], fwd0[k]);
 		}
 		CHECK(fabs(cam.P00 - kP00) < 1e-4 && fabs(-cam.B / cam.A - kNear) < 1e-3, "projection P00 %g near %g", cam.P00, -cam.B / cam.A);
+
+		// The effects' shader constants are exactly what their own copies computed.
+		old::Camera oc;
+		CHECK(old::CameraFromMatrices(wvp, world, oc), "old code rejected the camera");
+		const CameraFloats& F = cam.f;
+		const float terms[] = { F.A, F.B, F.P00, F.P11, F.P02, F.P12, F.nearZ, F.farZ };
+		const float oldTerms[] = { oc.A, oc.B, oc.P00, oc.P11, oc.P02, oc.P12, oc.nearZ, oc.farZ };
+		CHECK(SameFloats(terms, oldTerms, 8), "projection terms differ from the effects' old ones");
+		CHECK(SameFloats(F.right, oc.right, 3) && SameFloats(F.up, oc.up, 3) && SameFloats(F.forward, oc.forward, 3) &&
+				SameFloats(F.eye, oc.eye, 3),
+			"axes / eye differ from the effects' old ones");
+	}
+
+	// TAA's reprojection matrix: the same as its own copy computed.
+	{
+		const double eyeA[3] = { 10, 20, 3 }, tgtA[3] = { 40, 25, 2 }, eyeB[3] = { 10.4, 20.1, 3.05 }, tgtB[3] = { 39, 27, 2.5 };
+		double fa[3], fb[3];
+		Camera a, b;
+		a.viewProj = MakeViewProj(eyeA, tgtA, fa);
+		b.viewProj = MakeViewProj(eyeB, tgtB, fb);
+		float wvp[16], world[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+		for (int i = 0; i < 16; i++)
+			wvp[i] = (float)a.viewProj.m[i / 4][i % 4];
+		char why[160] = "";
+		CHECK(CameraFromMatrices(wvp, world, a, why, sizeof(why)), "camera a: %s", why);
+		for (int i = 0; i < 16; i++)
+			wvp[i] = (float)b.viewProj.m[i / 4][i % 4];
+		CHECK(CameraFromMatrices(wvp, world, b, why, sizeof(why)), "camera b: %s", why);
+		float m[4][4], om[4][4];
+		CHECK(ReprojectionMatrix(b, a, m) && old::ReprojectionMatrix(b, a, om), "reprojection matrix not computed");
+		CHECK(SameFloats(&m[0][0], &om[0][0], 16), "TAA's reprojection matrix differs from its old one");
+
+		// Camera cuts: a small step is none; 4 m or about 32 degrees in one frame is one.
+		CHECK(!IsCameraCut(b, a), "a small step counted as a camera cut");
+		Camera c = a;
+		c.eye[0] += 4.1;
+		CHECK(IsCameraCut(c, a), "a 4.1 m jump not counted as a camera cut");
+		c = a;
+		c.eye[0] += 3.9;
+		CHECK(!IsCameraCut(c, a), "a 3.9 m step counted as a camera cut");
+		c = a;
+		const double t = 0.6; // radians, about 34 degrees
+		c.forward[0] = a.forward[0] * cos(t) - a.forward[1] * sin(t);
+		c.forward[1] = a.forward[0] * sin(t) + a.forward[1] * cos(t);
+		CHECK(IsCameraCut(c, a), "a 34 degree turn not counted as a camera cut");
 	}
 
 	// ---- Reprojection: the camera moves and turns between frames

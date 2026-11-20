@@ -3,6 +3,7 @@
 #include "vsjitter.h"
 #include "common.h"
 #include "shaders_gen.h"
+#include "core/scene.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -93,13 +94,8 @@ bool Taa_Init()
 
 // ---- Vertex shaders ----------------------------------------------------------------------------
 
-struct VsMatrices
-{
-	int wvp = -1, world = -1;
-};
 static CRITICAL_SECTION g_vsLock;
 static bool g_vsLockReady = false;
-static std::unordered_map<void*, VsMatrices> g_vsInfo;
 static std::map<std::string, int> g_skipReasons;
 static int g_vsRewritten = 0, g_vsSkipped = 0;
 
@@ -134,152 +130,13 @@ bool Taa_RewriteVS(const DWORD* code, std::vector<DWORD>& out, VsJitterInfo& inf
 	return ok && g_enabled;
 }
 
-void Taa_OnVertexShaderCreated(IDirect3DVertexShader9* vs, const VsJitterInfo& info)
-{
-	if (!vs)
-		return;
-	InitLock();
-	EnterCriticalSection(&g_vsLock);
-	if (info.wvpReg >= 0 && info.worldReg >= 0)
-	{
-		VsMatrices m;
-		m.wvp = info.wvpReg;
-		m.world = info.worldReg;
-		g_vsInfo[vs] = m;
-	}
-	else
-		g_vsInfo.erase(vs); // the address may have belonged to a released shader
-	LeaveCriticalSection(&g_vsLock);
-}
-
-static IDirect3DVertexShader9* g_curVs;
-void Taa_OnSetVertexShader(IDirect3DVertexShader9* vs) { g_curVs = vs; }
-
 // ---- Camera ------------------------------------------------------------------------------------
 
-typedef TaaCamera Camera;
-static Camera g_cam, g_prevCam;
-
-static bool Invert4(const double m[4][4], double out[4][4])
-{
-	double a[4][8];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 8; c++)
-			a[r][c] = c < 4 ? m[r][c] : (c - 4 == r ? 1.0 : 0.0);
-	for (int c = 0; c < 4; c++)
-	{
-		int piv = c;
-		for (int r = c + 1; r < 4; r++)
-			if (fabs(a[r][c]) > fabs(a[piv][c]))
-				piv = r;
-		if (fabs(a[piv][c]) < 1e-12)
-			return false;
-		for (int k = 0; k < 8; k++)
-		{
-			double t = a[c][k];
-			a[c][k] = a[piv][k];
-			a[piv][k] = t;
-		}
-		double inv = 1.0 / a[c][c];
-		for (int k = 0; k < 8; k++)
-			a[c][k] *= inv;
-		for (int r = 0; r < 4; r++)
-			if (r != c)
-			{
-				double f = a[r][c];
-				for (int k = 0; k < 8; k++)
-					a[r][k] -= f * a[c][k];
-			}
-	}
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			out[r][c] = a[r][c + 4];
-	return true;
-}
-
-static void Mul4(const double a[4][4], const double b[4][4], double out[4][4])
-{
-	double t[4][4];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			t[r][c] = a[r][0] * b[0][c] + a[r][1] * b[1][c] + a[r][2] * b[2][c] + a[r][3] * b[3][c];
-	memcpy(out, t, sizeof(t));
-}
-
-// Registers hold matrix rows (clip.x = dot(position, c[wvp])). ViewProj = WVP * World^-1, which for
-// a D3D perspective projection is P * V with P = [P00 0 P02 0; 0 P11 P12 0; 0 0 A B; 0 0 1 0].
-bool Taa_CameraFromMatrices(const float wvp[16], const float world[16], Camera& cam, char* why, size_t whySize)
-{
-	double M[4][4], Wm[4][4], Wi[4][4];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-		{
-			M[r][c] = wvp[r * 4 + c];
-			Wm[r][c] = world[r * 4 + c];
-		}
-	if (!Invert4(Wm, Wi))
-	{
-		snprintf(why, whySize, "world matrix not invertible");
-		return false;
-	}
-	double(*VP)[4] = cam.VP;
-	Mul4(M, Wi, VP);
-	auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
-	double s = sqrt(dot3(VP[3], VP[3]));
-	if (fabs(s - 1.0) > 0.01)
-	{
-		snprintf(why, whySize, "not a standard perspective projection (|w row| = %g)", s);
-		return false;
-	}
-	double f[3] = { VP[3][0] / s, VP[3][1] / s, VP[3][2] / s };
-	double A = dot3(VP[2], f) / s, B = VP[2][3] - A * VP[3][3];
-	double p02 = dot3(VP[0], f) / s, p12 = dot3(VP[1], f) / s;
-	double r0[3], r1[3], res[3];
-	for (int k = 0; k < 3; k++)
-	{
-		r0[k] = VP[0][k] - p02 * VP[3][k];
-		r1[k] = VP[1][k] - p12 * VP[3][k];
-		res[k] = VP[2][k] - A * VP[3][k];
-	}
-	double p00 = sqrt(dot3(r0, r0)), p11 = sqrt(dot3(r1, r1));
-	double near_ = A != 0 ? -B / A : 0;
-	if (sqrt(dot3(res, res)) > 1e-3 * fabs(A) || !(A > 0.5) || !(B < 0) || !(near_ > 0) || p00 < 1e-3 || p11 < 1e-3 ||
-		fabs(dot3(r0, r1)) > 1e-3 * p00 * p11)
-	{
-		snprintf(why, whySize, "unexpected projection (A %g, B %g, P00 %g, P11 %g)", A, B, p00, p11);
-		return false;
-	}
-	cam.A = A;
-	cam.B = B;
-	cam.P00 = p00;
-	cam.P11 = p11;
-	cam.P02 = p02;
-	cam.P12 = p12;
-	cam.ok = true;
-	return true;
-}
-
-// Rows of: this frame's view space (x right, y up, z forward, metres) -> previous frame's clip
-// space = VP_prev * VP_cur^-1 * P_cur (P_cur takes view space to this frame's clip space).
-bool Taa_ReprojectionMatrix(const Camera& cur, const Camera& prev, float out[4][4])
-{
-	double inv[4][4], P[4][4] = {}, M[4][4];
-	if (!Invert4(cur.VP, inv))
-		return false;
-	P[0][0] = cur.P00;
-	P[0][2] = cur.P02;
-	P[1][1] = cur.P11;
-	P[1][2] = cur.P12;
-	P[2][2] = cur.A;
-	P[2][3] = cur.B;
-	P[3][2] = 1.0;
-	Mul4(inv, P, M);
-	Mul4(prev.VP, M, M);
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			out[r][c] = (float)M[r][c];
-	return true;
-}
+// This frame's camera is core::Scene().camera (the first opaque draw with the camera matrices; they
+// are unjittered: the jitter is added in the vertex shaders). g_camOk: it was there by the time the
+// main pass drew into this frame's scene targets. g_prevCam: the camera of the history.
+static bool g_camOk = false;
+static core::Camera g_prevCam;
 
 // ---- Device state ------------------------------------------------------------------------------
 
@@ -298,8 +155,6 @@ static IDirect3DPixelShader9 *g_psResolve, *g_psOutput;
 static IDirect3DVertexDeclaration9* g_decl;
 
 // Per frame.
-static IDirect3DSurface9* g_rt0;       // current render targets 0 and 1 (not referenced)
-static IDirect3DSurface9* g_rt1;
 static bool g_inScene = false;         // the main pass was seen this frame
 static bool g_resolved = false;        // the resolve ran (or was attempted) this frame
 static bool g_resolvedOk = false;      // ... and produced a new history
@@ -454,7 +309,7 @@ static bool IsJitterTarget(IDirect3DSurface9* s)
 
 static void UpdateJitter(IDirect3DDevice9* dev)
 {
-	bool on = g_jitterFrame && !g_resolved && Taa_Active() && IsJitterTarget(g_rt0);
+	bool on = g_jitterFrame && !g_resolved && Taa_Active() && IsJitterTarget(core::Scene().rt0);
 	float v[4] = { 0, 0, 0, 0 };
 	if (on)
 	{
@@ -520,33 +375,23 @@ void Taa_OnSetTexture(DWORD stage, IDirect3DBaseTexture9* tex)
 // The game's z/w target bound as render target 1 next to a scene colour target of the same size.
 static bool IsMainPass(IDirect3DSurface9* s, IDirect3DSurface9* rt0, UINT& w, UINT& h, IDirect3DTexture9*& sceneTex)
 {
-	if (!s || !rt0)
+	const core::ZwBinding b = core::InspectRt1(s, rt0);
+	if (!b.zw || !b.zwTexture)
 		return false;
-	D3DSURFACE_DESC d = {}, c = {};
-	if (FAILED(s->GetDesc(&d)) || FAILED(rt0->GetDesc(&c)))
-		return false;
-	if (d.Format != D3DFMT_R32F || !(d.Usage & D3DUSAGE_RENDERTARGET) || c.Width != d.Width || c.Height != d.Height)
-		return false;
-	IDirect3DTexture9* tex = nullptr;
-	if (FAILED(s->GetContainer(kIID_Texture9, (void**)&tex)) || !tex)
-		return false;
-	tex->Release();
-	tex = nullptr;
-	if (c.MultiSampleType != D3DMULTISAMPLE_NONE || FAILED(rt0->GetContainer(kIID_Texture9, (void**)&tex)) || !tex)
+	if (b.colourMsaa || !b.colourTexture)
 	{
 		static bool warned = false;
 		if (!warned)
 		{
 			warned = true;
 			LogWarn("TAA: the scene colour is %s; TAA needs the in-game anti-aliasing (MSAA) switched off.",
-				c.MultiSampleType != D3DMULTISAMPLE_NONE ? "multisampled" : "not a texture");
+				b.colourMsaa ? "multisampled" : "not a texture");
 		}
 		return false;
 	}
-	tex->Release(); // the game holds it
-	sceneTex = tex;
-	w = d.Width;
-	h = d.Height;
+	sceneTex = b.colourTexture;
+	w = b.width;
+	h = b.height;
 	return true;
 }
 
@@ -556,21 +401,20 @@ void Taa_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 		return;
 	if (index == 0)
 	{
-		g_rt0 = s;
 		UpdateJitter(dev);
 		return;
 	}
 	if (index != 1)
 		return;
-	g_rt1 = s;
 	if (!s || g_inScene || g_resolved || !Taa_Active())
 		return;
+	IDirect3DSurface9* rt0 = core::Scene().rt0;
 	UINT w, h;
 	IDirect3DTexture9* tex = nullptr;
-	if (!IsMainPass(s, g_rt0, w, h, tex))
+	if (!IsMainPass(s, rt0, w, h, tex))
 		return;
 	g_inScene = true;
-	g_sceneSurf = g_rt0;
+	g_sceneSurf = rt0;
 	g_sceneTex = tex;
 	g_depthSurf = s;
 	g_sceneBound = 0;
@@ -580,51 +424,12 @@ void Taa_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 	if (w != g_sceneW || h != g_sceneH)
 	{
 		D3DSURFACE_DESC c = {};
-		g_rt0->GetDesc(&c);
+		rt0->GetDesc(&c);
 		LogInfo("TAA: scene found: %ux%u, colour format %d, z/w target R32F.", w, h, (int)c.Format);
 		g_sceneW = w;
 		g_sceneH = h;
 		g_historyValid = false;
 		UpdateJitter(dev);
-	}
-}
-
-static void CaptureCamera(IDirect3DDevice9* dev)
-{
-	if (!g_curVs || !g_vsLockReady)
-		return;
-	VsMatrices m;
-	EnterCriticalSection(&g_vsLock);
-	auto it = g_vsInfo.find(g_curVs);
-	if (it != g_vsInfo.end())
-		m = it->second;
-	LeaveCriticalSection(&g_vsLock);
-	if (m.wvp < 0)
-		return;
-	float wvp[16], world[16];
-	if (FAILED(dev->GetVertexShaderConstantF(m.wvp, wvp, 4)) || FAILED(dev->GetVertexShaderConstantF(m.world, world, 4)))
-		return;
-	char why[160];
-	Camera cam;
-	if (Taa_CameraFromMatrices(wvp, world, cam, why, sizeof(why)))
-	{
-		static bool logged = false;
-		if (!logged)
-		{
-			logged = true;
-			LogInfo("TAA: camera found (near %.3f m, far %.0f m, horizontal fov %.1f deg).", -cam.B / cam.A, cam.B / (1.0 - cam.A),
-				2.0 * atan(1.0 / cam.P00) * 57.29578);
-		}
-		g_cam = cam;
-	}
-	else
-	{
-		static bool warned = false;
-		if (!warned)
-		{
-			warned = true;
-			LogWarn("TAA: could not read the camera from the shader constants (%s).", why);
-		}
 	}
 }
 
@@ -634,10 +439,11 @@ void Taa_BeforeDraw(IDirect3DDevice9* dev)
 {
 	if (!g_inScene || g_resolved)
 		return;
-	if (g_sceneBound && g_rt0 != g_sceneSurf)
+	const core::SceneState& scene = core::Scene();
+	if (g_sceneBound && scene.rt0 != g_sceneSurf)
 		Resolve(dev);
-	else if (!g_cam.ok && g_rt0 == g_sceneSurf && g_rt1 == g_depthSurf)
-		CaptureCamera(dev);
+	else if (!g_camOk && scene.rt0 == g_sceneSurf && scene.rt1 == g_depthSurf)
+		g_camOk = scene.camera.ok; // set by the first draw into the scene targets with the camera matrices
 }
 
 void Taa_BeforeCopyFrom(IDirect3DDevice9* dev, IDirect3DSurface9* src)
@@ -671,7 +477,7 @@ void Taa_OnPresent(IDirect3DDevice9* dev)
 	g_sceneTex = nullptr;
 	g_depthSurf = nullptr;
 	g_sceneBound = 0;
-	g_cam.ok = false;
+	g_camOk = false;
 	UpdateJitter(dev); // the back buffer is bound now: off until the next scene target
 }
 
@@ -695,14 +501,13 @@ void Taa_OnLostDevice()
 	g_sceneSurf = nullptr;
 	g_sceneTex = nullptr;
 	g_depthSurf = nullptr;
-	g_rt0 = g_rt1 = nullptr;
 	g_sceneBound = 0;
 	memset(g_bound, 0, sizeof(g_bound));
 	g_jitterFrame = false;
 	g_jitterOn = false;
 	g_c255Known = false; // Reset sets all constants to 0
 	memset(g_gameBias, 0, sizeof(g_gameBias));
-	g_cam.ok = g_prevCam.ok = false;
+	g_camOk = g_prevCam.ok = false;
 	g_sceneW = g_sceneH = 0;
 }
 
@@ -718,7 +523,7 @@ static void Resolve(IDirect3DDevice9* dev)
 {
 	g_resolved = true;
 	UpdateJitter(dev); // off from here on
-	if (!g_cam.ok)
+	if (!g_camOk)
 	{
 		static bool warned = false;
 		if (!warned)
@@ -731,8 +536,9 @@ static void Resolve(IDirect3DDevice9* dev)
 	if (!EnsureResources(dev, g_sceneW, g_sceneH))
 		return;
 
+	const core::Camera& cam = core::Scene().camera;
 	float reproj[4][4];
-	bool valid = g_historyValid && g_prevCam.ok && Taa_ReprojectionMatrix(g_cam, g_prevCam, reproj);
+	bool valid = g_historyValid && g_prevCam.ok && core::ReprojectionMatrix(cam, g_prevCam, reproj);
 	if (!valid)
 		memset(reproj, 0, sizeof(reproj));
 
@@ -810,8 +616,8 @@ static void Resolve(IDirect3DDevice9* dev)
 		{ reproj[1][0], reproj[1][1], reproj[1][2], reproj[1][3] },
 		{ reproj[2][0], reproj[2][1], reproj[2][2], reproj[2][3] },
 		{ reproj[3][0], reproj[3][1], reproj[3][2], reproj[3][3] },
-		{ (float)g_cam.A, (float)g_cam.B, (float)g_cam.P00, (float)g_cam.P11 },
-		{ (float)g_cam.P02, (float)g_cam.P12, 0, 0 },
+		{ (float)cam.A, (float)cam.B, (float)cam.P00, (float)cam.P11 },
+		{ (float)cam.P02, (float)cam.P12, 0, 0 },
 		{ 1.0f - g_feedback, 1.0f - g_motionFeedback, g_motionPixels, g_depthTolerance },
 		{ g_sharpness, g_clipGamma, kHdrCompression, kDistrust },
 	};
@@ -876,7 +682,7 @@ static void Resolve(IDirect3DDevice9* dev)
 	UpdateJitter(dev);
 
 	g_histIndex = prev;
-	g_prevCam = g_cam;
+	g_prevCam = cam;
 	g_resolvedOk = true;
 	static bool first = true;
 	if (first)

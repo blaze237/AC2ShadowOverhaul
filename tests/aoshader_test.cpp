@@ -12,6 +12,7 @@
 //     shadow operand of the combine zeroed, and minus the colour with the cloud shadow map black
 //     (the clouds only dim the sun); unmatched shaders write oC3 = 0.
 #include "../src/common.cpp"
+#include "../src/core/shaderinfo.cpp"
 #include "../src/softshadows.cpp"
 #include "../src/aoshader.cpp"
 #include <stdio.h>
@@ -316,11 +317,11 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 	std::vector<Inst> insts;
 	size_t endPos;
 	Parse(code.data(), insts, endPos);
-	std::vector<CtabVar> vars;
-	ReadCtabVars(code.data(), insts, vars);
-	const CtabVar* amb = FindVar(vars, "g_AmbientCube", 2);
-	const CtabVar* lm = FindVar(vars, "g_WorldLightMapSampler", 3);
-	const CtabVar* cloud = FindVar(vars, "g_CloudShadowSampler", 3);
+	core::ConstantTable vars;
+	core::ReadConstantTable(code.data(), vars);
+	const core::ShaderConstant* amb = vars.Find("g_AmbientCube", core::RS_FLOAT4);
+	const core::ShaderConstant* lm = vars.Find("g_WorldLightMapSampler", core::RS_SAMPLER);
+	const core::ShaderConstant* cloud = vars.Find("g_CloudShadowSampler", core::RS_SAMPLER);
 
 	int trials = 0, mism = 0, indBad = 0, cutBad = 0, zeroBad = 0, sunBad = 0, cloudBad = 0;
 	float worst = 0;
@@ -345,8 +346,8 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 				if (Rand() < 0.1f)
 					f = Rand() * 2 - 1;
 		in.texSeed = (uint32_t)(Rand() * 4e9);
-		in.lmSampler = lm ? lm->index : -1;
-		in.cloudSampler = cloud ? cloud->index : -1;
+		in.lmSampler = lm ? lm->reg : -1;
+		in.cloudSampler = cloud ? cloud->reg : -1;
 		Outputs a, b, z;
 		if (!Run(code, in, a, err))
 			return "interpreter: " + err;
@@ -419,7 +420,7 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 		{
 			Inputs noAmb = in;
 			if (amb)
-				for (int r = amb->index; r < amb->index + amb->count; r++)
+				for (int r = amb->reg; r < amb->reg + amb->count; r++)
 					for (float& f : noAmb.c[r])
 						f = 0;
 			noAmb.noLightmapColour = true;

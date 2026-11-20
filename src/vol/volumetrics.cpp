@@ -1,11 +1,8 @@
 // Volumetric fog and sun shafts: settings, what we read from the game's shaders, the frame
 // tracking and the passes. See volumetrics.h for the overview.
 //
-// Camera: the opaque shaders' g_WorldViewProj and g_World give ViewProj = WVP * World^-1 (the
-// registers hold matrix rows). For a D3D perspective projection that is P * V with
-// P = [P00 0 P02 0; 0 P11 P12 0; 0 0 A B; 0 0 1 0], so A, B, P00, P11, P02, P12 and the camera's
-// world axes come straight out of the rows; z/w = A + B / z. The camera position is where clip x,
-// y and w are all 0.
+// Camera: this frame's, from the shared scene tracker (core/scene.h; the maths, from the opaque
+// shaders' g_WorldViewProj and g_World, in core/camera.h), taken during our pass.
 //
 // Sun shadow map: the lit shaders transform world positions with g_WorldToLightProjVS (3 rows:
 // x, y across the sun in metres, centred near the camera; z along the direction towards the sun),
@@ -16,6 +13,8 @@
 #include "volumetrics.h"
 #include "common.h"
 #include "shaders_gen.h"
+#include "core/scene.h"
+#include "core/shaderinfo.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -102,9 +101,11 @@ bool Vol_Init()
 
 // ---- Shader constant tables: where each shader keeps what we need ------------------------------
 
+// Vertex shaders: the sun shadow atlas's light-space matrix, and the eye position (only to check the
+// camera against it in the log). The camera matrices are the scene tracker's.
 struct VsInfo
 {
-	int wvp = -1, world = -1, light = -1, eye = -1;
+	int light = -1, eye = -1;
 };
 struct PsInfo
 {
@@ -122,41 +123,6 @@ static CRITICAL_SECTION g_mapLock;
 static std::unordered_map<void*, VsInfo> g_vsInfo;
 static std::unordered_map<void*, PsInfo> g_psInfo;
 
-// Calls fn(name, registerSet, index, count) for each entry of the constant table the HLSL compiler
-// embeds as the first comment of SM2/SM3 bytecode. Register sets: 0 bool, 1 int, 2 float, 3 sampler.
-template <typename Fn> static bool ReadCtab(const DWORD* code, Fn fn)
-{
-	if (!code || (code[0] & 0xFFFE0000) != 0xFFFE0000) // vs (FFFE) or ps (FFFF) version token
-		return false;
-	for (size_t i = 1; i < 4096 && code[i] != 0x0000FFFF;)
-	{
-		DWORD tok = code[i];
-		if ((tok & 0xFFFF) != 0xFFFE) // the table comes before any instruction
-			return false;
-		size_t len = (tok >> 16) & 0x7FFF;
-		if (len >= 8 && code[i + 1] == 0x42415443) // 'CTAB'
-		{
-			const uint8_t* base = (const uint8_t*)&code[i + 2];
-			size_t size = (len - 1) * 4;
-			auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-			auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-			DWORD count = rd32(12), infoOff = rd32(16);
-			for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-			{
-				size_t e = infoOff + 20 * k;
-				DWORD nameOff = rd32(e);
-				char name[48] = {};
-				for (size_t c = 0; c < sizeof(name) - 1 && nameOff + c < size && base[nameOff + c]; c++)
-					name[c] = (char)base[nameOff + c];
-				fn(name, (int)rd16(e + 4), (int)rd16(e + 6), (int)rd16(e + 8));
-			}
-			return true;
-		}
-		i += 1 + len;
-	}
-	return false;
-}
-
 static void InitLock()
 {
 	static bool ready = false;
@@ -172,20 +138,14 @@ void Vol_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code)
 	if (!vs)
 		return;
 	VsInfo info;
-	ReadCtab(code, [&](const char* name, int set, int index, int count) {
-		if (set != 2)
-			return;
-		if (count >= 4 && !strcmp(name, "g_WorldViewProj"))
-			info.wvp = index;
-		else if (count >= 4 && !strcmp(name, "g_World"))
-			info.world = index;
-		else if (count >= 3 && !strcmp(name, "g_WorldToLightProjVS"))
-			info.light = index;
-		else if (!strcmp(name, "g_EyePosition"))
-			info.eye = index;
-	});
+	core::ConstantTable t;
+	if (core::ReadConstantTable(code, t))
+	{
+		info.light = t.Register("g_WorldToLightProjVS", core::RS_FLOAT4, 3);
+		info.eye = t.Register("g_EyePosition", core::RS_FLOAT4);
+	}
 	EnterCriticalSection(&g_mapLock);
-	if ((info.wvp >= 0 && info.world >= 0) || info.light >= 0)
+	if (info.light >= 0 || info.eye >= 0)
 		g_vsInfo[vs] = info;
 	else
 		g_vsInfo.erase(vs); // the address may have belonged to a released shader
@@ -197,17 +157,11 @@ void Vol_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code)
 	if (!ps)
 		return;
 	PsInfo info;
-	ReadCtab(code, [&](const char* name, int set, int index, int count) {
-		if (set == 3)
-		{
-			if (!strcmp(name, "g_ShadowSampler"))
-				info.shadowSampler = index;
-			else if (!strcmp(name, "g_CloudShadowSampler"))
-				info.cloudSampler = index;
-			return;
-		}
-		if (set != 2)
-			return;
+	core::ConstantTable t;
+	if (core::ReadConstantTable(code, t))
+	{
+		info.shadowSampler = t.Register("g_ShadowSampler", core::RS_SAMPLER);
+		info.cloudSampler = t.Register("g_CloudShadowSampler", core::RS_SAMPLER);
 		struct
 		{
 			const char* name;
@@ -228,146 +182,14 @@ void Vol_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code)
 			{ "g_CloudUVScaleOffset", &info.cloudUV, 1 },
 		};
 		for (const auto& m : map)
-			if (count >= m.minCount && !strcmp(name, m.name))
-				*m.reg = index;
-	});
+			*m.reg = t.Register(m.name, core::RS_FLOAT4, m.minCount);
+	}
 	EnterCriticalSection(&g_mapLock);
 	if (info.Any())
 		g_psInfo[ps] = info;
 	else
 		g_psInfo.erase(ps);
 	LeaveCriticalSection(&g_mapLock);
-}
-
-// ---- Camera ------------------------------------------------------------------------------------
-
-struct Camera
-{
-	bool ok = false;
-	float A, B, P00, P11, P02, P12;
-	float right[3], up[3], forward[3]; // view axes in world space
-	float eye[3];                      // camera position, world space
-	float nearZ, farZ;
-};
-
-static bool Invert4(const double m[4][4], double out[4][4])
-{
-	double a[4][8];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 8; c++)
-			a[r][c] = c < 4 ? m[r][c] : (c - 4 == r ? 1.0 : 0.0);
-	for (int c = 0; c < 4; c++)
-	{
-		int piv = c;
-		for (int r = c + 1; r < 4; r++)
-			if (fabs(a[r][c]) > fabs(a[piv][c]))
-				piv = r;
-		if (fabs(a[piv][c]) < 1e-12)
-			return false;
-		for (int k = 0; k < 8; k++)
-		{
-			double t = a[c][k];
-			a[c][k] = a[piv][k];
-			a[piv][k] = t;
-		}
-		double inv = 1.0 / a[c][c];
-		for (int k = 0; k < 8; k++)
-			a[c][k] *= inv;
-		for (int r = 0; r < 4; r++)
-			if (r != c)
-			{
-				double f = a[r][c];
-				for (int k = 0; k < 8; k++)
-					a[r][k] -= f * a[c][k];
-			}
-	}
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			out[r][c] = a[r][c + 4];
-	return true;
-}
-
-static double Det3(const double m[3][3])
-{
-	return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
-		m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-}
-
-static bool CameraFromMatrices(const float wvp[16], const float world[16], Camera& cam, char* why, size_t whySize)
-{
-	double M[4][4], Wm[4][4], Wi[4][4], VP[4][4];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-		{
-			M[r][c] = wvp[r * 4 + c];
-			Wm[r][c] = world[r * 4 + c];
-		}
-	if (!Invert4(Wm, Wi))
-	{
-		snprintf(why, whySize, "world matrix not invertible");
-		return false;
-	}
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			VP[r][c] = M[r][0] * Wi[0][c] + M[r][1] * Wi[1][c] + M[r][2] * Wi[2][c] + M[r][3] * Wi[3][c];
-	auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
-	double s = sqrt(dot3(VP[3], VP[3]));
-	if (fabs(s - 1.0) > 0.01)
-	{
-		snprintf(why, whySize, "not a standard perspective projection (|w row| = %g)", s);
-		return false;
-	}
-	double f[3] = { VP[3][0] / s, VP[3][1] / s, VP[3][2] / s };
-	double A = dot3(VP[2], f) / s, B = VP[2][3] - A * VP[3][3];
-	double p02 = dot3(VP[0], f) / s, p12 = dot3(VP[1], f) / s;
-	double r0[3], r1[3], res[3];
-	for (int k = 0; k < 3; k++)
-	{
-		r0[k] = VP[0][k] - p02 * VP[3][k];
-		r1[k] = VP[1][k] - p12 * VP[3][k];
-		res[k] = VP[2][k] - A * VP[3][k];
-	}
-	double p00 = sqrt(dot3(r0, r0)), p11 = sqrt(dot3(r1, r1));
-	double near_ = A != 0 ? -B / A : 0;
-	if (sqrt(dot3(res, res)) > 1e-3 * fabs(A) || !(A > 0.5) || !(B < 0) || !(near_ > 0) || p00 < 1e-3 || p11 < 1e-3 ||
-		fabs(dot3(r0, r1)) > 1e-3 * p00 * p11)
-	{
-		snprintf(why, whySize, "unexpected projection (A %g, B %g, P00 %g, P11 %g)", A, B, p00, p11);
-		return false;
-	}
-	// Camera position: clip x, y and w are 0 there.
-	double sys[3][3] = { { VP[0][0], VP[0][1], VP[0][2] }, { VP[1][0], VP[1][1], VP[1][2] }, { VP[3][0], VP[3][1], VP[3][2] } };
-	double rhs[3] = { -VP[0][3], -VP[1][3], -VP[3][3] };
-	double det = Det3(sys);
-	if (fabs(det) < 1e-12)
-	{
-		snprintf(why, whySize, "camera position not solvable");
-		return false;
-	}
-	for (int k = 0; k < 3; k++)
-	{
-		double m[3][3];
-		memcpy(m, sys, sizeof(m));
-		for (int r = 0; r < 3; r++)
-			m[r][k] = rhs[r];
-		cam.eye[k] = (float)(Det3(m) / det);
-	}
-	cam.A = (float)A;
-	cam.B = (float)B;
-	cam.P00 = (float)p00;
-	cam.P11 = (float)p11;
-	cam.P02 = (float)p02;
-	cam.P12 = (float)p12;
-	cam.nearZ = (float)near_;
-	cam.farZ = A > 1.0 ? (float)(B / (1.0 - A)) : 1e6f;
-	for (int k = 0; k < 3; k++)
-	{
-		cam.right[k] = (float)(r0[k] / p00);
-		cam.up[k] = (float)(r1[k] / p11);
-		cam.forward[k] = (float)f[k];
-	}
-	cam.ok = true;
-	return true;
 }
 
 // ---- What one frame's opaque draws told us ------------------------------------------------------
@@ -380,7 +202,7 @@ struct Shadow
 struct FrameData
 {
 	bool cam, light, shadow, sun, fog, cloud;
-	Camera camera;
+	core::Camera camera;
 	float eyeConst[4];
 	bool eyeConstOk;
 	float light3x4[3][4];
@@ -441,25 +263,14 @@ static void CaptureFromDraw(IDirect3DDevice9* dev)
 	}
 	LeaveCriticalSection(&g_mapLock);
 
-	if (haveVs && !g_frame.cam && vi.wvp >= 0 && vi.world >= 0)
+	if (!g_frame.cam && core::Scene().camera.ok)
 	{
-		float wvp[16], world[16];
-		if (SUCCEEDED(dev->GetVertexShaderConstantF(vi.wvp, wvp, 4)) && SUCCEEDED(dev->GetVertexShaderConstantF(vi.world, world, 4)))
-		{
-			char why[160];
-			if (CameraFromMatrices(wvp, world, g_frame.camera, why, sizeof(why)))
-			{
-				g_frame.cam = true;
-				if (vi.eye >= 0 && SUCCEEDED(dev->GetVertexShaderConstantF(vi.eye, g_frame.eyeConst, 1)))
-					g_frame.eyeConstOk = true;
-			}
-			else
-			{
-				static int warned = 0;
-				if (warned++ < 3)
-					LogWarn("Could not read the camera from a shader's constants (%s).", why);
-			}
-		}
+		// The scene tracker found this frame's camera (at this draw, the first opaque one with the
+		// camera matrices): its g_EyePosition, if it has one, should be the same point.
+		g_frame.camera = core::Scene().camera;
+		g_frame.cam = true;
+		if (haveVs && vi.eye >= 0 && SUCCEEDED(dev->GetVertexShaderConstantF(vi.eye, g_frame.eyeConst, 1)))
+			g_frame.eyeConstOk = true;
 	}
 	if (haveVs && !g_frame.light && vi.light >= 0 && SUCCEEDED(dev->GetVertexShaderConstantF(vi.light, &g_frame.light3x4[0][0], 3)))
 		g_frame.light = true;
@@ -665,10 +476,8 @@ enum Phase
 static Phase g_phase = IDLE;
 static bool g_skySeen = false;
 static int g_passDraws = 0;
-static IDirect3DSurface9* g_rt0;      // tracked RT0
 static IDirect3DSurface9* g_scene;    // the game's scene colour target during the pass
 static IDirect3DSurface9* g_depthRt;  // the game's z/w target during the pass
-static D3DVIEWPORT9 g_vp;
 static const char* g_status = "waiting for the game's 3D scene";
 static int g_framesApplied = 0;
 
@@ -676,16 +485,10 @@ const char* Vol_Status() { return g_status; }
 
 static bool IsZwTarget(IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 {
-	if (!s || !rt0)
+	const core::ZwBinding b = core::InspectRt1(s, rt0);
+	if (!b.zw)
 		return false;
-	D3DSURFACE_DESC d = {}, c = {};
-	if (FAILED(s->GetDesc(&d)) || FAILED(rt0->GetDesc(&c)))
-		return false;
-	if (d.Format != D3DFMT_R32F || !(d.Usage & D3DUSAGE_RENDERTARGET) || d.MultiSampleType != D3DMULTISAMPLE_NONE)
-		return false;
-	if (c.Width != d.Width || c.Height != d.Height)
-		return false;
-	if (c.MultiSampleType != D3DMULTISAMPLE_NONE)
+	if (b.colourMsaa)
 	{
 		static bool warned = false;
 		if (!warned)
@@ -696,11 +499,7 @@ static bool IsZwTarget(IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 		g_status = "off: in-game anti-aliasing (MSAA) is on";
 		return false;
 	}
-	IDirect3DTexture9* tex = nullptr;
-	if (FAILED(s->GetContainer(kIID_Texture9, (void**)&tex)) || !tex)
-		return false;
-	tex->Release();
-	return true;
+	return b.zwTexture;
 }
 
 static void Apply(IDirect3DDevice9* dev);
@@ -719,20 +518,9 @@ void Vol_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurf
 
 void Vol_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s)
 {
-	if (index == 0)
-	{
-		g_rt0 = s;
-		if (s)
-		{
-			// D3D9 resets the viewport to the full target when RT0 changes.
-			D3DSURFACE_DESC d;
-			if (SUCCEEDED(s->GetDesc(&d)))
-				g_vp = { 0, 0, d.Width, d.Height, 0.0f, 1.0f };
-		}
-		return;
-	}
 	if (index != 1)
 		return;
+	IDirect3DSurface9* rt0 = core::Scene().rt0;
 	if (s)
 	{
 		if (g_phase == DONE)
@@ -748,7 +536,7 @@ void Vol_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 			}
 			return;
 		}
-		if (!Wanted() || !IsZwTarget(s, g_rt0))
+		if (!Wanted() || !IsZwTarget(s, rt0))
 			return;
 		if (g_phase == IDLE)
 		{
@@ -756,17 +544,11 @@ void Vol_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 			g_passDraws = 0;
 		}
 		g_phase = IN_PASS;
-		g_scene = g_rt0;
+		g_scene = rt0;
 		g_depthRt = s;
 	}
 	else if (g_phase == IN_PASS)
 		g_phase = BETWEEN;
-}
-
-void Vol_AfterSetViewport(const D3DVIEWPORT9* vp)
-{
-	if (vp)
-		g_vp = *vp;
 }
 
 void Vol_AfterSetVertexShader(IDirect3DVertexShader9* vs) { g_curVs = vs; }
@@ -781,9 +563,9 @@ void Vol_BeforeDraw(IDirect3DDevice9* dev)
 			CaptureFromDraw(dev);
 		return;
 	}
-	if (g_phase != BETWEEN || g_rt0 != g_scene)
+	if (g_phase != BETWEEN || core::Scene().rt0 != g_scene)
 		return;
-	if (g_vp.MinZ >= 0.99f)
+	if (core::IsSkyViewport(core::Scene().viewport))
 		g_skySeen = true; // the sky (or the sun) behind everything
 	else if (g_skySeen && g_set.placement == 0)
 		Apply(dev);
@@ -818,7 +600,6 @@ void Vol_OnDeviceReady(IDirect3DDevice9* dev)
 {
 	(void)dev;
 	g_phase = IDLE;
-	g_rt0 = nullptr;
 	g_scene = g_depthRt = nullptr;
 	g_curVs = nullptr;
 	g_curPs = nullptr;
@@ -882,7 +663,7 @@ static void Apply(IDirect3DDevice9* dev)
 	if (FAILED(g_scene->GetContainer(kIID_Texture9, (void**)&sceneTex)))
 		sceneTex = nullptr;
 
-	const Camera& C = F.camera;
+	const core::CameraFloats& C = F.camera.f;
 	const bool fog = g_set.fogOn || g_set.view == 1 || g_set.view == 2;
 	const bool shadowed = F.shadow && F.light;
 

@@ -130,21 +130,21 @@ bool NegateSrc(DWORD s, DWORD& out)
 bool IdentityXyz(DWORD s) { return SwzComp(s, 0) == 0 && SwzComp(s, 1) == 1 && SwzComp(s, 2) == 2; }
 
 // Finds the combine and final instructions. fogSrc = 0 when the final instruction has no fog.
-bool FindIndirect(const DWORD* code, const std::vector<Inst>& insts, const std::vector<CtabVar>& vars, size_t& combI,
+bool FindIndirect(const DWORD* code, const std::vector<Inst>& insts, const core::ConstantTable& vars, size_t& combI,
 	size_t& finalI, DWORD indirect[2], DWORD& ambSrc, DWORD sun[2], DWORD& sunSrc, DWORD& fogSrc, std::string& why)
 {
 	Taint t;
-	if (const CtabVar* v = FindVar(vars, "g_AmbientCube", 2))
+	if (const core::ShaderConstant* v = vars.Find("g_AmbientCube", core::RS_FLOAT4))
 	{
-		t.ambLo = v->index;
-		t.ambHi = v->index + v->count;
+		t.ambLo = v->reg;
+		t.ambHi = v->reg + v->count;
 	}
-	if (const CtabVar* v = FindVar(vars, "g_WorldLightMapSampler", 3))
-		t.lmSampler = v->index;
-	if (const CtabVar* v = FindVar(vars, "g_ShadowSampler", 3))
-		t.shadowSampler = v->index;
-	if (const CtabVar* v = FindVar(vars, "g_CloudShadowSampler", 3))
-		t.cloudSampler = v->index;
+	if (const core::ShaderConstant* v = vars.Find("g_WorldLightMapSampler", core::RS_SAMPLER))
+		t.lmSampler = v->reg;
+	if (const core::ShaderConstant* v = vars.Find("g_ShadowSampler", core::RS_SAMPLER))
+		t.shadowSampler = v->reg;
+	if (const core::ShaderConstant* v = vars.Find("g_CloudShadowSampler", core::RS_SAMPLER))
+		t.cloudSampler = v->reg;
 	if (t.ambLo < 0 && t.lmSampler < 0)
 	{
 		why = "no ambient light inputs";
@@ -395,8 +395,8 @@ bool AO_RewritePS(const DWORD* code, std::vector<DWORD>& result, bool& matched, 
 		reason = "single render target";
 		return false;
 	}
-	std::vector<CtabVar> vars;
-	ReadCtabVars(code, insts, vars);
+	core::ConstantTable vars;
+	core::ReadConstantTable(code, vars);
 	int maxTemp;
 	bool constUsed[256];
 	if (!RegisterUsage(code, insts, vars, maxTemp, constUsed))
@@ -491,8 +491,7 @@ int AO_SunRegister(const DWORD* code)
 	size_t endPos = 0;
 	if (!code || !Parse(code, insts, endPos))
 		return -1;
-	std::vector<CtabVar> vars;
-	ReadCtabVars(code, insts, vars);
-	const CtabVar* v = FindVar(vars, "g_ShadowedDirect", 2);
-	return v ? v->index : -1; // m_Direction is its first member
+	core::ConstantTable vars;
+	core::ReadConstantTable(code, vars);
+	return vars.Register("g_ShadowedDirect", core::RS_FLOAT4); // m_Direction is its first member
 }

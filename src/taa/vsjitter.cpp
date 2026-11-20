@@ -1,5 +1,6 @@
 // See vsjitter.h. Token formats: d3d9types.h (D3DSHADER_PARAM_REGISTER_TYPE etc.).
 #include "vsjitter.h"
+#include "core/shaderinfo.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -61,41 +62,6 @@ bool HasDst(const Inst& in)
 
 bool IsConstType(int t) { return t == REG_CONST || t == REG_CONST2 || t == REG_CONST3 || t == REG_CONST4; }
 
-struct CtabFloat
-{
-	std::string name;
-	int index, count;
-};
-
-void ReadCtab(const DWORD* code, const std::vector<Inst>& insts, std::vector<CtabFloat>& vars, bool& found)
-{
-	found = false;
-	for (const Inst& in : insts)
-	{
-		if (in.op != OP_COMMENT || in.len < 8 || code[in.pos + 1] != 0x42415443) // 'CTAB'
-			continue;
-		found = true;
-		const unsigned char* base = (const unsigned char*)&code[in.pos + 2];
-		size_t size = (in.len - 1) * 4;
-		auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-		auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-		DWORD count = rd32(12), infoOff = rd32(16);
-		for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-		{
-			size_t e = infoOff + 20 * k;
-			DWORD nameOff = rd32(e);
-			if (rd16(e + 4) != 2) // float registers only
-				continue;
-			CtabFloat v;
-			v.index = rd16(e + 6);
-			v.count = rd16(e + 8);
-			for (size_t c = 0; c < 64 && nameOff + c < size && base[nameOff + c]; c++)
-				v.name += (char)base[nameOff + c];
-			vars.push_back(v);
-		}
-		return;
-	}
-}
 } // namespace
 
 bool VsJitter_Rewrite(const DWORD* code, std::vector<DWORD>& out, VsJitterInfo& info, std::string& reason)
@@ -129,20 +95,14 @@ bool VsJitter_Rewrite(const DWORD* code, std::vector<DWORD>& out, VsJitterInfo& 
 		i += 1 + in.len;
 	}
 
-	// Constant table: the camera matrices, and the float registers it names.
-	std::vector<CtabFloat> vars;
-	bool haveCtab = false;
-	ReadCtab(code, insts, vars, haveCtab);
+	// Constant table: the float registers it names.
+	core::ConstantTable table;
+	const bool haveCtab = core::ReadConstantTable(code, table, kMaxTokens);
 	bool constNamed[256] = {};
-	for (const CtabFloat& v : vars)
-	{
-		if (v.count == 4 && v.name == "g_WorldViewProj")
-			info.wvpReg = v.index;
-		if (v.count == 4 && v.name == "g_World")
-			info.worldReg = v.index;
-		for (int r = v.index; r < v.index + v.count && r < 256; r++)
-			constNamed[r] = true;
-	}
+	for (const core::ShaderConstant& v : table.constants)
+		if (v.set == core::RS_FLOAT4)
+			for (int r = v.reg; r < v.reg + v.count && r < 256; r++)
+				constNamed[r] = true;
 
 	// Position output, constants defined in the shader, temps used, our constant used?
 	if (major < 3)

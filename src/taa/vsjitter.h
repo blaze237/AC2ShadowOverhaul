@@ -28,12 +28,10 @@ struct VsJitterInfo
 	int posReg = -1;    // its number
 	int temp = -1;      // temp register the position goes through
 	size_t insertAt = 0; // token index (original code) where the two instructions are inserted
-	int wvpReg = -1;    // g_WorldViewProj (4 registers), -1 if not in the constant table
-	int worldReg = -1;  // g_World (4 registers)
 };
 
 // Returns true and fills `out` when the shader was rewritten; otherwise `reason` says why not.
-// `info` is filled as far as the analysis got (the matrices are found even when not rewritten).
+// `info` is filled as far as the analysis got.
 bool VsJitter_Rewrite(const DWORD* code, std::vector<DWORD>& out, VsJitterInfo& info, std::string& reason);
 
 } // namespace taa

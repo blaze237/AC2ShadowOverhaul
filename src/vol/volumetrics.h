@@ -67,7 +67,6 @@ void Vol_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code);
 void Vol_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code);
 void Vol_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
 void Vol_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
-void Vol_AfterSetViewport(const D3DVIEWPORT9* vp);
 void Vol_BeforeDraw(IDirect3DDevice9* dev);
 void Vol_AfterSetVertexShader(IDirect3DVertexShader9* vs);
 void Vol_AfterSetPixelShader(IDirect3DPixelShader9* ps);

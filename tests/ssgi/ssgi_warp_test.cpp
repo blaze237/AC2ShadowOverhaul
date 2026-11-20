@@ -27,7 +27,9 @@
 #include <vector>
 #include <utility>
 #include "ssgi/gi.h"
+#include "core/camera.h"
 using namespace ssgi;
+using namespace core;
 
 static const UINT W = 1280, H = 720, HW = W / 2, HH = H / 2;
 static const float P00 = 1.0f, P11 = (float)W / H, NEAR_ = 0.1f, FAR_ = 1000.0f;

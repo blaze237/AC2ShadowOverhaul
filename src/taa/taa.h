@@ -11,8 +11,8 @@
 // resolve runs first: this frame + reprojected history -> new history -> back into the scene
 // colour. Everything after (bloom, tone mapping, HUD) sees the anti-aliased image.
 //
-// Camera: ViewProj = g_WorldViewProj * g_World^-1 from the first opaque draw that has both (the
-// matrices in the constants are unjittered: the jitter is added in the shader).
+// Camera: this frame's and the history's (core/scene.h, core/camera.h). The matrices in the constants
+// are unjittered: the jitter is added in the shader.
 #pragma once
 
 #include <windows.h>
@@ -39,17 +39,6 @@ TaaSettings Taa_GetSettings();
 void Taa_SetSettings(const TaaSettings& s);
 const char* Taa_Status(); // one line for the menu: working, off, waiting for a 3D scene...
 
-// Camera from one draw's g_WorldViewProj and g_World (registers = matrix rows), and the matrix
-// taking this frame's view space to the previous frame's clip space (rows), for the resolve.
-struct TaaCamera
-{
-	bool ok = false;
-	double VP[4][4];                // view-projection, rows
-	double A, B, P00, P11, P02, P12; // z/w = A + B / z; ndc.x = P00 x / z + P02, ndc.y = P11 y / z + P12
-};
-bool Taa_CameraFromMatrices(const float wvp[16], const float world[16], TaaCamera& cam, char* why, size_t whySize);
-bool Taa_ReprojectionMatrix(const TaaCamera& cur, const TaaCamera& prev, float out[4][4]);
-
 // The original (unhooked) device functions, so our own calls don't go through the hooks.
 struct TaaDeviceFns
 {
@@ -68,8 +57,6 @@ void Taa_OnDeviceCreated(IDirect3D9* d3d, UINT adapter, IDirect3DDevice9* dev);
 
 // Vertex shaders: returns true with `out` set when the shader should be created from `out`.
 bool Taa_RewriteVS(const DWORD* code, std::vector<DWORD>& out, struct VsJitterInfo& info);
-void Taa_OnVertexShaderCreated(IDirect3DVertexShader9* vs, const struct VsJitterInfo& info);
-void Taa_OnSetVertexShader(IDirect3DVertexShader9* vs);
 
 // Device calls (After = after the call was passed on; Before = before).
 void Taa_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);

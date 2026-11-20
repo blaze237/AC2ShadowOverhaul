@@ -56,7 +56,6 @@ void Fx_BeforeCopyFrom(IDirect3DDevice9* dev, IDirect3DSurface9* src, bool stret
 void Fx_BeforeOther(IDirect3DDevice9* dev);              // ColorFill, Clear, EndScene
 void Fx_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
 void Fx_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0);
-void Fx_AfterSetViewport(const D3DVIEWPORT9* vp);
 void Fx_BeforeSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);
 void Fx_AfterSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);
 DWORD Fx_SamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value); // value to pass on
@@ -66,9 +65,9 @@ void Fx_AfterSetVertexShader(IDirect3DVertexShader9* vs);
 void Fx_AfterSetPixelShader(IDirect3DPixelShader9* ps);
 
 // Shaders. RewriteVS returns true with `out` set when the vertex shader should be created from it
-// (TAA jitter); `state` is passed back to OnCreateVertexShader.
-bool Fx_RewriteVS(const DWORD* code, std::vector<DWORD>& out, void*& state);
-void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode, void* state);
+// (TAA jitter). OnCreateVertexShader gets the game's code either way.
+bool Fx_RewriteVS(const DWORD* code, std::vector<DWORD>& out);
+void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode);
 // Adds the SSGI bounce light to `code` (the game's shader, possibly already rewritten for soft
 // shadows and AO). Returns false (out untouched) if it doesn't apply.
 bool Fx_RewritePSForGI(const DWORD* code, uint32_t hash, std::vector<DWORD>& out);

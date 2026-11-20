@@ -12,6 +12,7 @@
 #include "taa/taa.h"
 #include "taa/menu.h"
 #include "taa/vsjitter.h"
+#include "core/scene.h"
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -85,15 +86,7 @@ void Fx_SetDeviceFns(const FxDeviceFns& f)
 // while the game's own anti-aliasing (MSAA) is on; each effect switches itself off then. Rather
 // than leave that in the log, a red warning is drawn while it happens and any of them is on.
 
-static bool g_ppMsaa = false;          // the back buffer is multisampled
-static volatile LONG g_sceneMsaaFrame = -1000; // last frame the main pass was seen multisampled
-static LONG g_frame = 0;
-
-static bool IsMultisampled(IDirect3DSurface9* s)
-{
-	D3DSURFACE_DESC d;
-	return s && SUCCEEDED(s->GetDesc(&d)) && d.MultiSampleType != D3DMULTISAMPLE_NONE;
-}
+static bool g_ppMsaa = false; // the back buffer is multisampled (the main pass is checked by core/scene)
 
 static void NotePresentParams(const D3DPRESENT_PARAMETERS* pp)
 {
@@ -101,18 +94,6 @@ static void NotePresentParams(const D3DPRESENT_PARAMETERS* pp)
 	if (g_ppMsaa)
 		LogWarn("The back buffer is multisampled (in-game anti-aliasing is on): ambient occlusion, contact shadows, SSGI, "
 				"volumetrics and TAA need it off.");
-}
-
-// The main pass binds an R32F z/w target as render target 1 next to the scene colour.
-static void CheckMainPass(DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0)
-{
-	if (index != 1 || !s)
-		return;
-	D3DSURFACE_DESC d;
-	if (FAILED(s->GetDesc(&d)) || d.Format != D3DFMT_R32F || !(d.Usage & D3DUSAGE_RENDERTARGET))
-		return;
-	if (d.MultiSampleType != D3DMULTISAMPLE_NONE || IsMultisampled(rt0))
-		g_sceneMsaaFrame = g_frame;
 }
 
 // The effects that are on and need MSAA off, as a list for the warning ("" if none).
@@ -192,7 +173,7 @@ static bool EnsureWarnFont(IDirect3DDevice9* dev, UINT bbHeight)
 
 static void DrawWarning(IDirect3DDevice9* dev, unsigned bbW, unsigned bbH)
 {
-	bool msaa = g_ppMsaa || g_frame - g_sceneMsaaFrame < 120;
+	bool msaa = g_ppMsaa || core::Scene_MsaaRecently();
 	if (!msaa || !bbW || !bbH)
 		return;
 	std::string effects = MsaaBlockedEffects();
@@ -249,7 +230,8 @@ void Fx_OnDeviceCreated(IDirect3D9* d3d, UINT adapter, IDirect3DDevice9* dev, DW
 {
 	NotePresentParams(pp);
 	if (flags & D3DCREATE_PUREDEVICE)
-		LogWarn("The device is a pure device: shader constants can't be read back, so SSGI, volumetrics and TAA can't find the camera.");
+		LogWarn("The device is a pure device: shader constants can't be read back, so ambient occlusion, contact shadows, SSGI, "
+				"volumetrics and TAA can't find the camera.");
 	if (g_vol)
 		vol::Vol_OnDeviceReady(dev);
 	if (g_taa)
@@ -307,7 +289,6 @@ void Fx_BeforePresent(IDirect3DDevice9* dev)
 		vol::Vol_BeforePresent(dev);
 	if (g_taa)
 		taa::Taa_OnPresent(dev);
-	g_frame++;
 }
 
 void Fx_DrawOverlays(IDirect3DDevice9* dev, unsigned bbW, unsigned bbH)
@@ -366,19 +347,12 @@ void Fx_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 void Fx_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 {
 	FxScope scope;
-	CheckMainPass(index, s, rt0);
 	if (g_gi && index < 4)
 		ssgi::GI_AfterSetRenderTarget(dev, index, s, rt0);
 	if (g_vol)
 		vol::Vol_AfterSetRenderTarget(dev, index, s);
 	if (g_taa)
 		taa::Taa_AfterSetRenderTarget(dev, index, s);
-}
-
-void Fx_AfterSetViewport(const D3DVIEWPORT9* vp)
-{
-	if (g_vol)
-		vol::Vol_AfterSetViewport(vp);
 }
 
 void Fx_BeforeSetTexture(DWORD stage, IDirect3DBaseTexture9* tex)
@@ -409,7 +383,7 @@ void Fx_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DP
 	FxScope scope;
 	(void)ps;
 	if (g_gi)
-		ssgi::GI_BeforeDraw(dev, vs);
+		ssgi::GI_BeforeDraw(dev);
 	if (g_vol)
 		vol::Vol_BeforeDraw(dev);
 	if (g_taa)
@@ -420,8 +394,6 @@ void Fx_AfterSetVertexShader(IDirect3DVertexShader9* vs)
 {
 	if (g_vol)
 		vol::Vol_AfterSetVertexShader(vs);
-	if (g_taa)
-		taa::Taa_OnSetVertexShader(vs);
 }
 
 void Fx_AfterSetPixelShader(IDirect3DPixelShader9* ps)
@@ -432,29 +404,18 @@ void Fx_AfterSetPixelShader(IDirect3DPixelShader9* ps)
 
 // ---- Shaders -----------------------------------------------------------------------------------
 
-bool Fx_RewriteVS(const DWORD* code, std::vector<DWORD>& out, void*& state)
+bool Fx_RewriteVS(const DWORD* code, std::vector<DWORD>& out)
 {
-	state = nullptr;
 	if (!g_taa || !code)
 		return false;
-	taa::VsJitterInfo* info = new taa::VsJitterInfo();
-	state = info;
-	return taa::Taa_RewriteVS(code, out, *info);
+	taa::VsJitterInfo info;
+	return taa::Taa_RewriteVS(code, out, info);
 }
 
-void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode, void* state)
+void Fx_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* gameCode)
 {
-	taa::VsJitterInfo* info = (taa::VsJitterInfo*)state;
-	if (vs && gameCode)
-	{
-		if (g_gi)
-			ssgi::GI_OnCreateVertexShader(vs, gameCode);
-		if (g_vol)
-			vol::Vol_OnCreateVertexShader(vs, gameCode);
-		if (g_taa && info)
-			taa::Taa_OnVertexShaderCreated(vs, *info);
-	}
-	delete info;
+	if (vs && gameCode && g_vol)
+		vol::Vol_OnCreateVertexShader(vs, gameCode);
 }
 
 static LONG g_giRewritten = 0, g_giSkipped = 0;

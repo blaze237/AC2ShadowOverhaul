@@ -80,12 +80,11 @@ struct AoDeviceFns
 };
 void AO_SetDeviceFns(const AoDeviceFns& fns);
 
-void AO_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code); // remembers where the matrices are
 void AO_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code);    // remembers where the sun direction is
 // Render target changes: Before may apply AO (returns true if it did); After binds/unbinds ours.
 bool AO_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s);
 void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0);
-bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps); // true if AO was applied first
+bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps); // true if AO was applied first
 bool AO_InPass();                             // our target is bound (the opaque pass is drawing)
 bool AO_BeforeOther(IDirect3DDevice9* dev);   // Clear, StretchRect, ColorFill, EndScene...
 bool AO_BeforePresent(IDirect3DDevice9* dev); // also ends the frame

@@ -3,13 +3,16 @@
 # Builds dist/scripts/AC2ShadowOverhaul.asi once (build.sh), then runs every suite and exits non-zero
 # if any check failed:
 #
+#  Shared core (tests/core/)
+#   - the camera maths (bit for bit what the effects computed before they shared it) and the
+#     reprojection helpers; the constant table reader on our shaders and the game's (*)
 #  Shadows, soft shadows, ambient occlusion, contact shadows, frame dump (tests/)
 #   - end to end (fdtest/): the .asi in a fake AssassinsCreedIIGame.exe over the mock d3d9.dll; the
 #     shader rewrite, the F9 menu (frame dump, on/off switches, soft shadow width), ini saving
 #   - the AO shaders on WARP (D3D11's software renderer, part of Windows) over a synthetic scene
 #   - soft shadow and AO output rewrites on the game's real pixel shaders (*)
 #  SSGI (tests/ssgi/)
-#   - camera / reprojection maths; the SSGI passes on WARP; the rewrite on the game's shaders (*),
+#   - the SSGI passes on WARP; the rewrite on the game's shaders (*),
 #     also stacked on the soft shadow and AO rewrites
 #   - end to end: SSGI alone, then with every effect on
 #  Volumetric fog and sun shafts (tests/vol/)
@@ -43,6 +46,8 @@ FLAGS="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEA
 # The feature suites build from their own folders.
 SUB="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -fms-extensions -fasm-blocks -I.. -I../../src -fuse-ld=lld -static"
 TESTS="$(pwd)"
+# The shared core, for tests that link an effect's code (paths from a suite's folder).
+CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp"
 OUT="$TESTS/run_tests.out"
 
 # A Windows path for a folder (the tests are Windows programs), or "" if it doesn't exist.
@@ -111,6 +116,15 @@ if ! (cd .. && sh build.sh "$TCARG" >/dev/null); then
 fi
 build "mock d3d9.dll" $CXX -O2 -w -fuse-ld=lld -static -shared -Wl,--kill-at -o mockd3d/d3d9.dll mockd3d/mock_d3d9.cpp || exit 1
 
+# ---- Shared core -----------------------------------------------------------------------------------
+
+cd core
+build "camera test" $CXX $SUB -o camera_test.exe camera_test.cpp ../../src/core/camera.cpp &&
+	run "core: camera / reprojection maths" . -- ./camera_test.exe
+build "constant table test" $CXX $SUB -o shaderinfo_test.exe shaderinfo_test.cpp ../../src/core/shaderinfo.cpp &&
+	run "core: constant tables (our shaders and the game's)" . -- ./shaderinfo_test.exe "$SHADERS" "$VS_SHADERS"
+cd ..
+
 # ---- Shadows, soft shadows, AO, contact shadows, frame dump ---------------------------------------
 
 mkdir -p fdtest/scripts
@@ -140,18 +154,16 @@ fi
 # ---- SSGI ------------------------------------------------------------------------------------------
 
 cd ssgi
-build "gimath test" $CXX $SUB -o gimath_test.exe gimath_test.cpp ../../src/ssgi/gimath.cpp &&
-	run "SSGI: camera / reprojection maths" . -- ./gimath_test.exe
-build "SSGI WARP test" $CXX $SUB -o ssgi_warp_test.exe ssgi_warp_test.cpp ../../src/ssgi/gimath.cpp -ld3d11 &&
+build "SSGI WARP test" $CXX $SUB -o ssgi_warp_test.exe ssgi_warp_test.cpp ../../src/core/camera.cpp -ld3d11 &&
 	run "SSGI: passes on WARP" . -- ./ssgi_warp_test.exe
 if [ -n "$SHADERS" ]; then
 	build "gishader test" $CXX $SUB -Wno-unused -DWITH_OVERHAUL -o gishader_test.exe gishader_test.cpp ../../src/ssgi/gishader.cpp \
-		../../src/softshadows.cpp ../../src/aoshader.cpp ../../src/common.cpp &&
+		../../src/softshadows.cpp ../../src/aoshader.cpp ../../src/common.cpp ../../src/core/shaderinfo.cpp &&
 		run "SSGI: rewrite on the game's shaders (alone and stacked on soft shadows + AO)" . '$p' -- ./gishader_test.exe "$SHADERS"
 else
 	echo "== SSGI: shader rewrite test skipped (no exported shaders in ../re/shaders/dump)"
 fi
-if build "SSGI end to end" $CXX $SUB -o e2e_test.exe e2e_test.cpp ../../src/ssgi/gimath.cpp -ld3d9; then
+if build "SSGI end to end" $CXX $SUB -o e2e_test.exe e2e_test.cpp ../../src/core/camera.cpp -ld3d9; then
 	(cd .. && e2e_dir ssgi/e2e)
 	mv e2e_test.exe e2e/AssassinsCreedIIGame.exe
 	run "SSGI: end to end, alone" e2e -- ./AssassinsCreedIIGame.exe
@@ -178,7 +190,7 @@ cd ..
 # ---- TAA -------------------------------------------------------------------------------------------
 
 cd taa
-if build "vsjitter test" $CXX $SUB -o vsjitter_test.exe vsjitter_test.cpp ../../src/taa/vsjitter.cpp -ld3d9; then
+if build "vsjitter test" $CXX $SUB -o vsjitter_test.exe vsjitter_test.cpp ../../src/taa/vsjitter.cpp ../../src/core/shaderinfo.cpp -ld3d9; then
 	if [ -n "$VS_SHADERS" ]; then
 		run "TAA: vertex shader jitter rewrite (synthetic and the game's shaders)" . '/^    \|rewritten$/!p' -- ./vsjitter_test.exe "$VS_SHADERS"
 	else
@@ -186,9 +198,10 @@ if build "vsjitter test" $CXX $SUB -o vsjitter_test.exe vsjitter_test.cpp ../../
 			'/^    \|rewritten$/!p' -- ./vsjitter_test.exe ./no-shaders
 	fi
 fi
-build "TAA WARP test" $CXX $SUB -o taa_warp_test.exe taa_warp_test.cpp ../../src/taa/taa.cpp ../../src/common.cpp ../../src/taa/vsjitter.cpp -ld3d11 &&
+build "TAA WARP test" $CXX $SUB -o taa_warp_test.exe taa_warp_test.cpp ../../src/core/camera.cpp -ld3d11 &&
 	run "TAA: shaders on WARP" . -- ./taa_warp_test.exe
-build "TAA menu test" $CXX $SUB -o menu_test.exe menu_test.cpp ../../src/taa/taa.cpp ../../src/common.cpp ../../src/taa/vsjitter.cpp &&
+build "TAA menu test" $CXX $SUB -o menu_test.exe menu_test.cpp ../../src/taa/taa.cpp ../../src/common.cpp ../../src/taa/vsjitter.cpp \
+	$CORE &&
 	run "TAA: menu (input and saving)" . -- ./menu_test.exe
 if build "TAA end to end" $CXX $SUB -o e2e_test.exe e2e_test.cpp -ld3d9; then
 	(cd .. && e2e_dir taa/e2e)
