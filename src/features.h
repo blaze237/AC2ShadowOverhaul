@@ -41,7 +41,7 @@ void Fx_BeforeSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);
 void Fx_AfterSetTexture(DWORD stage, IDirect3DBaseTexture9* tex);
 DWORD Fx_SamplerState(DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value); // value to pass on
 void Fx_AfterVertexConstants(IDirect3DDevice9* dev, UINT start, UINT count);
-void Fx_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps);
+void Fx_BeforeDraw(IDirect3DDevice9* dev);
 void Fx_AfterSetVertexShader(IDirect3DVertexShader9* vs);
 void Fx_AfterSetPixelShader(IDirect3DPixelShader9* ps);
 

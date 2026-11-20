@@ -1481,7 +1481,7 @@ static void BeforeDraw(IDirect3DDevice9* dev)
 {
 	core::Scene_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs);
 	NoteAO(AO_BeforeDraw(dev, (IDirect3DPixelShader9*)g_ps));
-	Fx_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps);
+	Fx_BeforeDraw(dev);
 	if (AO_InPass() && g_ps)
 	{
 		static int logged = 0;

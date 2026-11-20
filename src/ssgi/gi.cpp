@@ -15,7 +15,6 @@
 #include "core/fxpass.h"
 #include <math.h>
 #include <stdio.h>
-#include <unordered_map>
 
 namespace ssgi
 {

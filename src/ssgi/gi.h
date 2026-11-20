@@ -92,7 +92,7 @@ extern GiRewriteLayout g_giLastLayout;
 // The camera and the reprojection rows for c216-c218 come from core/camera.h (ReprojectionRows,
 // IdentityRows), the camera of each frame from core/scene.h.
 
-// ---- Device side (called from the hooks in hooks.cpp) -------------------------------------------
+// ---- Device side (called from the hooks, framedump.cpp, through features.cpp) -------------------
 
 // Our own device calls go to the original (unhooked) functions (core/fxpass.h).
 

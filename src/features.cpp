@@ -248,10 +248,9 @@ void Fx_AfterVertexConstants(IDirect3DDevice9* dev, UINT start, UINT count)
 		taa::Taa_AfterVertexConstants(dev, start, count);
 }
 
-void Fx_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps)
+void Fx_BeforeDraw(IDirect3DDevice9* dev)
 {
 	FxScope scope;
-	(void)ps;
 	if (g_gi)
 		ssgi::GI_BeforeDraw(dev);
 	if (g_vol)
