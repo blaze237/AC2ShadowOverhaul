@@ -26,6 +26,10 @@ enum
 	ITEM_AO_STRENGTH,
 	ITEM_CS_ON,
 	ITEM_CS_LENGTH,
+	ITEM_CH_ON,
+	ITEM_CH_SCALE,
+	ITEM_CH_MIN,
+	ITEM_CH_MAX,
 	ITEM_ALL_ON,     // master switch for every effect; not saved
 	ITEM_FRAME_DUMP, // writes a frame dump ([Debug] FrameDump=1 only); not a setting
 	ITEM_COUNT
@@ -41,6 +45,10 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "AO strength", "AmbientOcclusion", "Strength", true },
 	{ "Contact shadows", "ContactShadows", "StartEnabled", true },
 	{ "Contact shadow length", "ContactShadows", "Length", true },
+	{ "Contact hardening", "SoftShadows", "ContactHardening", true },
+	{ "Hardening penumbra", "SoftShadows", "PenumbraScale", true },
+	{ "Hardening min width", "SoftShadows", "MinWidth", true },
+	{ "Hardening max width", "SoftShadows", "MaxWidth", true },
 	{ "All shadow effects", nullptr, nullptr, true },
 	{ "Frame dump", nullptr, nullptr, false },
 };
@@ -133,6 +141,18 @@ protected:
 		case ITEM_CS_LENGTH:
 			snprintf(buf, n, "%.2f", CS_Length());
 			break;
+		case ITEM_CH_ON:
+			snprintf(buf, n, "%d", SoftShadows_ContactHardening() ? 1 : 0);
+			break;
+		case ITEM_CH_SCALE:
+			snprintf(buf, n, "%.3f", SoftShadows_Pcss().penumbraScale);
+			break;
+		case ITEM_CH_MIN:
+			snprintf(buf, n, "%.2f", SoftShadows_Pcss().minWidth);
+			break;
+		case ITEM_CH_MAX:
+			snprintf(buf, n, "%.2f", SoftShadows_Pcss().maxWidth);
+			break;
 		default:
 			buf[0] = 0;
 			break;
@@ -159,7 +179,9 @@ protected:
 				snprintf(buf, n, "x%.1f", Shadows_GetSetting(item));
 			break;
 		case ITEM_SOFT_WIDTH:
-			if (SoftWidth())
+			if (SoftWidth() && SoftShadows_ContactHardening())
+				snprintf(buf, n, "%d (contact hardening sets it)", SoftWidth());
+			else if (SoftWidth())
 				snprintf(buf, n, "%d (%d taps)", SoftWidth(), (SoftWidth() + 1) * (SoftWidth() + 1));
 			else
 				snprintf(buf, n, "OFF (game's filter)");
@@ -178,6 +200,18 @@ protected:
 			break;
 		case ITEM_CS_LENGTH:
 			snprintf(buf, n, "%.2f m", CS_Length());
+			break;
+		case ITEM_CH_ON:
+			snprintf(buf, n, "%s", !SoftShadows_ContactHardening() ? "OFF" : SoftWidth() ? "ON" : "ON (soft shadows off)");
+			break;
+		case ITEM_CH_SCALE:
+			snprintf(buf, n, "%.3f m per m", SoftShadows_Pcss().penumbraScale);
+			break;
+		case ITEM_CH_MIN:
+			snprintf(buf, n, "%.2f texels", SoftShadows_Pcss().minWidth);
+			break;
+		case ITEM_CH_MAX:
+			snprintf(buf, n, "%.2f texels", SoftShadows_Pcss().maxWidth);
 			break;
 		case ITEM_ALL_ON:
 			snprintf(buf, n, "%s", g_allOn ? "ON" : "OFF (vanilla)");
@@ -238,6 +272,22 @@ protected:
 			// 0.05 m steps up to half a metre, 0.25 m above
 			CS_SetLength(CS_Length() + ((dir > 0 ? CS_Length() < 0.499f : CS_Length() < 0.501f) ? 0.05f : 0.25f) * dir);
 			return true;
+		case ITEM_CH_ON:
+			SoftShadows_SetContactHardening(dir > 0);
+			return true;
+		case ITEM_CH_SCALE:
+		case ITEM_CH_MIN:
+		case ITEM_CH_MAX:
+		{
+			// Penumbra: 0.005 steps up to 0.05, 0.01 above; widths: quarter texels.
+			SoftShadowsPcss p = SoftShadows_Pcss();
+			if (item == ITEM_CH_SCALE)
+				p.penumbraScale += ((dir > 0 ? p.penumbraScale < 0.0499f : p.penumbraScale < 0.0501f) ? 0.005f : 0.01f) * dir;
+			else
+				(item == ITEM_CH_MIN ? p.minWidth : p.maxWidth) += 0.25f * dir;
+			SoftShadows_SetPcss(p);
+			return true;
+		}
 		case ITEM_ALL_ON:
 			SetAllOn(dir > 0);
 			return true;

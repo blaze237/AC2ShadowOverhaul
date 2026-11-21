@@ -23,6 +23,9 @@ lighting effects the 2009 renderer never had.
 - **Soft shadows.** The game blends shadow edges across a single shadow-map texel, which looks
   blocky once the shadows are stretched. This widens that blend to 2-4 texels (up to 25 samples)
   by rewriting the game's shadow shaders as they load. The cascades stay seam-free.
+  Optional contact hardening (`[SoftShadows] ContactHardening`, off by default) varies that width
+  with the distance to each shadow's caster: sharp where an object meets the ground, softer
+  further away. The width is worked out in metres, so it matches across cascade boundaries.
 - **Crash fix.** The game keeps shadow casters in fixed-size lists with no bounds check, so long
   shadow distances crashed it. The lists are enlarged, and anything that still doesn't fit is
   skipped instead of corrupting memory.
@@ -158,7 +161,9 @@ Every change applies at once and is saved to the ini a second later. The excepti
 comparison switches, which aren't saved: "All shadow effects" in the F9 menu switches the shadow
 tweaks, soft shadows, ambient occlusion and contact shadows off and back on for a quick comparison
 with vanilla, and "All volumetric effects" in the F11 menu does the same for the fog and shafts.
-Soft shadow width 0 is the game's own filter. With `[Debug] FrameDump=1` the last entry of the F9
+Soft shadow width 0 is the game's own filter; contact hardening only applies while soft shadows are
+on, and a change to its penumbra or widths rebuilds the shadow shaders a moment after the last key
+press (a short hitch). With `[Debug] FrameDump=1` the last entry of the F9
 menu, "Frame dump", writes a frame dump (diagnostic); `[Debug] FrameDumpKey` can also give it a
 hotkey for debugging (off by default).
 
@@ -198,6 +203,10 @@ generate yourself from your own copy of the game; none of the game's code or dat
   visibility-distance setter; the render list capacity patch and its guards are in `src/shadows.cpp`.
 - Soft shadows (`src/softshadows.cpp`) rewrite the SM3 pixel shaders that sample the shadow atlas,
   replacing the game's 4-tap bilinear filter with an N x N box filter clamped to each cascade's tile.
+  Contact hardening is a variant of its own: one read of the 5 x 5 texels around the sample finds
+  the blockers and their mean distance above the receiver (via `g_ShadowNearFar`), the penumbra in
+  metres becomes texels through the cascade's `g_ShadowScalesX`, and a box of that continuous
+  width is filtered over the same texels.
 - Ambient occlusion and contact shadows (`src/ao.cpp`, `src/shaders/ao.hlsl`) and SSGI (`src/ssgi`)
   share one shader rewrite (`src/litshader.cpp`): one dataflow analysis traces each opaque shader's
   baked indirect light and shadowed sun light from the ambient cube / world lightmap and the shadow

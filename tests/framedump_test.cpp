@@ -492,6 +492,59 @@ int main()
 		printf("debug menu save: FilterWidth %d right after the key, %d a second later: %s\n", before, after,
 			before == 3 && after == 2 ? "yes" : "NO");
 		WritePrivateProfileStringA("SoftShadows", "FilterWidth", "3", ini); // leave the test ini as it was
+
+		// Contact hardening (off in the ini): the menu item after "Contact shadow length" (0, then
+		// Down) switches the game's shader to its contact hardening variant, live.
+		press('5');
+		press(VK_RIGHT); // back to width 3, the variant handed to the game
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		bool plainAgain = cur == gp;
+		press('0');
+		press(VK_DOWN);
+		press(VK_RIGHT);
+		dev->SetPixelShader(gp);
+		IDirect3DPixelShader9* pcss = nullptr;
+		dev->GetPixelShader(&pcss);
+		UINT pcssSize = 0;
+		if (pcss)
+			pcss->GetFunction(nullptr, &pcssSize);
+		printf("contact hardening on: device has another variant (%u bytes; width 3 %u): %s\n", pcssSize, got,
+			plainAgain && pcss && pcss != gp && pcssSize > got ? "yes" : "NO");
+		// Penumbra (the next item) up: once the setting has settled the variant is rebuilt.
+		press(VK_DOWN);
+		press(VK_RIGHT);
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		bool notYet = cur == pcss;
+		Sleep(400);
+		dev->SetPixelShader(gp);
+		IDirect3DPixelShader9* rebuilt = nullptr;
+		dev->GetPixelShader(&rebuilt);
+		UINT rebuiltSize = 0;
+		if (rebuilt)
+			rebuilt->GetFunction(nullptr, &rebuiltSize);
+		printf("contact hardening penumbra changed: same variant until it settles, then a rebuilt one (%u bytes): %s\n", rebuiltSize,
+			notYet && rebuilt && rebuilt != pcss && rebuilt != gp && rebuiltSize == pcssSize ? "yes" : "NO");
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		printf("contact hardening: the rebuilt variant is kept (not rebuilt again): %s\n", cur == rebuilt ? "yes" : "NO");
+		// Off again: the game's shader (plain width 3).
+		press(VK_UP);
+		press(VK_LEFT);
+		dev->SetPixelShader(gp);
+		dev->GetPixelShader(&cur);
+		printf("contact hardening off: device has the game's shader: %s\n", cur == gp ? "yes" : "NO");
+		Sleep(1200);
+		dev->Present(NULL, NULL, NULL, NULL);
+		char scale[32] = {};
+		GetPrivateProfileStringA("SoftShadows", "PenumbraScale", "", scale, sizeof(scale), ini);
+		printf("contact hardening saved to the ini (ContactHardening %d, PenumbraScale %s): %s\n",
+			GetPrivateProfileIntA("SoftShadows", "ContactHardening", -1, ini), scale,
+			GetPrivateProfileIntA("SoftShadows", "ContactHardening", -1, ini) == 0 && strcmp(scale, "0.045") == 0 ? "yes" : "NO");
+		// Leave the test ini as it was.
+		WritePrivateProfileStringA("SoftShadows", "ContactHardening", NULL, ini);
+		WritePrivateProfileStringA("SoftShadows", "PenumbraScale", NULL, ini);
 	} while (0);
 
 	// [Debug] FrameDumpKey (F8 here; off by default): a second dump without the menu.

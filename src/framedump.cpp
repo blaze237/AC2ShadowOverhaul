@@ -289,19 +289,25 @@ static std::string SurfName(IDirect3DSurface9* s, bool full)
 static std::unordered_map<void*, uint32_t> g_psHash;
 static std::unordered_map<void*, uint32_t> g_vsHash;
 // Soft shadows: shader handed to the game (rewritten) -> the game's original shader, used when
-// soft shadows are toggled off and for exporting the original bytecode.
+// soft shadows are toggled off and for exporting the original bytecode, and the other variants
+// the menu switches to.
 struct SoftSet
 {
 	IDirect3DPixelShader9* original = nullptr; // owned
-	IDirect3DPixelShader9* byWidth[5] = {};    // owned, except byWidth[returned] (the game's)
-	int returned = 0;                          // width of the shader handed to the game
+	IDirect3DPixelShader9* byWidth[5] = {};    // owned, except the one handed to the game
+	IDirect3DPixelShader9* pcss = nullptr;     // contact hardening; owned, except when handed to the game
+	IDirect3DPixelShader9* handed = nullptr;   // the shader the game holds (not owned)
+	int pcssVersion = 0;                       // the contact hardening settings `pcss` was built with
+	std::vector<DWORD> code;                   // the game's bytecode, to rebuild `pcss` (menu only)
 	void Release()
 	{
 		if (original)
 			original->Release();
 		for (int w = 1; w <= 4; w++)
-			if (byWidth[w] && w != returned)
+			if (byWidth[w] && byWidth[w] != handed)
 				byWidth[w]->Release();
+		if (pcss && pcss != handed)
+			pcss->Release();
 	}
 };
 static std::unordered_map<void*, SoftSet> g_softOriginal;
@@ -1916,6 +1922,30 @@ static HRESULT CreatePs(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixel
 	return o_CreatePixelShader(dev, code, out);
 }
 
+// The contact hardening variant of a shader the plain soft shadow rewrite took, or null (it then
+// keeps the plain filter, which the menu falls back to).
+static LONG g_pcssSkipped = 0;
+static IDirect3DPixelShader9* CreatePcss(IDirect3DDevice9* dev, const DWORD* code, const SoftShadowsPcss& p, int* kind, std::string* why)
+{
+	std::vector<DWORD> v;
+	std::string reason;
+	if (!SoftShadows_RewritePcss(code, p, v, reason))
+	{
+		if (InterlockedIncrement(&g_pcssSkipped) <= 10)
+			LogInfo("Contact hardening: shader %08X keeps the plain soft shadow filter (%s).", HashShader(code), reason.c_str());
+		return nullptr;
+	}
+	IDirect3DPixelShader9* ps = nullptr;
+	HRESULT hr = CreatePs(dev, v.data(), &ps, kind, why);
+	if (FAILED(hr) || !ps)
+	{
+		if (InterlockedIncrement(&g_pcssSkipped) <= 10)
+			LogWarn("Contact hardening: the driver rejected shader %08X (0x%08lX); it keeps the plain soft shadow filter.", HashShader(code), hr);
+		return nullptr;
+	}
+	return ps;
+}
+
 static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out)
 {
 	FX_PASSTHROUGH(CreatePixelShader, code, out);
@@ -1941,8 +1971,32 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 			else
 			{
 				haveSet = true;
-				set.returned = width;
+				set.handed = *out;
 				set.byWidth[width] = *out;
+				// Contact hardening: handed to the game instead when on at start (the plain width
+				// variant stays, for the menu and as the fallback), built too when the menu can switch
+				// to it; the menu's settings changes rebuild it from the game's code.
+				if (SoftShadows_ContactHardeningAtStart() || SoftShadows_BuildAllWidths())
+				{
+					SoftShadowsPcss p;
+					set.pcssVersion = SoftShadows_PcssBuilt(&p);
+					int pcssKind = 0;
+					std::string pcssWhy;
+					set.pcss = CreatePcss(dev, code, p, &pcssKind, &pcssWhy);
+					if (set.pcss && SoftShadows_ContactHardeningAtStart())
+					{
+						set.handed = *out = set.pcss;
+						aoKind = pcssKind;
+						aoWhy = pcssWhy;
+					}
+					if (set.pcss && SoftShadows_BuildAllWidths())
+						for (size_t i = 0; i < (1u << 20); i++)
+						{
+							set.code.push_back(code[i]);
+							if (code[i] == 0x0000FFFF)
+								break;
+						}
+				}
 				// The game's filter (F6) and the debug menu's other widths. Each gets the AO output too,
 				// as any of them may be drawn in the opaque pass.
 				if (FAILED(CreatePs(dev, code, &set.original, nullptr, nullptr)))
@@ -2067,15 +2121,53 @@ static HRESULT __stdcall h_SetPixelShader(IDirect3DDevice9* dev, IDirect3DPixelS
 	{
 		bool active = SoftShadows_Active();
 		int width = SoftShadows_LiveWidth();
-		if (!active || width != SoftShadows_Width())
+		bool ch = SoftShadows_ContactHardening();
+		int version = ch ? SoftShadows_PcssBuilt(nullptr) : 0;
+		if (!active || width != SoftShadows_Width() || ch != SoftShadows_ContactHardeningAtStart() || version != 0)
 		{
-			Lock l;
-			auto it = g_softOriginal.find(ps);
-			if (it != g_softOriginal.end())
+			std::vector<DWORD> rebuild;
 			{
-				IDirect3DPixelShader9* sub = active ? it->second.byWidth[width] : it->second.original;
-				if (sub)
-					ps = sub;
+				Lock l;
+				auto it = g_softOriginal.find(ps);
+				if (it != g_softOriginal.end())
+				{
+					SoftSet& set = it->second;
+					if (active && ch && set.pcssVersion != version && !set.code.empty())
+						rebuild = set.code;
+					else
+					{
+						IDirect3DPixelShader9* sub = !active ? set.original : ch && set.pcss ? set.pcss : set.byWidth[width];
+						if (sub)
+							ps = sub;
+					}
+				}
+			}
+			if (!rebuild.empty())
+			{
+				// The contact hardening settings changed in the menu: this shader's variant is rebuilt
+				// when it is first drawn with them (outside the lock: it creates shaders).
+				SoftShadowsPcss p;
+				version = SoftShadows_PcssBuilt(&p);
+				IDirect3DPixelShader9* fresh = CreatePcss(dev, rebuild.data(), p, nullptr, nullptr);
+				Lock l;
+				auto it = g_softOriginal.find(ps);
+				if (it != g_softOriginal.end())
+				{
+					SoftSet& set = it->second;
+					if (fresh)
+					{
+						if (set.pcss && set.pcss != set.handed)
+							set.pcss->Release();
+						set.pcss = fresh;
+						fresh = nullptr;
+					}
+					set.pcssVersion = version; // also when it failed: keep the old variant, don't retry every draw
+					IDirect3DPixelShader9* sub = set.pcss ? set.pcss : set.byWidth[width];
+					if (sub)
+						ps = sub;
+				}
+				if (fresh)
+					fresh->Release();
 			}
 		}
 	}
