@@ -13,6 +13,10 @@
 //
 // Camera: this frame's and the history's (core/scene.h, core/camera.h). The matrices in the constants
 // are unjittered: the jitter is added in the shader.
+//
+// The other effects: TAA reports its jitter (what c255 holds) and that it runs this frame to the
+// scene tracker (core::Scene_TaaJitter / Scene_TaaFrame), and the effects read it from there:
+// they reconstruct positions from the jittered z/w target with the jittered projection.
 #pragma once
 
 #include <windows.h>

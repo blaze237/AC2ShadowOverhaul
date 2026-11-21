@@ -14,6 +14,12 @@
 // the real game frame and stay with the effects. What they share comes from here: the main pass, the
 // camera, and the sun and fog of the game's lighting (contact shadows and the volumetrics both use
 // the sun direction; they used to read it each on their own).
+//
+// TAA (taa/taa.h) moves the scene draws by a sub-pixel offset each frame and averages the frames.
+// What the other effects need to know about that is here too (SceneState::taa, rasterCamera),
+// reported by TAA through Scene_TaaJitter / Scene_TaaFrame: the effects never ask TAA itself. They
+// work without it; with it they reconstruct positions from the jittered z/w target with the jittered
+// projection.
 #pragma once
 
 #include <windows.h>
@@ -40,6 +46,37 @@ ZwBinding InspectRt1(IDirect3DSurface9* s, IDirect3DSurface9* rt0);
 // The sky (and the sun) is drawn behind everything with the viewport's depth range at 1..1.
 inline bool IsSkyViewport(const D3DVIEWPORT9& vp) { return vp.MinZ >= 0.99f; }
 
+// TAA as the other effects see it, for one frame.
+//
+// Timing: TAA decides a frame's jitter at the Present before it, puts it into c255 when the game
+// binds a scene-sized target, and resolves at the first read of the scene colour, after every other
+// effect. `running`, `historyValid` and `frame` are set when TAA recognises this frame's
+// main pass (the first binding of its z/w target); the jitter when the camera is read (the first
+// opaque draw with the camera matrices, which already has the jitter in c255). Both come before
+// every effect pass of the frame (AO and SSGI at the end of the opaque pass, the volumetrics after
+// the sky). At Present this frame's jitter becomes `prev*` and the rest is cleared.
+//
+// Without TAA (disabled in the ini, switched off in the menu, failed, or the scene multisampled)
+// everything here stays false / 0.
+struct TaaFrameState
+{
+	bool running = false;      // TAA resolves this frame: it is on and recognised this frame's main pass
+	bool historyValid = false; // TAA resolved the frame before too (so it blends this one with a
+	                           // history); false on the first frame after it was switched on, a
+	                           // frame it couldn't resolve, a Reset or a resolution change
+	unsigned frame = 0;        // TAA's frame counter (its Halton phase is (frame & 7) + 1)
+
+	// The sub-pixel offset the scene draws were rasterised with this frame (c255 at the camera's
+	// draw): clip.xy += jitterNdc * clip.w, so pixel q shows the unjittered image at q - jitterPx.
+	bool jittered = false;
+	float jitterNdc[2] = {}; // NDC units (= c255.xy; y up)
+	float jitterPx[2] = {};  // pixels (x right, y down)
+	// The same for the frame of prevCamera (0 if it wasn't jittered).
+	bool prevJittered = false;
+	float prevJitterNdc[2] = {};
+	float prevJitterPx[2] = {};
+};
+
 struct SceneState
 {
 	unsigned frame = 0; // frames presented so far
@@ -63,8 +100,17 @@ struct SceneState
 	int msaaFrame = -1000;
 
 	// The camera of this frame's first opaque draw that has g_WorldViewProj and g_World (ok = false
-	// until then), and of the last frame that had one.
+	// until then), and of the last frame that had one. These are the game's matrices, unjittered (TAA
+	// adds its offset inside the vertex shaders): TAA's own reprojection wants them so.
 	Camera camera, prevCamera;
+	// The same cameras as the scene was rasterised: with that frame's TAA jitter folded into the
+	// projection (Jittered in camera.h; equal to camera / prevCamera when not jittered). Anything that
+	// turns the z/w target and a pixel position into a view-space position or ray, or maps a point
+	// back to a pixel of a jittered target, must use these: with the unjittered projection every
+	// pixel would be off by the jitter (up to half a pixel). Reprojecting into an earlier frame's
+	// target uses that frame's raster camera (its own jitter).
+	Camera rasterCamera, prevRasterCamera;
+	TaaFrameState taa;
 
 	// The sun and the fog, read from the pixel shader constants of the opaque draws: g_ShadowedDirect
 	// (m_Direction, towards the sun, then m_Color) and g_FogColor, world space. The *Ok flags say
@@ -92,5 +138,13 @@ void Scene_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect
 void Scene_EndFrame();     // at Present, after the effects: this frame's camera becomes the previous one
 void Scene_OnLostDevice();  // before Reset: this frame and the cameras are forgotten
 void Scene_OnDeviceReady(IDirect3DSurface9* backBuffer); // after creation / Reset: RT0 is the back buffer
+
+// ---- TAA reports (taa.cpp only) ------------------------------------------------------------------
+
+// What c255 holds from now on: TAA's jitter while it draws the scene (`on`), 0 otherwise. The camera
+// read takes the value current at its draw.
+void Scene_TaaJitter(bool on, const float ndc[2], const float px[2]);
+// TAA recognised this frame's main pass and will resolve it.
+void Scene_TaaFrame(bool historyValid, unsigned frame);
 
 } // namespace core

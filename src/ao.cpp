@@ -7,7 +7,8 @@
 // the game binds a z/w target as RT1, and run our passes at the first thing after the pass.
 //
 // Camera: this frame's, from the shared scene tracker (core/scene.h, maths in core/camera.h), taken
-// once AO's own pass has started.
+// once AO's own pass has started: the raster camera, with TAA's jitter folded in, because GTAO and
+// the contact shadows turn pixels of the (jittered) z/w target into view-space positions and back.
 
 #include "ao.h"
 #include "common.h"
@@ -78,7 +79,7 @@ bool CS_Init()
 
 // ---- Camera ------------------------------------------------------------------------------------
 
-static bool g_camOk = false; // this frame's camera (core::Scene().camera) was found during our pass
+static bool g_camOk = false; // this frame's camera (core::Scene().rasterCamera) was found during our pass
 
 // ---- Device resources --------------------------------------------------------------------------
 
@@ -282,7 +283,7 @@ bool AO_BeforeDraw(IDirect3DDevice9* dev)
 	{
 		g_passDraws++;
 		if (!g_camOk)
-			g_camOk = core::Scene().camera.ok;
+			g_camOk = core::Scene().rasterCamera.ok;
 	}
 	return false;
 }
@@ -355,7 +356,7 @@ static void Composite(IDirect3DDevice9* dev)
 
 	g_state.Save(dev);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
-	const core::CameraFloats& cam = core::Scene().camera.f;
+	const core::CameraFloats& cam = core::Scene().rasterCamera.f; // jittered like the z/w target
 	// Normals at half res, shared with SSGI (which runs next and reuses them).
 	IDirect3DTexture9* geo = core::Geo_Ensure(dev, depthTex, g_w, g_h, cam);
 	if (!geo)

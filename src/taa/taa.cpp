@@ -13,6 +13,8 @@
 namespace taa
 {
 
+static_assert(kJitterReg == core::kJitterRegister, "TAA's jitter register is the one the effects' passes clear");
+
 // ---- Settings ----------------------------------------------------------------------------------
 
 static bool g_enabled = false;
@@ -304,6 +306,7 @@ static void UpdateJitter(IDirect3DDevice9* dev)
 		v[1] = -2.0f * g_jitterPx[1] / (float)g_sceneH;
 	}
 	SetC255(dev, v);
+	core::Scene_TaaJitter(on, v, g_jitterPx); // the camera read of the frame takes what the scene draws get
 	if (on != g_jitterOn)
 	{
 		g_jitterOn = on;
@@ -418,6 +421,8 @@ void Taa_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 		g_historyValid = false;
 		UpdateJitter(dev);
 	}
+	// The other effects run between here and the resolve: tell them TAA resolves this frame.
+	core::Scene_TaaFrame(g_historyValid, g_frame);
 }
 
 static void Resolve(IDirect3DDevice9* dev);

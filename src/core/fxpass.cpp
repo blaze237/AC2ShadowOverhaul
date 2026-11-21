@@ -66,6 +66,8 @@ void PassState::BeginPasses(IDirect3DDevice9* dev, IDirect3DVertexDeclaration9* 
 			g_fns.SetRenderTarget(dev, i, nullptr);
 	dev->SetVertexDeclaration(decl);
 	g_fns.SetVertexShader(dev, vs);
+	static const float zero[4] = { 0, 0, 0, 0 };
+	g_fns.SetVertexShaderConstantF(dev, kJitterRegister, zero, 1); // restored by the state block
 }
 
 void PassState::Restore(IDirect3DDevice9* dev)
@@ -145,6 +147,7 @@ void SetSamplerClamp(IDirect3DDevice9* dev, DWORD s, D3DTEXTUREFILTERTYPE filter
 	g_fns.SetSamplerState(dev, s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
 	g_fns.SetSamplerState(dev, s, D3DSAMP_SRGBTEXTURE, FALSE);
 	g_fns.SetSamplerState(dev, s, D3DSAMP_MAXMIPLEVEL, 0);
+	g_fns.SetSamplerState(dev, s, D3DSAMP_MIPMAPLODBIAS, 0);
 }
 
 // ---- RenderTarget --------------------------------------------------------------------------------

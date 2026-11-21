@@ -17,6 +17,32 @@ bool Scene_MsaaRecently() { return (int)S.frame - S.msaaFrame < 120; }
 
 bool Scene_CameraCut() { return S.camera.ok && S.prevCamera.ok && IsCameraCut(S.camera, S.prevCamera); }
 
+// ---- TAA -----------------------------------------------------------------------------------------
+
+// What c255 holds now (TAA's reports): the jitter while TAA draws the scene, else 0.
+static struct
+{
+	bool on = false;
+	float ndc[2] = {}, px[2] = {};
+} g_liveJitter;
+
+void Scene_TaaJitter(bool on, const float ndc[2], const float px[2])
+{
+	g_liveJitter.on = on;
+	for (int k = 0; k < 2; k++)
+	{
+		g_liveJitter.ndc[k] = on ? ndc[k] : 0.0f;
+		g_liveJitter.px[k] = on ? px[k] : 0.0f;
+	}
+}
+
+void Scene_TaaFrame(bool historyValid, unsigned frame)
+{
+	S.taa.running = true;
+	S.taa.historyValid = historyValid;
+	S.taa.frame = frame;
+}
+
 ZwBinding InspectRt1(IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 {
 	ZwBinding b;
@@ -167,12 +193,20 @@ static void CaptureCamera(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
 		return;
 	}
 
-	// ---- JITTER: the place for TAA's projection offset (not applied yet) ----------------------------
+	// ---- JITTER: TAA's projection offset ---------------------------------------------------------
 	// These matrices are the game's, unjittered: TAA moves the image by its sub-pixel offset inside the
-	// vertex shaders (c255, see taa/vsjitter.h), not in the constants. So this camera and prevCamera
-	// are unjittered, and so is every effect's reprojection. To make the effects jitter-aware, apply
-	// the frame's offset here (TAA's current one to `camera`, the previous frame's is then in
-	// prevCamera): in NDC, P02 += x and P12 += y (cam.f too), and viewProj rows 0 / 1 += x / y * row 3.
+	// vertex shaders (c255, see taa/vsjitter.h), not in the constants. So `camera` stays unjittered
+	// (TAA's resolve reprojects its unjittered history with it), and `rasterCamera` gets the offset
+	// this draw was rasterised with, folded into the projection: c255 here is the value every scene
+	// draw of this frame gets (TAA sets it per frame, before the depth prepass). The previous frame's
+	// raster camera (with its own offset) becomes prevRasterCamera at Present.
+	S.taa.jittered = g_liveJitter.on;
+	for (int k = 0; k < 2; k++)
+	{
+		S.taa.jitterNdc[k] = g_liveJitter.on ? g_liveJitter.ndc[k] : 0.0f;
+		S.taa.jitterPx[k] = g_liveJitter.on ? g_liveJitter.px[k] : 0.0f;
+	}
+	S.rasterCamera = S.taa.jittered ? Jittered(cam, S.taa.jitterNdc[0], S.taa.jitterNdc[1]) : cam;
 
 	static bool logged = false;
 	if (!logged)
@@ -256,8 +290,20 @@ void Scene_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect
 void Scene_EndFrame()
 {
 	if (S.camera.ok)
+	{
 		S.prevCamera = S.camera;
-	S.camera.ok = false;
+		S.prevRasterCamera = S.rasterCamera;
+		S.taa.prevJittered = S.taa.jittered;
+		for (int k = 0; k < 2; k++)
+		{
+			S.taa.prevJitterNdc[k] = S.taa.jitterNdc[k];
+			S.taa.prevJitterPx[k] = S.taa.jitterPx[k];
+		}
+	}
+	S.camera.ok = S.rasterCamera.ok = false;
+	S.taa.running = S.taa.historyValid = S.taa.jittered = false;
+	for (int k = 0; k < 2; k++)
+		S.taa.jitterNdc[k] = S.taa.jitterPx[k] = 0.0f;
 	S.sunOk = S.sunColourOk = S.fogOk = false;
 	S.passSeen = S.inOpaquePass = S.skySeen = false;
 	S.sceneColour = nullptr;
@@ -272,8 +318,13 @@ void Scene_OnLostDevice()
 	S.sceneColour = nullptr;
 	S.sceneColourTexture = nullptr;
 	S.zw = nullptr;
-	S.camera.ok = S.prevCamera.ok = false;
+	S.camera.ok = S.prevCamera.ok = S.rasterCamera.ok = S.prevRasterCamera.ok = false;
 	S.sunOk = S.sunColourOk = S.fogOk = false;
+	const unsigned taaFrame = S.taa.frame;
+	S.taa = TaaFrameState();
+	S.taa.frame = taaFrame;
+	float zero[2] = { 0, 0 };
+	Scene_TaaJitter(false, zero, zero); // Reset sets every shader constant to 0
 }
 
 void Scene_OnDeviceReady(IDirect3DSurface9* backBuffer)

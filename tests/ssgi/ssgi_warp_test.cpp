@@ -12,7 +12,12 @@
 //  - temporal: with a static camera the frame count grows and the light stays; where last frame's
 //    depth doesn't match it restarts; after the camera moves, a pattern stored in last frame's
 //    history comes back at the reprojected positions (using the mod's own reprojection rows);
-//  - the blur keeps the light and the final pass applies the intensity.
+//  - the blur keeps the light and the final pass applies the intensity;
+//  - TAA's jitter: with the frame rendered at a sub-pixel offset, the trace's view rays (its own
+//    ViewPos, through a test entry point appended to the real source) go through the jittered pixels
+//    with the offset folded into P02 / P12; two frames rendered with different offsets reproject
+//    onto the right texels with each frame's jittered camera (core::Jittered), and measurably off
+//    with the unjittered ones.
 // Writes ssgi_warp_gi.png (the final GI light) to look at.
 #include <windows.h>
 #include <d3d11.h>
@@ -64,6 +69,18 @@ static ID3DBlob* CompileEntry(const char* entry, const char* profile, bool geo =
 	ID3DBlob *code = nullptr, *err = nullptr;
 	const std::string& src = geo ? g_geoSrc : g_src;
 	HRESULT hr = g_compile(src.data(), src.size(), geo ? "geoprep.hlsl" : "ssgi.hlsl", defs, nullptr, entry, profile,
+		D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+	if (FAILED(hr))
+		printf("%s: compile failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
+	return code;
+}
+
+// Any source text (the real HLSL with a test entry point appended).
+static ID3DBlob* CompileText(const std::string& src, const char* entry)
+{
+	const D3D_SHADER_MACRO defs[] = { { "SSGI_D3D11", "1" }, { "GEO_D3D11", "1" }, { nullptr, nullptr } };
+	ID3DBlob *code = nullptr, *err = nullptr;
+	HRESULT hr = g_compile(src.data(), src.size(), "ssgi.hlsl (test)", defs, nullptr, entry, "ps_4_0",
 		D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
 	if (FAILED(hr))
 		printf("%s: compile failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
@@ -331,9 +348,9 @@ struct Shader
 	std::vector<uint8_t> cb;
 	std::vector<std::pair<std::string, UINT>> vars, textures, samplers;
 };
-static bool Load(Shader& s, const char* entry, bool geo = false)
+static bool Load(Shader& s, const char* entry, bool geo = false, ID3DBlob* code = nullptr)
 {
-	s.code = CompileEntry(entry, "ps_4_0", geo);
+	s.code = code ? code : CompileEntry(entry, "ps_4_0", geo);
 	if (!s.code)
 		return false;
 	dev->CreatePixelShader(s.code->GetBufferPointer(), s.code->GetBufferSize(), nullptr, &s.ps);
@@ -751,6 +768,142 @@ int main()
 		CHECK(tested > 500, "too few texels to test the reprojection (%d)", tested);
 		CHECK(rejected < tested / 50 + 1, "%d of %d visible texels lost their history after the camera moved", rejected, tested);
 		CHECK(bad == 0, "%d texels took their history from the wrong place", bad);
+	}
+
+	// ---- TAA's jitter: frames rendered with sub-pixel offsets (TAA's phases 3 and 4, in pixels, x
+	// right, y down; pixel q shows the unjittered image at q - offset).
+	{
+		const float jit[2][2] = { { 0.25f, -0.3888889f }, { -0.375f, -0.0555556f } };
+		auto ndc = [&](int f, int k) { return k == 0 ? 2.0f * jit[f][0] / W : -2.0f * jit[f][1] / H; };
+		const float eyeA[3] = { 0, 0, 0 }, eyeB[3] = { 0.4f, 0.1f, 0.8f };
+		auto render = [&](const float eye[3], int f) {
+			std::vector<float> d((size_t)W * H);
+			for (UINT y = 0; y < H; y++)
+				for (UINT x = 0; x < W; x++)
+				{
+					Hit h = Cast(x - jit[f][0], y - jit[f][1], eye);
+					d[(size_t)y * W + x] = h.z > 0 ? A + B / h.z : 1.0f;
+				}
+			return MakeTarget(W, H, DXGI_FORMAT_R32_FLOAT, d.data(), W * 4);
+		};
+		Target tDepthA = render(eyeA, 0), tDepthB = render(eyeB, 1);
+
+		// The trace's view rays: ViewPos of the half-res texel's full-res pixel, through x / z and y / z
+		// (independent of the half-float depth), against the ray through the jittered pixel.
+		Shader rays;
+		std::string src = g_src + "\nfloat4 PS_TestViewPos(VPOS_T vposIn : VPOS) : COLOR\n{\n\tfloat2 j = PIXEL(vposIn);\n"
+								  "\tfloat z = tex2Dlod(s_Geo, float4(HalfUv(j), 0, 0)).w;\n\treturn float4(ViewPos(j * 2.0, z), z);\n}\n";
+		if (!Load(rays, "PS_TestViewPos", false, CompileText(src, "PS_TestViewPos")))
+			return 1;
+		Target tPos = MakeTarget(HW, HH, F);
+		auto rayError = [&](bool fold) {
+			Consts kj = k;
+			kj.c[3][0] = fold ? ndc(0, 0) : 0.0f;
+			kj.c[3][1] = fold ? ndc(0, 1) : 0.0f;
+			Pass(geoPrep, kj, { &tGeo[0] }, { { "s_Depth", &tDepthA } });
+			Pass(rays, kj, { &tPos }, { { "s_Geo", &tGeo[0] } });
+			std::vector<float> pos = ReadBack(tPos);
+			double sum = 0;
+			int n = 0;
+			for (UINT y = 0; y < HH; y += 2)
+				for (UINT x = 0; x < HW; x += 2)
+				{
+					const float* p = At(pos, HW, x, y);
+					if (p[3] <= 0)
+						continue;
+					float tx = 2.0f * x - jit[0][0], ty = 2.0f * y - jit[0][1]; // the unjittered image position it shows
+					double ex = (p[0] / p[2] * P00 - (2.0 * tx / W - 1.0)) * 0.5 * W, ey = (p[1] / p[2] * P11 - (1.0 - 2.0 * ty / H)) * 0.5 * H;
+					sum += sqrt(ex * ex + ey * ey);
+					n++;
+				}
+			return n ? sum / n : 1e9;
+		};
+		double rf = rayError(true), ru = rayError(false), jl = sqrt(jit[0][0] * jit[0][0] + jit[0][1] * jit[0][1]);
+		printf("jittered by (%.4f, %.4f) px: trace rays off the jittered pixel by %.4f px with the offset folded in, %.4f px without "
+			   "(expected %.4f)\n",
+			jit[0][0], jit[0][1], rf, ru, jl);
+		CHECK(rf < 0.01 && fabs(ru - jl) < 0.02, "trace rays with TAA's offset: %.4f px folded, %.4f px not (expected %.4f)", rf, ru, jl);
+
+		// Temporal reprojection between the two frames: last frame's history holds each texel's world
+		// position, as in the camera move check; it must come back at this frame's texels.
+		std::vector<float> pattern((size_t)HW * HH * 4, 0.0f);
+		for (UINT y = 0; y < HH; y++)
+			for (UINT x = 0; x < HW; x++)
+			{
+				Hit h = Cast(2.0f * x - jit[0][0], 2.0f * y - jit[0][1], eyeA);
+				float* p = &pattern[((size_t)y * HW + x) * 4];
+				if (h.z > 0)
+				{
+					p[0] = h.world[0];
+					p[1] = h.world[1];
+					p[2] = h.world[2];
+					p[3] = 5;
+				}
+			}
+		Target tPattern = MakeTarget(HW, HH, F, pattern.data(), HW * 16);
+		std::vector<float> zeros((size_t)HW * HH * 4, 0.0f);
+		Target tZero = MakeTarget(HW, HH, F, zeros.data(), HW * 16);
+		Camera camA, camB;
+		camA.viewProj = ViewProj(eyeA);
+		camB.viewProj = ViewProj(eyeB);
+		camA.P02 = camA.P12 = camB.P02 = camB.P12 = 0;
+		auto reproject = [&](bool fold, int& tested) {
+			Camera a = fold ? Jittered(camA, ndc(0, 0), ndc(0, 1)) : camA, b = fold ? Jittered(camB, ndc(1, 0), ndc(1, 1)) : camB;
+			Consts ka = k, kb = k;
+			ka.c[3][0] = fold ? ndc(0, 0) : 0.0f;
+			ka.c[3][1] = fold ? ndc(0, 1) : 0.0f;
+			kb.c[3][0] = fold ? ndc(1, 0) : 0.0f;
+			kb.c[3][1] = fold ? ndc(1, 1) : 0.0f;
+			Pass(geoPrep, ka, { &tGeo[0] }, { { "s_Depth", &tDepthA } });
+			Pass(geoPrep, kb, { &tGeo[1] }, { { "s_Depth", &tDepthB } });
+			float r[3][4];
+			ReprojectionRows(a.viewProj, b.viewProj, W, H, r);
+			for (int i = 0; i < 3; i++)
+				memcpy(kb.c[6 + i], r[i], 16);
+			kb.c[9][2] = 1;
+			Pass(temporal, kb, { &tHist[0] }, { { "s_Geo", &tGeo[1] }, { "s_Raw", &tZero }, { "s_Hist", &tPattern }, { "s_PrevGeo", &tGeo[0] } });
+			std::vector<float> out = ReadBack(tHist[0]);
+			double sum = 0;
+			tested = 0;
+			for (UINT y = 4; y < HH - 4; y += 7)
+				for (UINT x = 4; x < HW - 4; x += 7)
+				{
+					Hit h1 = Cast(2.0f * x - jit[1][0], 2.0f * y - jit[1][1], eyeB);
+					if (h1.z <= 0)
+						continue;
+					float px0, py0;
+					Project(h1.world, eyeA, px0, py0);
+					px0 += jit[0][0];
+					py0 += jit[0][1];
+					if (px0 < 8 || py0 < 8 || px0 > W - 8 || py0 > H - 8)
+						continue;
+					Hit h0 = Cast(px0 - jit[0][0], py0 - jit[0][1], eyeA);
+					if (h0.surface != h1.surface || fabsf(h0.z - (h1.world[2] - eyeA[2])) > 0.01f)
+						continue;
+					bool edge = false;
+					for (int dy = -3; dy <= 3 && !edge; dy += 3)
+						for (int dx = -3; dx <= 3 && !edge; dx += 3)
+							edge = Cast(px0 + dx, py0 + dy, eyeA).surface != h0.surface || Cast(2.0f * x + dx, 2.0f * y + dy, eyeB).surface != h1.surface;
+					if (edge)
+						continue;
+					const float* v = At(out, HW, x, y);
+					if (fabsf(v[3] - 6) > 1e-3f)
+						continue; // history rejected: not counted (the check below wants nearly all kept)
+					tested++;
+					float err = 0;
+					for (int c = 0; c < 3; c++)
+						err = fmaxf(err, fabsf(v[c] / (5.0f / 6.0f) - h1.world[c]));
+					sum += err / (2.0f * h0.z / (P00 * W)); // in half-res texels (metres across one at that depth)
+				}
+			return tested ? sum / tested : 1e9;
+		};
+		int nf = 0, nu = 0;
+		double ef = reproject(true, nf), eu = reproject(false, nu);
+		printf("jittered frames (TAA phases 3 and 4): %d texels; history taken from %.3f half-res texel widths away (mean world distance; "
+			   "more on the slanted floor) with each frame's jittered camera, %.3f with the unjittered ones\n",
+			nf, ef, eu);
+		CHECK(nf > 500 && nu > 500, "too few texels kept their history (%d, %d)", nf, nu);
+		CHECK(ef < 0.05 && eu > 0.25 && eu > 5 * ef, "jittered reprojection: %.3f texels off with the jittered cameras, %.3f without", ef, eu);
 	}
 
 	// ---- Blur + intensity: one run of the full chain on frame 0's trace.

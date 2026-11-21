@@ -7,7 +7,11 @@
 //  - IsCameraCut: 4 m or about 32 degrees;
 //  - ReprojectionRows maps (z/w, x, y, 1) of a pixel in the current frame to the texel of the same
 //    world point in last frame's half-res texture, and w to its view depth then / now;
-//  - IdentityRows maps each pixel onto itself.
+//  - IdentityRows maps each pixel onto itself;
+//  - TAA's jitter: Jittered folds a sub-pixel offset into a camera exactly as CameraFromMatrices reads
+//    it from the jittered matrices (and (0, 0) changes nothing); ReprojectionRows between two frames
+//    rendered with different jitter lands on the right texel with each frame's jittered camera, and
+//    measurably off (by the jitter difference) with the unjittered ones.
 #include "core/camera.h"
 using namespace core;
 #include <stdio.h>
@@ -398,6 +402,104 @@ int main()
 	}
 	CHECK(worstSame < 0.05, "static camera moves pixels by %g half-res texels", worstSame);
 	CHECK(worstId < 1e-3, "identity rows move pixels by %g half-res texels", worstId);
+
+	// ---- TAA's jitter
+	{
+		// The offsets of two of TAA's Halton phases (3 and 4), in pixels (x right, y down), and as TAA
+		// puts them into c255 (NDC, y up).
+		const double jpx[2][2] = { { 0.25, -0.3888889 }, { -0.375, -0.0555556 } };
+		float jndc[2][2];
+		for (int f = 0; f < 2; f++)
+		{
+			jndc[f][0] = (float)(2.0 * jpx[f][0] / W);
+			jndc[f][1] = (float)(-2.0 * jpx[f][1] / H);
+		}
+		// The rewritten vertex shaders add c255.xy * w to clip.xy: as a matrix, rows 0 / 1 += c255.xy * row 3.
+		auto jitterMat = [](const Mat4& M, const float o[2]) {
+			Mat4 J = M;
+			for (int c = 0; c < 4; c++)
+			{
+				J.m[0][c] += o[0] * M.m[3][c];
+				J.m[1][c] += o[1] * M.m[3][c];
+			}
+			return J;
+		};
+		auto toFloats = [](const Mat4& M, float out[16]) {
+			for (int i = 0; i < 16; i++)
+				out[i] = (float)M.m[i / 4][i % 4];
+		};
+		const float ident[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+		float wvp[16];
+		char why[160] = "";
+		Camera c0, c1, c0j, read0j;
+		toFloats(VP0, wvp);
+		CHECK(CameraFromMatrices(wvp, ident, c0, why, sizeof(why)), "camera 0: %s", why);
+		toFloats(VP1, wvp);
+		CHECK(CameraFromMatrices(wvp, ident, c1, why, sizeof(why)), "camera 1: %s", why);
+		c0j = Jittered(c0, jndc[0][0], jndc[0][1]);
+		// Folding the offset in = reading the camera from the jittered matrices.
+		toFloats(jitterMat(VP0, jndc[0]), wvp);
+		CHECK(CameraFromMatrices(wvp, ident, read0j, why, sizeof(why)), "jittered camera 0: %s", why);
+		double worstVp = 0;
+		for (int r = 0; r < 4; r++)
+			for (int c = 0; c < 4; c++)
+				worstVp = fmax(worstVp, fabs(c0j.viewProj.m[r][c] - read0j.viewProj.m[r][c]) / (1 + fabs(read0j.viewProj.m[r][c])));
+		CHECK(worstVp < 1e-6, "Jittered view-projection off the jittered matrices' by %g", worstVp);
+		CHECK(fabs(c0j.P02 - read0j.P02) < 1e-7 && fabs(c0j.P12 - read0j.P12) < 1e-7 && fabs(c0j.P02 - c0.P02 - jndc[0][0]) < 1e-9,
+			"Jittered P02 / P12 %g %g, read from the jittered matrices %g %g", c0j.P02, c0j.P12, read0j.P02, read0j.P12);
+		CHECK(c0j.P00 == c0.P00 && c0j.P11 == c0.P11 && c0j.A == c0.A && c0j.B == c0.B && SameFloats(c0j.f.right, c0.f.right, 3) &&
+				SameFloats(c0j.f.eye, c0.f.eye, 3),
+			"Jittered changed more than the off-centre terms");
+		// No offset: the camera exactly (every effect's constants unchanged without TAA).
+		Camera same = Jittered(c0, 0.0f, 0.0f);
+		CHECK(!memcmp(&same.viewProj, &c0.viewProj, sizeof(Mat4)) && !memcmp(&same.f, &c0.f, sizeof(CameraFloats)) && same.P02 == c0.P02,
+			"Jittered(0, 0) changed the camera");
+
+		// Frame 0 rendered with offset 0, frame 1 with offset 1: a world point seen at (jittered) pixel
+		// x1 in frame 1 must land on its texel of frame 0's (jittered) half-res texture.
+		// (The cameras' exact matrices, as above: read back from float constants they would add the
+		// float error of the matrices themselves, about 0.05 texels at 4K.)
+		const Mat4 VP0j = jitterMat(VP0, jndc[0]), VP1j = jitterMat(VP1, jndc[1]);
+		Camera e0, e1;
+		e0.viewProj = VP0;
+		e1.viewProj = VP1;
+		e0.P02 = e0.P12 = e1.P02 = e1.P12 = 0;
+		const Camera e0j = Jittered(e0, jndc[0][0], jndc[0][1]), e1j = Jittered(e1, jndc[1][0], jndc[1][1]);
+		float rowsJ[3][4], rowsU[3][4];
+		CHECK(ReprojectionRows(e0j.viewProj, e1j.viewProj, W, H, rowsJ) && ReprojectionRows(e0.viewProj, e1.viewProj, W, H, rowsU),
+			"rows not computed");
+		int n = 0;
+		double worstJ = 0, sumU = 0;
+		for (int trial = 0; trial < 2000; trial++)
+		{
+			double wpt[3];
+			double t = 2 + rnd() * 200;
+			for (int k = 0; k < 3; k++)
+				wpt[k] = eye1[k] + fwd1[k] * t + (rnd() - 0.5) * t;
+			double x1, y1, zw1, vz1, x0, y0, zw0, vz0;
+			if (!PixelOf(VP1j, wpt, x1, y1, zw1, vz1) || !PixelOf(VP0j, wpt, x0, y0, zw0, vz0))
+				continue;
+			n++;
+			float q[4] = { (float)zw1, (float)x1, (float)y1, 1 };
+			double eu = (x0 / 2 + 0.5) / hw, ev = (y0 / 2 + 0.5) / hh;
+			double hj[3], hu[3];
+			for (int r = 0; r < 3; r++)
+			{
+				hj[r] = (double)rowsJ[r][0] * q[0] + (double)rowsJ[r][1] * q[1] + (double)rowsJ[r][2] * q[2] + (double)rowsJ[r][3] * q[3];
+				hu[r] = (double)rowsU[r][0] * q[0] + (double)rowsU[r][1] * q[1] + (double)rowsU[r][2] * q[2] + (double)rowsU[r][3] * q[3];
+			}
+			worstJ = fmax(worstJ, fmax(fabs(hj[0] / hj[2] - eu) * hw, fabs(hj[1] / hj[2] - ev) * hh));
+			sumU += fmax(fabs(hu[0] / hu[2] - eu) * hw, fabs(hu[1] / hu[2] - ev) * hh);
+		}
+		double meanU = n ? sumU / n : 0;
+		// The two offsets differ by (0.625, 0.333) full-res pixels = (0.31, 0.17) half-res texels.
+		CHECK(n > 500, "only %d points on screen in both jittered frames", n);
+		CHECK(worstJ < 0.02, "jittered frames: reprojected with the jittered cameras, off by %g half-res texels", worstJ);
+		CHECK(meanU > 0.25, "jittered frames: the unjittered cameras should be off by the jitter difference (0.31 texels), got %g", meanU);
+		printf("jittered frames (TAA phases 3 and 4): %d points; with each frame's jittered camera worst %.4f half-res texels, "
+			   "with the unjittered ones %.3f on average\n",
+			n, worstJ, meanU);
+	}
 
 	printf(g_fail ? "%d FAILURES\n" : "all camera / reprojection checks passed\n", g_fail);
 	return g_fail ? 1 : 0;

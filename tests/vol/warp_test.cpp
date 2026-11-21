@@ -17,6 +17,13 @@
 // fog; shadowed fog has less in-scatter than unshadowed and shows the shafts' stripes; the sky gets
 // screen-space shafts near the sun and none far from it; the composite is scene * T + light.
 // Writes warp_<view>_*.png to look at.
+//
+// TAA:
+//  - TAA off (noise offset 0): the march, blurred fog and composite are bit for bit what the shaders
+//    gave before the offset was added (hashes recorded from those shaders);
+//  - jitter: the ray each fog pixel marches along (the shader's own ViewRay / WorldDir, through a
+//    test entry point appended to the real source) goes through the jittered pixel with TAA's
+//    offset folded into P02 / P12, and misses it by the offset without.
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -216,6 +223,10 @@ static V3 PixelDir(float px, float py)
 	return Norm(g_right * (ndcX / P00) + g_up * (ndcY / P11) + g_fwd);
 }
 
+// TAA's sub-pixel offset (pixels, x right, y down) the scene is rendered with: pixel q shows the
+// unjittered image at q - offset. 0 except in the jitter check.
+static float g_jitterPx[2] = { 0, 0 };
+
 static void RenderScene(std::vector<float>& depth, std::vector<float>& colour)
 {
 	depth.assign((size_t)W * H, 1.0f);
@@ -223,7 +234,7 @@ static void RenderScene(std::vector<float>& depth, std::vector<float>& colour)
 	for (UINT y = 0; y < H; y++)
 		for (UINT x = 0; x < W; x++)
 		{
-			V3 d = PixelDir((float)x, (float)y), n;
+			V3 d = PixelDir((float)x - g_jitterPx[0], (float)y - g_jitterPx[1]), n;
 			float t;
 			V3 c;
 			if (Trace(g_eye, d, t, n))
@@ -363,10 +374,10 @@ struct Pass
 	UINT cbSize = 0;
 };
 
-static Pass MakePass(const char* entry)
+static Pass MakePass(const char* entry, const std::string* src = nullptr)
 {
 	Pass p;
-	ID3DBlob* code = CompileEntry(entry, "ps_4_0", g_src);
+	ID3DBlob* code = CompileEntry(entry, "ps_4_0", src ? *src : g_src);
 	if (!code)
 		return p;
 	g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &p.ps);
@@ -471,6 +482,56 @@ static std::vector<float> ReadBack(const Tex& t)
 	return out;
 }
 
+// FNV-1a over a target's texels: two renders hash the same only if every bit agrees.
+static uint64_t HashTex(const Tex& t, UINT bytesPerTexel)
+{
+	D3D11_TEXTURE2D_DESC d;
+	t.t->GetDesc(&d);
+	d.Usage = D3D11_USAGE_STAGING;
+	d.BindFlags = 0;
+	d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ID3D11Texture2D* st = nullptr;
+	g_dev->CreateTexture2D(&d, nullptr, &st);
+	g_ctx->CopyResource(st, t.t);
+	D3D11_MAPPED_SUBRESOURCE m;
+	uint64_t h = 1469598103934665603ull;
+	if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)))
+	{
+		for (UINT y = 0; y < t.h; y++)
+		{
+			const uint8_t* row = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
+			for (size_t i = 0; i < (size_t)t.w * bytesPerTexel; i++)
+				h = (h ^ row[i]) * 1099511628211ull;
+		}
+		g_ctx->Unmap(st, 0);
+	}
+	st->Release();
+	return h;
+}
+
+// A 32-bit float RGBA target.
+static std::vector<float> ReadBack32(const Tex& t)
+{
+	D3D11_TEXTURE2D_DESC d;
+	t.t->GetDesc(&d);
+	d.Usage = D3D11_USAGE_STAGING;
+	d.BindFlags = 0;
+	d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ID3D11Texture2D* st = nullptr;
+	g_dev->CreateTexture2D(&d, nullptr, &st);
+	g_ctx->CopyResource(st, t.t);
+	D3D11_MAPPED_SUBRESOURCE m;
+	std::vector<float> out((size_t)t.w * t.h * 4);
+	if (SUCCEEDED(g_ctx->Map(st, 0, D3D11_MAP_READ, 0, &m)))
+	{
+		for (UINT y = 0; y < t.h; y++)
+			memcpy(&out[(size_t)y * t.w * 4], (const uint8_t*)m.pData + (size_t)y * m.RowPitch, (size_t)t.w * 16);
+		g_ctx->Unmap(st, 0);
+	}
+	st->Release();
+	return out;
+}
+
 static ID3D11VertexShader* g_vs;
 static ID3D11SamplerState* g_samplers[6];
 static ID3D11BlendState *g_blendComposite, *g_blendOff;
@@ -521,20 +582,28 @@ struct Settings
 	float shaftIntensity = 0.35f, shaftThreshold = 0.5f;
 	bool shadows = true, shafts = true;
 	float view = 0;
+	float noise = 0;        // c_Medium.w: the per-frame noise offset (0 without TAA)
+	bool narrowBlur = false; // a narrower fog blur (sigma 1), measured against the mod's with TAA (not used by the mod)
 };
 
 struct Outputs
 {
 	std::vector<float> march, fog, shafts, composite, scene, depth;
+	uint64_t hashMarch = 0, hashFog = 0, hashComposite = 0;
 };
 
-static Pass g_march, g_blur, g_mask, g_radial, g_comp;
+static Pass g_march, g_blur, g_blurNarrow, g_mask, g_radial, g_comp;
 static Tex g_depthTex, g_atlasTex, g_cloudTex, g_fogT[2], g_shaftT[2], g_sceneTex, g_outTex;
 
-static Outputs RunView(const Settings& s)
+// reuseScene: the scene (depth, colour) of the last call, for repeated runs of one view.
+static Outputs RunView(const Settings& s, bool reuseScene = false)
 {
 	Outputs o;
-	RenderScene(o.depth, o.scene);
+	static std::vector<float> lastDepth, lastScene;
+	if (!reuseScene || lastDepth.empty())
+		RenderScene(lastDepth, lastScene);
+	o.depth = lastDepth;
+	o.scene = lastScene;
 	g_depthTex = MakeTex(W, H, DXGI_FORMAT_R32_FLOAT, false, o.depth.data(), W * 4);
 	g_sceneTex = MakeTex(W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, false, o.scene.data(), W * 16);
 	g_outTex = MakeTex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true);
@@ -550,7 +619,8 @@ static Outputs RunView(const Settings& s)
 	set4(0, (float)W, (float)H, 1.0f / W, 1.0f / H);
 	set4(1, (float)LW, (float)LH, 1.0f / LW, 1.0f / LH);
 	set4(2, A, B, P00, P11);
-	set4(3, 0, 0, (float)DIV, A + B / (0.99f * FAR_));
+	// P02 / P12 with TAA's offset folded in, as the mod sets them (0 without TAA).
+	set4(3, 2.0f * g_jitterPx[0] / W, -2.0f * g_jitterPx[1] / H, (float)DIV, A + B / (0.99f * FAR_));
 	set4(4, g_eye.x, g_eye.y, g_eye.z, s.maxDist);
 	set4(5, g_right.x, g_right.y, g_right.z, s.steps);
 	set4(6, g_up.x, g_up.y, g_up.z, s.view);
@@ -568,7 +638,7 @@ static Outputs RunView(const Settings& s)
 	set4(21, g_sun.x, g_sun.y, g_sun.z, s.g);
 	set4(22, kSunCol.x * s.sun, kSunCol.y * s.sun, kSunCol.z * s.sun, 0);
 	set4(23, kFogCol.x * s.ambient, kFogCol.y * s.ambient, kFogCol.z * s.ambient, 0);
-	set4(24, s.density, s.falloff, s.base, 0);
+	set4(24, s.density, s.falloff, s.base, s.noise);
 	set4(27, s.shaftThreshold, 12.0f, 0, 0);
 	set4(29, (float)SW, (float)SH, 1.0f / SW, 1.0f / SH);
 
@@ -590,12 +660,14 @@ static Outputs RunView(const Settings& s)
 	ID3D11ShaderResourceView* srv[6] = { g_depthTex.srv, g_atlasTex.srv, g_cloudTex.srv, nullptr, nullptr, nullptr };
 	Run(g_march, c, g_fogT[0], srv);
 	o.march = ReadBack(g_fogT[0]);
+	o.hashMarch = HashTex(g_fogT[0], 8);
+	Pass& blur = s.narrowBlur ? g_blurNarrow : g_blur;
 	set4(25, 1, 0, 0, 0);
 	srv[3] = g_fogT[0].srv;
-	Run(g_blur, c, g_fogT[1], srv);
+	Run(blur, c, g_fogT[1], srv);
 	set4(25, 0, 1, 0, 0);
 	srv[3] = g_fogT[1].srv;
-	Run(g_blur, c, g_fogT[0], srv);
+	Run(blur, c, g_fogT[0], srv);
 	srv[3] = nullptr;
 	if (shafts)
 	{
@@ -629,8 +701,10 @@ static Outputs RunView(const Settings& s)
 	srv[5] = g_shaftT[0].srv;
 	Run(g_comp, c, g_outTex, srv, true);
 	o.fog = ReadBack(g_fogT[0]);
+	o.hashFog = HashTex(g_fogT[0], 8);
 	o.shafts = shafts ? ReadBack(g_shaftT[0]) : std::vector<float>((size_t)SW * SH * 4, 0.0f);
 	o.composite = ReadBack(g_outTex);
+	o.hashComposite = HashTex(g_outTex, 8);
 	g_depthTex.srv->Release();
 	g_depthTex.t->Release();
 	g_sceneTex.srv->Release();
@@ -663,6 +737,7 @@ static void Reference(UINT lx, UINT ly, const Settings& s, float out[4])
 	float dist = Trace(g_eye, dir, t, n) ? t : s.maxDist;
 	float tEnd = fminf(dist, s.maxDist);
 	float jitter = (float)fmod(52.9829189 * fmod(0.06711056 * lx + 0.00583715 * ly, 1.0), 1.0);
+	jitter = jitter + s.noise - floorf(jitter + s.noise);
 	float c = Dot(dir, g_sun), g = s.g;
 	float phase = (1 - g * g) / powf(fmaxf(1 + g * g - 2 * g * c, 1e-4f), 1.5f);
 	float T = 1;
@@ -712,6 +787,13 @@ static void CheckAgainstReference(const Outputs& o, const Settings& s, const cha
 	Check(worstT < 0.01f, what, worstT, 0.01);
 }
 
+// Hashes of the street view's march, fog and composite, then the beams view's, with the noise
+// offset at 0, recorded from the shaders before the offset was added (src/vol/shaders/volumetrics.hlsl
+// of commit 7a64ec5): without TAA nothing may change, not one bit. (Recorded on WARP; a different
+// WARP version could round differently, in which case the shaders of that commit give the new numbers.)
+static const uint64_t kToday[6] = { 0xD230F5FE078380B3ull, 0x85A7B7098B73E03Dull, 0x32409D31E90E8CD1ull, 0x41C86D2BAFC8E453ull,
+	0xBC8C1D65F6B16501ull, 0x96915E45B808CEE9ull };
+
 int main(int argc, char** argv)
 {
 	(void)argc;
@@ -747,6 +829,14 @@ int main(int argc, char** argv)
 	g_dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_vs);
 	g_march = MakePass("PS_FogMarch");
 	g_blur = MakePass("PS_FogBlur");
+	{
+		// A narrower fog blur (sigma 1), only measured (TAA section below): not used by the mod.
+		std::string n = g_src;
+		const char* from = "{ 0.8825, 0.6065, 0.3247, 0.1353 }; // exp(-k^2 / 8)";
+		size_t at = n.find(from);
+		n.replace(at, strlen(from), "{ 0.6065, 0.1353, 0.0111, 0.0003 };");
+		g_blurNarrow = MakePass("PS_FogBlur", &n);
+	}
 	g_mask = MakePass("PS_ShaftsMask");
 	g_radial = MakePass("PS_ShaftsBlur");
 	g_comp = MakePass("PS_Composite");
@@ -957,6 +1047,64 @@ int main(int argc, char** argv)
 	WritePngRgb("warp_beams_fog.png", FogRgb(beams.fog, false), LW, LH, 3.0f);
 	Check(!AnyNan(beams.fog) && !AnyNan(beams.composite), "beams: no NaN / Inf");
 
+	// ---- TAA -------------------------------------------------------------------------------------
+	{
+		// TAA off: the offset 0 gives exactly the old output (the street and beams views above).
+		printf("TAA off, output hashes: street march %016llX fog %016llX composite %016llX; beams march %016llX fog %016llX composite %016llX\n",
+			(unsigned long long)lit.hashMarch, (unsigned long long)lit.hashFog, (unsigned long long)lit.hashComposite,
+			(unsigned long long)beams.hashMarch, (unsigned long long)beams.hashFog, (unsigned long long)beams.hashComposite);
+		bool same = lit.hashMarch == kToday[0] && lit.hashFog == kToday[1] && lit.hashComposite == kToday[2] && beams.hashMarch == kToday[3] &&
+			beams.hashFog == kToday[4] && beams.hashComposite == kToday[5];
+		Check(same, "TAA off (noise offset 0): march, fog and composite bit for bit what the shaders gave before the offset");
+	}
+	{
+		// Jitter: the march's ray through each full-res pixel, from the shader's own ViewRay / WorldDir,
+		// against the direction through the jittered pixel (TAA's phase 8 offset).
+		g_jitterPx[0] = -0.4375f;
+		g_jitterPx[1] = 0.3888889f;
+		std::string src = g_src + "\nfloat4 PS_TestRay(VPOS_T vposIn : VPOS) : COLOR\n{\n\treturn float4(WorldDir(ViewRay(PIXEL(vposIn))), 0);\n}\n";
+		Pass ray = MakePass("PS_TestRay", &src);
+		Tex out = MakeTex(W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, true);
+		double expected = 0; // what misses the jittered pixel by the offset does: the unjittered pixel's direction
+		auto rayError = [&](bool fold) {
+			float c[30][4] = {};
+			c[0][0] = (float)W, c[0][1] = (float)H, c[0][2] = 1.0f / W, c[0][3] = 1.0f / H;
+			c[2][0] = A, c[2][1] = B, c[2][2] = P00, c[2][3] = P11;
+			c[3][0] = fold ? 2.0f * g_jitterPx[0] / W : 0.0f;
+			c[3][1] = fold ? -2.0f * g_jitterPx[1] / H : 0.0f;
+			memcpy(c[5], &g_right, 12);
+			memcpy(c[6], &g_up, 12);
+			memcpy(c[7], &g_fwd, 12);
+			ID3D11ShaderResourceView* none[6] = {};
+			Run(ray, c, out, none);
+			std::vector<float> d = ReadBack32(out);
+			double sum = 0, sumExpected = 0;
+			int n = 0;
+			for (UINT y = 0; y < H; y += 3)
+				for (UINT x = 0; x < W; x += 3)
+				{
+					V3 truth = PixelDir(x - g_jitterPx[0], y - g_jitterPx[1]);
+					const float* g = &d[((size_t)y * W + x) * 4];
+					V3 e = V3{ g[0], g[1], g[2] } - truth, u = PixelDir((float)x, (float)y) - truth;
+					// in pixels: radians x pixels per radian at the centre of the screen
+					sum += sqrt(Dot(e, e)) * 0.5 * W * P00;
+					sumExpected += sqrt(Dot(u, u)) * 0.5 * W * P00;
+					n++;
+				}
+			expected = sumExpected / n;
+			return sum / n;
+		};
+		double f = rayError(true), u = rayError(false);
+		char what[200];
+		snprintf(what, sizeof(what), "jittered by (-0.4375, 0.3889) px: march rays off the jittered pixel by (px) with the offset folded in, "
+									 "without it (expected %.3f)",
+			expected);
+		Check(f < 0.01 && fabs(u - expected) < 0.05 * expected, what, f, u);
+		g_jitterPx[0] = g_jitterPx[1] = 0;
+		out.srv->Release();
+		out.rtv->Release();
+		out.t->Release();
+	}
 	printf("%s: %d failure(s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails);
 	return g_fails ? 1 : 0;
 }

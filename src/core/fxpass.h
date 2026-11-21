@@ -34,6 +34,11 @@ struct DeviceFns
 void SetDeviceFns(const DeviceFns& fns);
 const DeviceFns& Orig();
 
+// The vertex shader constant that holds TAA's jitter (taa/vsjitter.h kJitterReg): the game's
+// rewritten vertex shaders add c255.xy * clip.w to their position. It is non-zero while the game
+// draws its scene, which is when AO, SSGI and the volumetrics run their passes.
+enum { kJitterRegister = 255 };
+
 // IID_IDirect3DTexture9, for GetContainer (a surface's texture), without linking dxguid.
 inline const GUID kIID_Texture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
 
@@ -54,7 +59,9 @@ public:
 	void Save(IDirect3DDevice9* dev);
 	// Fullscreen pass setup: no depth buffer, render targets 1-3 unbound, `decl` and `vs`, and the
 	// render states every pass wants (no depth / stencil / alpha test, no blending or culling, all
-	// colour channels written, no sRGB, fog or clip planes).
+	// colour channels written, no sRGB, fog or clip planes). c255 (TAA's jitter) is set to 0: our
+	// fullscreen vertex shaders are created through the original function, so they are never
+	// rewritten to read it, but no pass should run with the scene's jitter in place either way.
 	void BeginPasses(IDirect3DDevice9* dev, IDirect3DVertexDeclaration9* decl, IDirect3DVertexShader9* vs);
 	// Puts all of it back and drops the references Save took.
 	void Restore(IDirect3DDevice9* dev);
@@ -77,7 +84,9 @@ IDirect3DVertexDeclaration9* FullscreenDecl(IDirect3DDevice9* dev);
 void DrawFullscreen(IDirect3DDevice9* dev);
 // Render target 0 and a viewport covering it.
 void SetTarget(IDirect3DDevice9* dev, IDirect3DSurface9* s, UINT w, UINT h);
-// Clamped sampling without mipmaps, point or linear filtered.
+// Clamped sampling without mipmaps, point or linear filtered, no mip bias. (Through the original
+// function, so TAA's mip bias, which it adds to the game's own SetSamplerState calls and to samplers
+// 0-15 while the scene is drawn, is replaced by 0 for our passes; the state block puts it back.)
 void SetSamplerClamp(IDirect3DDevice9* dev, DWORD sampler, D3DTEXTUREFILTERTYPE filter);
 
 // A render target texture and its surface (D3DPOOL_DEFAULT: released before a Reset).

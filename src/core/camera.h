@@ -57,6 +57,13 @@ bool CameraFromMatrices(const float wvp[16], const float world[16], Camera& cam,
 // about 32 degrees from `prev`. History from `prev` is no use then. (SSGI's test, verified in game.)
 bool IsCameraCut(const Camera& cur, const Camera& prev);
 
+// `cam` with a sub-pixel offset (TAA's jitter) folded into its projection. TAA's vertex shaders add
+// (x, y) * clip.w to the clip position (taa/vsjitter.h), which moves every NDC position by (x, y):
+// the same as P02 += x, P12 += y, i.e. viewProj rows 0 / 1 += x / y * row 3. Nothing else changes
+// (A, B, P00, P11, the axes and the eye), so the result is what CameraFromMatrices would read from
+// the jittered matrices. (0, 0) returns `cam` exactly.
+Camera Jittered(const Camera& cam, float x, float y);
+
 // ---- Reprojection -------------------------------------------------------------------------------
 
 // SSGI's GI texture: rows mapping (z/w, x, y, 1) of a full-res pixel (x, y integer, D3D9 pixel

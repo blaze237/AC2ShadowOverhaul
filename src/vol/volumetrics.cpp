@@ -2,7 +2,9 @@
 // tracking and the passes. See volumetrics.h for the overview.
 //
 // Camera: this frame's, from the shared scene tracker (core/scene.h; the maths, from the opaque
-// shaders' g_WorldViewProj and g_World, in core/camera.h), taken during our pass.
+// shaders' g_WorldViewProj and g_World, in core/camera.h), taken during our pass. The raster camera,
+// with TAA's jitter of the frame folded in: the march casts a ray through each pixel of the
+// (jittered) z/w target, and the sun's place on screen is where the (jittered) sky shows it.
 //
 // Sun shadow map: the lit shaders transform world positions with g_WorldToLightProjVS (3 rows:
 // x, y across the sun in metres, centred near the camera; z along the direction towards the sun),
@@ -263,11 +265,11 @@ static void CaptureFromDraw(IDirect3DDevice9* dev)
 	}
 	LeaveCriticalSection(&g_mapLock);
 
-	if (!g_frame.cam && core::Scene().camera.ok)
+	if (!g_frame.cam && core::Scene().rasterCamera.ok)
 	{
 		// The scene tracker found this frame's camera (at this draw, the first opaque one with the
 		// camera matrices): its g_EyePosition, if it has one, should be the same point.
-		g_frame.camera = core::Scene().camera;
+		g_frame.camera = core::Scene().rasterCamera;
 		g_frame.cam = true;
 		if (haveVs && vi.eye >= 0 && SUCCEEDED(dev->GetVertexShaderConstantF(vi.eye, g_frame.eyeConst, 1)))
 			g_frame.eyeConstOk = true;
@@ -579,6 +581,8 @@ void Vol_OnDeviceReady(IDirect3DDevice9* dev)
 
 // ---- The passes --------------------------------------------------------------------------------
 
+// (Through the device, but inside the effects' scope, so the hooks pass it straight on: TAA's mip
+// bias never applies, and MIPMAPLODBIAS is set to 0 here like core::SetSamplerClamp does.)
 static void Sampler(IDirect3DDevice9* dev, DWORD s, D3DTEXTUREFILTERTYPE filter, D3DTEXTUREADDRESS address)
 {
 	dev->SetSamplerState(s, D3DSAMP_MINFILTER, filter);
@@ -590,6 +594,7 @@ static void Sampler(IDirect3DDevice9* dev, DWORD s, D3DTEXTUREFILTERTYPE filter,
 	dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
 	dev->SetSamplerState(s, D3DSAMP_MAXMIPLEVEL, 0);
 	dev->SetSamplerState(s, D3DSAMP_MAXANISOTROPY, 1);
+	dev->SetSamplerState(s, D3DSAMP_MIPMAPLODBIAS, 0);
 }
 
 static void Apply(IDirect3DDevice9* dev)

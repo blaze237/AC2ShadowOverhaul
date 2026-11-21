@@ -107,12 +107,19 @@ void GI_SetSetting(int s, float v)
 
 // ---- Camera ------------------------------------------------------------------------------------
 
-// This frame's camera is core::Scene().camera (the first opaque draw with the camera matrices);
-// g_camOk says it was there by the time our pass drew. g_prevCam: the camera of the frame that wrote
-// g_out[g_outBound] / the history.
+// This frame's camera is core::Scene().rasterCamera (the first opaque draw with the camera
+// matrices, with TAA's jitter of this frame folded in, if any); g_camOk says it was there by the time
+// our pass drew. g_prevCam: the raster camera of the frame that wrote g_out[g_outBound] / the
+// history, so with that frame's own jitter.
+//
+// Every position here is a pixel of a jittered target: the z/w target and geometry prep of this
+// frame (trace, temporal), last frame's geometry prep and history (temporal), and in the game's
+// shaders the pixel being shaded now (c216-c218). Each frame's raster camera maps them to and from
+// view / world space exactly; with the unjittered cameras every reprojection would be off by the
+// difference of the two frames' jitter (up to a pixel).
 static bool g_camOk = false;
 static core::Camera g_prevCam;
-static const core::Camera& Cam() { return core::Scene().camera; }
+static const core::Camera& Cam() { return core::Scene().rasterCamera; }
 
 // ---- Device resources --------------------------------------------------------------------------
 
@@ -428,6 +435,15 @@ void GI_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 }
 
 // Rows for the shaders and the temporal pass, and whether last frame's GI is usable.
+//
+// With TAA: the game's shader gets (z/w, vPos) of the pixel it shades now, rasterised with this
+// frame's jitter, so this frame's raster camera (jittered) takes it back to the world point that
+// pixel shows. The GI texture was traced last frame from last frame's geometry prep: texel i holds
+// the light at the surface seen at full-res pixel 2i of last frame's jittered image, so the world
+// point goes into that texture through last frame's raster camera, with last frame's jitter. Then
+// every lit sample reads the light of its own surface point. (With the unjittered projections the
+// lookup would wander by up to half a pixel from frame to frame with the jitter, and TAA would
+// average that into a slightly blurred bounce light.)
 static void SetFrameConstants(IDirect3DDevice9* dev)
 {
 	float rows[3][4];

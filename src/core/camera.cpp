@@ -173,6 +173,23 @@ bool IsCameraCut(const Camera& cur, const Camera& prev)
 	return d2 > 4.0 * 4.0 || dot < 0.85; // 4 m or about 32 degrees in one frame
 }
 
+Camera Jittered(const Camera& cam, float x, float y)
+{
+	Camera j = cam;
+	if (x == 0.0f && y == 0.0f)
+		return j;
+	for (int c = 0; c < 4; c++)
+	{
+		j.viewProj.m[0][c] += x * cam.viewProj.m[3][c];
+		j.viewProj.m[1][c] += y * cam.viewProj.m[3][c];
+	}
+	j.P02 = cam.P02 + x;
+	j.P12 = cam.P12 + y;
+	j.f.P02 = (float)j.P02;
+	j.f.P12 = (float)j.P12;
+	return j;
+}
+
 // ---- Reprojection -------------------------------------------------------------------------------
 
 static void HalfSize(unsigned w, unsigned h, double& hw, double& hh)
