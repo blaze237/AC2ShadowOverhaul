@@ -11,6 +11,9 @@
 //  4. oC3 must equal what the shadowed sun light contributes: the colour minus the colour with the
 //     shadow operand of the combine zeroed, and minus the colour with the cloud shadow map black
 //     (the clouds only dim the sun); unmatched shaders write oC3 = 0.
+// The same for the contact hardening variant of the soft shadow rewrite, which must also leave
+// the lighting rewrite room: the same match as without it, both parts (AO and SSGI) still fitting,
+// and the stacked shader within ps_3_0's 512 instruction slots.
 #include "../src/common.cpp"
 #include "../src/core/shaderinfo.cpp"
 #include "../src/softshadows.cpp"
@@ -511,13 +514,39 @@ int main(int argc, char** argv)
 			soft.push_back(0);
 			softText = Check(soft, m2, f2);
 		}
+		std::string pcssText = "no contact hardening variant";
+		int m3 = m1;
+		bool f3 = false;
+		std::vector<DWORD> pcss;
+		if (SoftShadows_RewritePcss(code.data(), SoftShadowsPcss(), pcss, why))
+		{
+			pcss.push_back(0);
+			pcssText = Check(pcss, m3, f3);
+			// Both parts of the lighting rewrite on top, as the plugin creates it.
+			std::vector<DWORD> lit, litPlain;
+			LitRewriteResult r, rPlain;
+			LitParts both;
+			both.ao = both.gi = true;
+			bool ok = Lit_RewritePS(pcss.data(), both, lit, r);
+			bool okPlain = Lit_RewritePS(code.data(), both, litPlain, rPlain);
+			int slots = ok ? SoftShadows_InstructionSlots(lit) : 0;
+			char buf[96];
+			snprintf(buf, sizeof(buf), " (+lighting: %d slots)", slots);
+			pcssText += buf;
+			if (ok != okPlain || r.ao != rPlain.ao || r.gi != rPlain.gi || slots > 512)
+			{
+				pcssText += "  LIGHTING REWRITE DIFFERS OR TOO LONG";
+				f3 = true;
+			}
+		}
 		if (m1 == 1)
 			matchedCount++;
 		else if (m1 == 0)
 			zeroCount++;
-		if (f1 || f2 || m1 != m2)
+		if (f1 || f2 || f3 || m1 != m2 || m1 != m3)
 			failures++;
-		printf("%.8s %s | soft w3: %s%s\n", fd.cFileName, plain.c_str(), softText.c_str(), m1 != m2 ? "  MATCH DIFFERS" : "");
+		printf("%.8s %s | soft w3: %s%s | contact hardening: %s%s\n", fd.cFileName, plain.c_str(), softText.c_str(), m1 != m2 ? "  MATCH DIFFERS" : "",
+			pcssText.c_str(), m1 != m3 ? "  MATCH DIFFERS" : "");
 	} while (FindNextFileA(h, &fd));
 	FindClose(h);
 	printf("\n%d shaders: %d with the indirect and sun light found, %d writing oC2 = oC3 = 0, %d with failures\n", shaders, matchedCount, zeroCount,

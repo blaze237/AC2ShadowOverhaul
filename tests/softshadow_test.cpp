@@ -5,6 +5,16 @@
 //  3. the shadow section (first tap .. our result) is executed by a small ps_3_0 interpreter
 //     against a random point-sampled shadow atlas: at width 1 our filter must reproduce the game's
 //     own filter result, and at every width it must match a C reference box filter.
+// Contact hardening (the PCSS variant, [SoftShadows] ContactHardening=1):
+//  4. every shader the plain filter rewrites also gets it; the disassembler accepts it, it stays
+//     within the instruction slots and temps left for the lighting rewrite on top of it, and it
+//     matches a C reference of the same filter (blocker search, width from the cascade's scale,
+//     box of that width) on the random atlas, with random cascade constants and settings;
+//  5. on a synthetic scene (a ledge h metres above the ground, its edge across the atlas) the
+//     penumbra is measured: it widens with h as h * PenumbraScale metres (clamped to the width
+//     limits), and it is the same width in metres in two cascades of different resolution (no
+//     seam at a cascade boundary), where the plain filter's width changes with the texel size;
+//  6. the plain filter's shaders don't depend on the contact hardening settings (bit-identical).
 #include "../src/common.cpp"
 #include "../src/core/shaderinfo.cpp"
 #include "../src/softshadows.cpp"
@@ -12,6 +22,7 @@
 #include <math.h>
 #include <string>
 #include <vector>
+#include <algorithm>
 
 // ---- D3DCompiler disassembler ------------------------------------------------------------------
 struct Blob
@@ -41,6 +52,7 @@ static bool Disassemble(const std::vector<DWORD>& code, std::string& text)
 // ---- Mini interpreter ----------------------------------------------------------------------------
 static const int AW = 128, AH = 32; // atlas: 4 cascades of 32x32
 static float g_atlas[AH][AW];
+static float g_randomAtlas[AH][AW]; // g_atlas as generated (the contact hardening scene overwrites it)
 
 static float Fetch(float u, float v)
 {
@@ -52,14 +64,14 @@ static float Fetch(float u, float v)
 
 struct Machine
 {
-	float r[32][4], c[256][4];
+	float r[32][4], c[256][4], v[16][4] = {};
 	float lastGameLrp = NAN;
 };
 
 static void ReadSrc(Machine& m, DWORD t, float out[4])
 {
 	int type = RegType(t), n = RegNum(t);
-	const float* v = type == REG_TEMP ? m.r[n] : type == REG_CONST ? m.c[n] : nullptr;
+	const float* v = type == REG_TEMP ? m.r[n] : type == REG_CONST ? m.c[n] : type == REG_INPUT && n < 16 ? m.v[n] : nullptr;
 	static const float zero[4] = {};
 	if (!v)
 		v = zero;
@@ -104,6 +116,7 @@ static bool Run(Machine& m, const std::vector<DWORD>& code, size_t from, size_t 
 		case OP_MAX: for (int k = 0; k < 4; k++) res[k] = a[k] > b[k] ? a[k] : b[k]; break;
 		case OP_FRC: for (int k = 0; k < 4; k++) res[k] = a[k] - floorf(a[k]); break;
 		case OP_RCP: for (int k = 0; k < 4; k++) res[k] = 1.0f / a[0]; break;
+		case OP_RSQ: for (int k = 0; k < 4; k++) res[k] = 1.0f / sqrtf(fabsf(a[0])); break;
 		case OP_CMP: for (int k = 0; k < 4; k++) res[k] = a[k] >= 0 ? b[k] : cc[k]; break;
 		case OP_LRP: for (int k = 0; k < 4; k++) res[k] = a[k] * (b[k] - cc[k]) + cc[k]; break;
 		case 0x08: res[0] = res[1] = res[2] = res[3] = a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; break;
@@ -166,6 +179,158 @@ static float Reference(float u, float v, float depth, int N)
 static uint32_t g_rng = 12345;
 static float Rand() { return (g_rng = g_rng * 1664525u + 1013904223u) / 4294967296.0f; }
 
+// ---- Contact hardening -----------------------------------------------------------------------
+
+static size_t TokenLen(DWORD tk)
+{
+	int op = tk & 0xFFFF;
+	return op == OP_COMMENT ? ((tk >> 16) & 0x7FFF) : ((tk >> 24) & 0xF);
+}
+
+// The inserted filter in the rewritten code: from where the first tap was (after our defs) to just
+// past our mov after the game's lrp. 0 if not found.
+static bool FilterRegion(const std::vector<DWORD>& code, const std::vector<DWORD>& out, const SoftShadowsLayout& L, size_t& start, size_t& end)
+{
+	start = L.insertAt + (L.pcss ? 4 : 3) * 6;
+	size_t lrpLen = 1 + ((code[L.outputAt] >> 24) & 0xF);
+	for (size_t k = start; k + lrpLen + 2 < out.size(); k++)
+		if (memcmp(&out[k], &code[L.outputAt], lrpLen * 4) == 0)
+		{
+			end = k + lrpLen + 3; // lrp + our mov (3 tokens)
+			return true;
+		}
+	return false;
+}
+
+// The game's per-cascade shadow constants (components = cascades).
+struct Cascades
+{
+	float sx[4], ox[4], nf[2];
+};
+
+// Runs the inserted filter alone for one sample: the uv and receiver depth it reads, the atlas size
+// and cascade constants. Every other register is random, so a filter that read anything else (or a
+// temp before writing it) would not match its reference.
+static bool RunFilter(const std::vector<DWORD>& out, size_t start, size_t end, const SoftShadowsLayout& L, const Cascades& cs, float u, float v,
+	float depth, float& result, std::string& err)
+{
+	Machine m;
+	for (int a = 0; a < 32; a++)
+		for (int k = 0; k < 4; k++)
+			m.r[a][k] = Rand() * 2 - 1;
+	for (int a = 0; a < 256; a++)
+		for (int k = 0; k < 4; k++)
+			m.c[a][k] = Rand();
+	for (size_t k = 1; k < out.size() && out[k] != 0xFFFF; k += 1 + TokenLen(out[k]))
+		if ((out[k] & 0xFFFF) == OP_DEF)
+			memcpy(m.c[RegNum(out[k + 1])], &out[k + 2], 16);
+	m.c[L.sizeConst][0] = AW;
+	m.c[L.sizeConst][1] = AH;
+	for (int k = 0; k < 4; k++)
+	{
+		m.c[L.scalesX][k] = cs.sx[k];
+		m.c[L.offsetsX][k] = cs.ox[k];
+	}
+	m.c[L.nearFar][0] = cs.nf[0];
+	m.c[L.nearFar][1] = cs.nf[1];
+	m.r[L.uvReg][L.uvComp[0]] = u;
+	m.r[L.uvReg][L.uvComp[1]] = v;
+	if (L.depthType == REG_TEMP)
+		m.r[L.depthReg][L.depthComp] = depth;
+	else
+		m.v[L.depthReg][L.depthComp] = depth;
+	if (!Run(m, out, start, end, L, err))
+		return false;
+	result = m.r[L.tempBase + 9][0];
+	if (m.r[L.outReg][L.outComp] != result)
+	{
+		err = "result not moved over the game's";
+		return false;
+	}
+	return true;
+}
+
+static float Sat(float x) { return x < 0 ? 0 : x > 1 ? 1 : x; }
+
+// C reference of the contact hardening filter (see softshadows.cpp).
+static float PcssReference(float u, float v, float depth, const Cascades& cs, const SoftShadowsPcss& p, float* widthOut = nullptr)
+{
+	float x = u * AW - 1.5f, y = v * AH - 1.5f;
+	float bx = floorf(x), by = floorf(y), fx = x - bx, fy = y - by;
+	float tileLo = floorf(u * 4) / 4, lo = tileLo + 0.5f / AW, hi = tileLo + 0.25f - 0.5f / AW;
+	float B[5][5], sum = 0, count = 0;
+	for (int j = 0; j <= 4; j++)
+		for (int i = 0; i <= 4; i++)
+		{
+			float su = (bx + i + 0.5f) / AW;
+			su = su < lo ? lo : su > hi ? hi : su;
+			float d = Fetch(su, (by + j + 0.5f) / AH) - depth;
+			B[j][i] = d < 0 ? 1.0f : 0.0f;
+			if (d < 0)
+				sum -= d, count++;
+		}
+	float metres = (count ? sum / count : 0) / fabsf(cs.nf[0]);
+	float tile = floorf(u * 4), scale = 0;
+	for (int k = 0; k < 4; k++)
+		if (floorf(cs.ox[k] * 4 + 0.125f) == tile)
+			scale += cs.sx[k];
+	float w = metres * fabsf(scale) * AW * p.penumbraScale;
+	w = fminf(fmaxf(w, fminf(p.minWidth, p.maxWidth)), p.maxWidth);
+	if (widthOut)
+		*widthOut = w;
+	float lx = fx + 2 - w / 2, ly = fy + 2 - w / 2, blocked = 0;
+	for (int j = 0; j <= 4; j++)
+		for (int i = 0; i <= 4; i++)
+			blocked += (Sat(lx + w - i) - Sat(lx - i)) * (Sat(ly + w - j) - Sat(ly - j)) * B[j][i];
+	return Sat(1 - blocked / (w * w));
+}
+
+// The synthetic scene: ground at depth `ground` everywhere, and a ledge h metres above it (closer
+// to the light: depth ground + h * nf.x, nf.x < 0) over world x < 0. Every tile holds the scene as
+// its cascade maps it (u = x * sx[k] + ox[k], offsets at the tiles' centres).
+static const float kGround = 0.8f;
+static void FillLedge(const Cascades& cs, float h)
+{
+	for (int y = 0; y < AH; y++)
+		for (int x = 0; x < AW; x++)
+		{
+			int k = x / (AW / 4);
+			float wx = ((x + 0.5f) / AW - cs.ox[k]) / cs.sx[k];
+			g_atlas[y][x] = wx < 0 ? kGround + h * cs.nf[0] : kGround;
+		}
+}
+
+// Penumbra width in metres in cascade k: how far apart world x is where the ground under the
+// ledge's edge is 10% and 90% lit (the shadow fades linearly across a box filter's width).
+static bool MeasurePenumbra(const std::vector<DWORD>& out, size_t start, size_t end, const SoftShadowsLayout& L, const Cascades& cs, int k,
+	float& width, std::string& err)
+{
+	const float step = 0.25f / (cs.sx[k] * AW) / 8; // 1/32 texel
+	float prevX = 0, prev = 0, x10 = NAN, x90 = NAN;
+	for (float x = -1.2f; x <= 1.2f; x += step)
+	{
+		float lit;
+		if (!RunFilter(out, start, end, L, cs, x * cs.sx[k] + cs.ox[k], 0.5f, kGround, lit, err))
+			return false;
+		if (x > -1.2f)
+		{
+			if (prev < 0.1f && lit >= 0.1f && x10 != x10)
+				x10 = prevX + (0.1f - prev) / (lit - prev) * (x - prevX);
+			if (prev < 0.9f && lit >= 0.9f && x90 != x90)
+				x90 = prevX + (0.9f - prev) / (lit - prev) * (x - prevX);
+		}
+		prevX = x;
+		prev = lit;
+	}
+	if (x10 != x10 || x90 != x90)
+	{
+		err = "no shadow edge found";
+		return false;
+	}
+	width = (x90 - x10) / 0.8f;
+	return true;
+}
+
 int main(int argc, char** argv)
 {
 	const char* dir = argc > 1 ? argv[1] : "../re/shaders/dump";
@@ -180,6 +345,7 @@ int main(int argc, char** argv)
 	for (int y = 0; y < AH; y++)
 		for (int x = 0; x < AW; x++)
 			g_atlas[y][x] = Rand();
+	memcpy(g_randomAtlas, g_atlas, sizeof(g_atlas));
 
 	char pattern[MAX_PATH];
 	snprintf(pattern, sizeof(pattern), "%s\\*.cso", dir);
@@ -190,7 +356,7 @@ int main(int argc, char** argv)
 		printf("no .cso files in %s\n", dir);
 		return 1;
 	}
-	int shaders = 0, rewritten = 0, failures = 0;
+	int shaders = 0, rewritten = 0, failures = 0, pcssOk = 0;
 	do
 	{
 		char path[MAX_PATH];
@@ -373,6 +539,212 @@ int main(int argc, char** argv)
 				ok = false;
 			}
 		}
+		// ---- Contact hardening ----
+		if (any && ok)
+		{
+			std::vector<DWORD> plainBefore, plainAfter, pc;
+			std::string why;
+			SoftShadows_Rewrite(code.data(), 3, plainBefore, why);
+			const SoftShadowsPcss defaults;
+			if (!SoftShadows_RewritePcss(code.data(), defaults, pc, why))
+			{
+				line += " pcss:FAILED (" + why + ")";
+				ok = false;
+			}
+			SoftShadowsLayout L = g_softShadowsLastLayout;
+			std::string text, err;
+			size_t start = 0, end = 0;
+			if (ok && (!Disassemble(pc, text) || text.find("error") != std::string::npos))
+			{
+				line += " pcss:disasm FAILED";
+				ok = false;
+			}
+			if (ok && !FilterRegion(code, pc, L, start, end))
+			{
+				line += " pcss:lrp not found in output";
+				ok = false;
+			}
+			if (ok)
+			{
+				// Slots, and temps: at most 10 more, and 3 left for the lighting rewrite.
+				int slots = SoftShadows_InstructionSlots(pc), maxTemp = -1;
+				for (size_t k = 1; k < pc.size() && pc[k] != 0xFFFF; k += 1 + TokenLen(pc[k]))
+				{
+					int op = pc[k] & 0xFFFF;
+					if (op == OP_COMMENT || op == OP_DEF || op == OP_DCL)
+						continue;
+					for (size_t q = 1; q <= TokenLen(pc[k]); q++)
+						if ((pc[k + q] & 0x80000000u) && RegType(pc[k + q]) == REG_TEMP)
+							maxTemp = std::max(maxTemp, RegNum(pc[k + q]));
+				}
+				static int maxSlots = 0;
+				if (slots > maxSlots)
+				{
+					maxSlots = slots;
+					printf("  [pcss max instruction slots so far: %d (w4 %d)]\n", slots, SoftShadows_InstructionSlots(plainBefore));
+				}
+				if (slots > 512 - 48 || maxTemp > L.tempBase + 9 || maxTemp > 28)
+				{
+					char buf[96];
+					snprintf(buf, sizeof(buf), " pcss:TOO BIG (%d slots, r%d)", slots, maxTemp);
+					line += buf;
+					ok = false;
+				}
+			}
+			// The C reference on the random atlas: random cascade constants (the cascades' order in
+			// the atlas shuffled; offsets at the tiles' centres or starts) and settings.
+			int refBad = 0;
+			float worst = 0, wMin = 9, wMax = 0;
+			for (int set = 0; set < 4 && ok; set++)
+			{
+				SoftShadowsPcss p;
+				p.penumbraScale = set == 0 ? defaults.penumbraScale : 0.005f + Rand() * 0.3f;
+				p.minWidth = set == 0 ? defaults.minWidth : 1 + Rand() * 3;
+				p.maxWidth = set == 0 ? defaults.maxWidth : 1 + Rand() * 3;
+				std::vector<DWORD> o;
+				if (!SoftShadows_RewritePcss(code.data(), p, o, why) || !FilterRegion(code, o, g_softShadowsLastLayout, start, end))
+				{
+					line += " pcss:settings rewrite FAILED";
+					ok = false;
+					break;
+				}
+				const SoftShadowsLayout& Lp = g_softShadowsLastLayout;
+				for (int trial = 0; trial < 1500 && ok; trial++)
+				{
+					Cascades cs;
+					int order[4] = { 0, 1, 2, 3 };
+					for (int k = 3; k > 0; k--)
+						std::swap(order[k], order[(int)(Rand() * (k + 1)) % (k + 1)]);
+					bool centres = Rand() < 0.5f;
+					for (int k = 0; k < 4; k++)
+					{
+						cs.sx[k] = (0.5f + Rand() * 7) / AW * (Rand() < 0.5f ? -1 : 1);
+						cs.ox[k] = (order[k] + (centres ? 0.5f : 0.0f)) * 0.25f + (Rand() - 0.5f) * 2.0f / AW;
+					}
+					cs.nf[0] = (0.005f + Rand() * 0.05f) * (Rand() < 0.5f ? -1 : 1);
+					cs.nf[1] = Rand();
+					int tile = (int)(Rand() * 4);
+					float margin = 6.0f / AW;
+					float u = tile * 0.25f + margin + Rand() * (0.25f - 2 * margin);
+					float v = 6.0f / AH + Rand() * (1 - 12.0f / AH);
+					float depth = Rand(), ours, w;
+					if (!RunFilter(o, start, end, Lp, cs, u, v, depth, ours, err))
+					{
+						line += " pcss:interp: " + err;
+						ok = false;
+						break;
+					}
+					float ref = PcssReference(u, v, depth, cs, SoftShadows_ClampPcss(p), &w);
+					wMin = std::min(wMin, w);
+					wMax = std::max(wMax, w);
+					if (!(fabsf(ours - ref) <= 2e-4f))
+					{
+						refBad++;
+						worst = std::max(worst, fabsf(ours - ref));
+					}
+				}
+			}
+			if (ok && refBad)
+			{
+				char buf[96];
+				snprintf(buf, sizeof(buf), " pcss:REF-FAIL[%d, worst %.4f]", refBad, worst);
+				line += buf;
+				ok = false;
+			}
+			// The ledge: penumbra width against its height, in two cascades (8 and 4 texels per
+			// metre, the second next to the first in the atlas).
+			if (ok)
+			{
+				SoftShadowsPcss p;
+				p.penumbraScale = 0.1f;
+				p.minWidth = 1;
+				p.maxWidth = 4;
+				std::vector<DWORD> o;
+				SoftShadows_RewritePcss(code.data(), p, o, why);
+				const SoftShadowsLayout Lp = g_softShadowsLastLayout;
+				FilterRegion(code, o, Lp, start, end);
+				Cascades cs;
+				const float tpm[4] = { 8, 4, 2, 1 };
+				for (int k = 0; k < 4; k++)
+				{
+					cs.sx[k] = tpm[k] / AW;
+					cs.ox[k] = 0.125f + 0.25f * k;
+				}
+				cs.nf[0] = -0.02f;
+				cs.nf[1] = 0.5f;
+				const float heights[] = { 0.5f, 1, 2, 3, 4, 10 };
+				float prevW = 0, w3[2] = {};
+				std::string growth;
+				for (float h : heights)
+				{
+					FillLedge(cs, h);
+					for (int k = 0; k < 2 && ok; k++)
+					{
+						if (k == 1 && h != 3)
+							continue;
+						float width;
+						if (!MeasurePenumbra(o, start, end, Lp, cs, k, width, err))
+						{
+							line += " pcss:ledge: " + err;
+							ok = false;
+							break;
+						}
+						// Expected: h * scale metres, clamped to 1..4 texels of this cascade.
+						float expect = std::min(std::max(h * p.penumbraScale, p.minWidth / tpm[k]), p.maxWidth / tpm[k]);
+						if (fabsf(width - expect) > 0.01f + 0.02f * expect)
+						{
+							char buf[96];
+							snprintf(buf, sizeof(buf), " pcss:PENUMBRA h=%.1f c%d %.3f m (expected %.3f)", h, k, width, expect);
+							line += buf;
+							ok = false;
+						}
+						if (k == 0)
+						{
+							if (width < prevW - 0.005f)
+								ok = false, line += " pcss:PENUMBRA SHRINKS";
+							prevW = width;
+							char buf[32];
+							snprintf(buf, sizeof(buf), "%s%.2f", growth.empty() ? "" : "/", width);
+							growth += buf;
+						}
+						if (h == 3)
+							w3[k] = width;
+					}
+				}
+				memcpy(g_atlas, g_randomAtlas, sizeof(g_atlas));
+				if (ok && fabsf(w3[0] - w3[1]) > 0.01f)
+				{
+					char buf[96];
+					snprintf(buf, sizeof(buf), " pcss:SEAM (%.3f m in cascade 0, %.3f m in cascade 1)", w3[0], w3[1]);
+					line += buf;
+					ok = false;
+				}
+				if (ok)
+				{
+					char buf[160];
+					snprintf(buf, sizeof(buf), " pcss:ok (widths %.2f-%.2f texels; ledge 0.5..10 m: %s m; cascades 0/1 at 3 m: %.3f/%.3f m)", wMin,
+						wMax, growth.c_str(), w3[0], w3[1]);
+					line += buf;
+				}
+			}
+			// The plain filter doesn't depend on the contact hardening settings.
+			SoftShadowsPcss other;
+			other.penumbraScale = 0.3f;
+			other.minWidth = 2;
+			other.maxWidth = 3;
+			SoftShadows_SetContactHardening(true);
+			SoftShadows_SetPcss(other);
+			SoftShadows_PcssBuilt(nullptr);
+			SoftShadows_Rewrite(code.data(), 3, plainAfter, why);
+			SoftShadows_SetContactHardening(false);
+			if (plainAfter != plainBefore)
+			{
+				line += " PLAIN FILTER CHANGED BY CONTACT HARDENING SETTINGS";
+				ok = false;
+			}
+			if (ok)
+				pcssOk++;
+		}
 		if (any)
 			rewritten++;
 		if (!ok)
@@ -380,6 +752,6 @@ int main(int argc, char** argv)
 		printf("%.8s %s\n", fd.cFileName, line.c_str());
 	} while (FindNextFileA(h, &fd));
 	FindClose(h);
-	printf("\n%d shaders, %d rewritten, %d with failures\n", shaders, rewritten, failures);
+	printf("\n%d shaders, %d rewritten (%d with contact hardening), %d with failures\n", shaders, rewritten, pcssOk, failures);
 	return failures ? 3 : 0;
 }
