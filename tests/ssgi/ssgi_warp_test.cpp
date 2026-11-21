@@ -20,7 +20,14 @@
 //    with the unjittered ones;
 //  - a light switched on (the red wall's radiance x 3): how many frames the temporal pass takes to
 //    follow it (its blend is at least TemporalBlend = 0.1 per frame), the lag TAA comes on top of
-//    (tests/taa's "light settling" case measures what TAA adds).
+//    (tests/taa's "light settling" case measures what TAA adds);
+//  - the history clip (HistoryClamp): the light switched off again is gone from the history within a
+//    few frames instead of ~22, without more noise or a shifted level on a still scene;
+//  - the blur by frame count: wider for fresh pixels (less noise left), narrower for settled ones
+//    (more detail kept), the count kept through the first pass, fresh light hardly bleeding into
+//    settled light;
+//  - the feedback (the game adding albedo x GI to the colour the next frame traces): at intensity 2
+//    the loop gains no more than at 1 with the radiance pass's damping, clearly more without it.
 // Writes ssgi_warp_gi.png (the final GI light) to look at.
 #include <windows.h>
 #include <d3d11.h>
@@ -324,6 +331,18 @@ static Target MakeTarget(UINT w, UINT h, DXGI_FORMAT fmt, const void* init = nul
 	return t;
 }
 
+// Releases a target with its views (the views hold the texture too).
+static void Free(Target& t)
+{
+	if (t.srv)
+		t.srv->Release();
+	if (t.rtv)
+		t.rtv->Release();
+	if (t.tex)
+		t.tex->Release();
+	t = Target();
+}
+
 static std::vector<float> ReadBack(const Target& t) // RGBA32F targets only
 {
 	D3D11_TEXTURE2D_DESC d;
@@ -394,18 +413,18 @@ static ID3D11InputLayout* g_layout;
 static ID3D11Buffer* g_vb;
 static ID3D11SamplerState *g_point, *g_linear;
 
-// Constants as src/gi.cpp sets them (c0..c10, by name).
+// Constants as src/gi.cpp sets them (c0..c14, by name).
 struct Consts
 {
-	float c[11][4];
+	float c[15][4];
 };
-static const char* const kConstNames[11] = { "c_Full", "c_Half", "c_Proj", "c_Proj2", "c_Trace", "c_Trace2", "c_Reproj0", "c_Reproj1",
-	"c_Reproj2", "c_Temporal", "c_Blur" };
+static const char* const kConstNames[15] = { "c_Full", "c_Half", "c_Proj", "c_Proj2", "c_Trace", "c_Trace2", "c_Reproj0", "c_Reproj1",
+	"c_Reproj2", "c_Temporal", "c_Blur", "c_GiRow0", "c_GiRow1", "c_GiRow2", "c_Feedback" };
 
 static void Pass(Shader& s, const Consts& k, std::vector<const Target*> outs, std::vector<std::pair<const char*, const Target*>> inputs)
 {
 	for (auto& v : s.vars)
-		for (int i = 0; i < 11; i++)
+		for (int i = 0; i < 15; i++)
 			if (v.first == kConstNames[i] && v.second + 16 <= s.cb.size())
 				memcpy(&s.cb[v.second], k.c[i], 16);
 	ID3D11Buffer* cb = nullptr;
@@ -425,7 +444,7 @@ static void Pass(Shader& s, const Consts& k, std::vector<const Target*> outs, st
 				ctx->PSSetShaderResources(t.second, 1, &in.second->srv);
 	for (auto& sm : s.samplers)
 	{
-		bool linear = sm.first == "s_Colour" || sm.first == "s_Out";
+		bool linear = sm.first == "s_Colour" || sm.first == "s_Out" || sm.first == "s_Gi";
 		ctx->PSSetSamplers(sm.second, 1, linear ? &g_linear : &g_point);
 	}
 	D3D11_VIEWPORT vp = { 0, 0, (float)outs[0]->w, (float)outs[0]->h, 0, 1 };
@@ -549,12 +568,16 @@ int main()
 		{ rows[2][0], rows[2][1], rows[2][2], rows[2][3] },
 		{ 0.1f, 0.05f, 0.0f, 10.0f },
 		{ 1.5f, 0, 0, 0 },
+		{ rows[0][0], rows[0][1], rows[0][2], rows[0][3] },
+		{ rows[1][0], rows[1][1], rows[1][2], rows[1][3] },
+		{ rows[2][0], rows[2][1], rows[2][2], rows[2][3] },
+		{ 0, 0, 0, 0 }, // no feedback damping, no history clip: the checks below test the rest alone; their own sections test those
 	} };
 
 	// The geometry prep shared with AO (normals + depth), then SSGI's radiance pass, as the mod runs them.
 	auto prep = [&](const Target& geo, const Target& depthT) {
 		Pass(geoPrep, k, { &geo }, { { "s_Depth", &depthT } });
-		Pass(radiance, k, { &tRad }, { { "s_Colour", &tColour } });
+		Pass(radiance, k, { &tRad }, { { "s_Colour", &tColour }, { "s_Geo", &geo } });
 	};
 
 	// ---- Prep + trace, averaged over 8 noise frames (the game averages over frames too)
@@ -976,8 +999,9 @@ int main()
 			for (size_t i = 0; i < n; i++)
 				conv[i] += raws.back()[i] / 32;
 		}
-		auto noise = [&](float minBlend, double& alone, double& withTaa) {
+		auto noise = [&](float minBlend, double& alone, double& withTaa, float clip = 0, double* bias = nullptr) {
 			Consts kt = k;
+			kt.c[14][1] = clip;
 			kt.c[9][0] = minBlend;
 			kt.c[9][3] = 1.0f / minBlend;
 			std::vector<float> taa;
@@ -995,16 +1019,19 @@ int main()
 					taa[i] += (h[i] - taa[i]) * 0.05f;
 				if (f == 63)
 				{
-					double e = 0, et = 0, level = 0;
+					double e = 0, et = 0, level = 0, sum = 0;
 					for (size_t i = 0; i < n; i += 4)
 						for (int c = 0; c < 3; c++)
 						{
 							e += fabs(h[i + c] - conv[i + c]);
 							et += fabs(taa[i + c] - conv[i + c]);
 							level += conv[i + c];
+							sum += h[i + c];
 						}
 					alone = e / level;
 					withTaa = et / level;
+					if (bias)
+						*bias = sum / level - 1;
 				}
 			}
 		};
@@ -1015,12 +1042,145 @@ int main()
 			   "TAA-like averaging %.4f; blend 0.2 %.4f, then TAA-like averaging %.4f\n",
 			a1, t1, a2, t2);
 		CHECK(t2 < a1, "with TAA averaging, the doubled blend should still be less noisy than the normal blend alone (%.4f vs %.4f)", t2, a1);
+
+		// ---- History clip ([SSGI] HistoryClamp, 1.5 standard deviations): the light switched off again
+		// (red wall x 3 -> x 1: like someone walking past a sunlit wall, whose bounce on the floor has to
+		// go when they have). Every frame has its own noise, as in the game. Without the clip the old
+		// light fades at the blend (about 22 frames to 90 %); with it, it should be gone in a few. On the
+		// still scene the clip must not add much noise or shift the level.
+		{
+			const float clip = 1.5f;
+			std::vector<std::vector<float>> brightRaws;
+			Pass(radiance, k, { &tRad }, { { "s_Colour", &tBright }, { "s_Geo", &tGeo[0] } });
+			float hi[4] = {}, lo[4] = {};
+			for (int f = 0; f < 16; f++)
+			{
+				Consts kf = k;
+				kf.c[3][2] = (float)f;
+				Pass(trace, kf, { &tRaw }, { { "s_Geo", &tGeo[0] }, { "s_Rad", &tRad } });
+				brightRaws.push_back(ReadBack(tRaw));
+				float v[4];
+				Avg(brightRaws.back(), px, py, v, 1);
+				for (int c = 0; c < 4; c++)
+					hi[c] += v[c] / 16;
+			}
+			Pass(radiance, k, { &tRad }, { { "s_Colour", &tColour }, { "s_Geo", &tGeo[0] } });
+			Avg(conv, px, py, lo, 1);
+			auto trail = [&](float clipSigmas) {
+				Consts kt = k;
+				kt.c[14][1] = clipSigmas;
+				int cur = 0;
+				for (int f = 0; f < 40; f++, cur ^= 1)
+				{
+					Target tIn = MakeTarget(HW, HH, F, brightRaws[f % 16].data(), HW * 16);
+					kt.c[9][2] = f ? 1.0f : 0.0f;
+					Pass(temporal, kt, { &tHist[cur] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tIn }, { "s_Hist", &tHist[cur ^ 1] }, { "s_PrevGeo", &tGeo[0] } });
+					Free(tIn);
+				}
+				for (int i = 1; i <= 40; i++, cur ^= 1)
+				{
+					Target tIn = MakeTarget(HW, HH, F, raws[(i * 7 + 3) % 32].data(), HW * 16);
+					Pass(temporal, kt, { &tHist[cur] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tIn }, { "s_Hist", &tHist[cur ^ 1] }, { "s_PrevGeo", &tGeo[0] } });
+					Free(tIn);
+					float v[4];
+					Avg(ReadBack(tHist[cur]), px, py, v, 1);
+					if (v[0] - lo[0] <= 0.1f * (hi[0] - lo[0]))
+						return i;
+				}
+				return -1;
+			};
+			int slow = trail(0), fast = trail(clip);
+			double ac, tc, bias;
+			noise(0.1f, ac, tc, clip, &bias);
+			printf("history clip (%.2f sigmas): light switched off (floor by the wall %.3f -> %.3f) gone to 10 %% after %d frames, %d without; "
+				   "still scene noise %.4f (%.4f without), level %+.1f %%\n",
+				clip, hi[0], lo[0], fast, slow, ac, a1, 100 * bias);
+			CHECK(slow > 10, "without the clip the old light should take the blend's time to go (%d frames)", slow);
+			CHECK(fast > 0 && fast <= 5, "with the clip the old light should be gone within a few frames (%d)", fast);
+			CHECK(ac < 1.25 * a1, "the clip adds too much noise on a still scene (%.4f vs %.4f)", ac, a1);
+			CHECK(fabs(bias) < 0.03, "the clip shifts the settled level by %.1f %%", 100 * bias);
+		}
+
+		// ---- Blur width by frame count (history alpha). On one noisy trace frame marked fresh (count
+		// 1) the blur is wider than with it marked settled (count 10), so less noise is left; on the
+		// settled light (32 frames averaged) marked settled it is narrower and keeps more detail. The
+		// first pass keeps the count for the second; taps with fewer frames than the pixel count for
+		// less, so a band of fresh, wrong light next to settled light barely bleeds into it.
+		{
+			const std::vector<float> one = raws[5];
+			auto withCount = [&](const std::vector<float>& img, float count) {
+				std::vector<float> v(img);
+				for (size_t i = 0; i < n; i += 4)
+					v[i + 3] = geo[i + 3] > 0 ? count : 0;
+				return v;
+			};
+			std::vector<float> tmpOut;
+			auto blurred = [&](const std::vector<float>& img) {
+				Target tIn = MakeTarget(HW, HH, F, img.data(), HW * 16);
+				Pass(blur, k, { &tTmp }, { { "s_Geo", &tGeo[0] }, { "s_Src", &tIn } });
+				Consts kd = k;
+				kd.c[10][0] = 0;
+				kd.c[10][1] = 1.5f;
+				kd.c[10][2] = 1;
+				Pass(blur, kd, { &tOut }, { { "s_Geo", &tGeo[0] }, { "s_Src", &tTmp } });
+				Free(tIn);
+				tmpOut = ReadBack(tTmp);
+				return ReadBack(tOut);
+			};
+			auto err = [&](const std::vector<float>& a, const std::vector<float>& b) {
+				double e = 0, level = 0;
+				for (size_t i = 0; i < n; i += 4)
+					if (geo[i + 3] > 0)
+						for (int c = 0; c < 3; c++)
+						{
+							e += fabs(a[i + c] - b[i + c]);
+							level += b[i + c];
+						}
+				return e / level;
+			};
+			// Noise left: the noisy frame blurred against the settled light blurred the same way. Detail
+			// lost: the settled light blurred against itself.
+			const std::vector<float> convNarrow = blurred(withCount(conv, 10));
+			float keptCount = tmpOut[((size_t)(HH / 2) * HW + HW / 2) * 4 + 3];
+			const std::vector<float> convWide = blurred(withCount(conv, 1));
+			double freshWide = err(blurred(withCount(one, 1)), convWide), freshNarrow = err(blurred(withCount(one, 10)), convNarrow);
+			double settledNarrow = err(convNarrow, conv), settledWide = err(convWide, conv), unblurred = err(one, conv);
+			// The band: 7 texel columns of light x 3, starting 2 texels right of a settled texel; fresh
+			// (count 1), and for comparison settled like the rest (count 10, so not down-weighted).
+			const float pMid[3] = { -0.5f, -1.6f, 6.0f };
+			float mx, my;
+			Project(pMid, eye0, mx, my);
+			int cx = (int)(mx / 2), cy = (int)(my / 2);
+			auto withBand = [&](float count) {
+				std::vector<float> band = withCount(conv, 10);
+				for (int y = 0; y < (int)HH; y++)
+					for (int x = cx + 2; x < cx + 9; x++)
+					{
+						float* v = &band[((size_t)y * HW + x) * 4];
+						for (int c = 0; c < 3; c++)
+							v[c] *= 3;
+						v[3] = v[3] > 0 ? count : 0;
+					}
+				return At(blurred(band), HW, cx, cy)[1] / At(convNarrow, HW, cx, cy)[1] - 1;
+			};
+			float bleed = withBand(1), bleedSettled = withBand(10);
+			printf("blur by frame count (mean |error| / mean level): one noisy frame (%.4f unblurred) keeps %.4f of noise blurred as fresh, "
+				   "%.4f as settled; the settled light loses %.4f of detail blurred as settled, %.4f as fresh; light x 3 two texels away "
+				   "brightens a settled texel by %.1f %% when fresh, %.1f %% when settled\n",
+				unblurred, freshWide, freshNarrow, settledNarrow, settledWide, 100 * bleed, 100 * bleedSettled);
+			CHECK(freshWide < 0.7 * freshNarrow, "a fresh pixel should be blurred wider (noise left %.4f vs %.4f)", freshWide, freshNarrow);
+			CHECK(settledNarrow < 0.7 * settledWide, "settled light should keep its detail (%.4f lost vs %.4f)", settledNarrow, settledWide);
+			CHECK(fabsf(keptCount - 10) < 1e-3f, "the first blur pass should keep the frame count (%.2f)", keptCount);
+			CHECK(bleed < 0.25f * bleedSettled, "fresh light bleeds %.1f %% into settled light (%.1f %% if it were settled)", 100 * bleed, 100 * bleedSettled);
+		}
 	}
 
 	// ---- Blur + intensity: one run of the full chain on frame 0's trace.
 	{
 		prep(tGeo[0], tDepth);
 		std::vector<float> avg(gi);
+		for (size_t i = 3; i < avg.size(); i += 4)
+			avg[i] = geo[i] > 0 ? 10.0f : 0.0f; // settled (alpha = frames accumulated, as the temporal pass writes it)
 		Target tAvg = MakeTarget(HW, HH, F, avg.data(), HW * 16);
 		Pass(blur, k, { &tTmp }, { { "s_Geo", &tGeo[0] }, { "s_Src", &tAvg } });
 		Consts kd = k;
@@ -1055,6 +1215,73 @@ int main()
 			for (int c = 0; c < 3; c++)
 				png[i * 3 + c] = (uint8_t)fminf(255.0f, 255.0f * powf(fmaxf(fin[i * 4 + c] * 0.5f, 0.0f), 1 / 2.2f));
 		WritePng("ssgi_warp_gi.png", png, HW, HH);
+	}
+
+	// ---- Feedback. The game's shaders add albedo x GI to the colour the next frame traces, so the
+	// bounce feeds back into itself. Here the full chain runs as one step per frame (no temporal lag),
+	// with every surface's albedo 0.9 and the colour = the scene's + 0.9 x the last result. The ratio of
+	// where it settles to the first bounce is the many-bounce gain: 1 / (1 - loop gain). At intensity 2
+	// without the radiance pass's damping it is clearly more than at 1 (in a bright enclosed space it
+	// would run away); with it, no more than at intensity 1.
+	{
+		prep(tGeo[0], tDepth);
+		const float albedo = 0.9f;
+		auto settle = [&](float intensity, bool damp, double& first, double& last) {
+			std::vector<float> G((size_t)HW * HH * 4, 0.0f);
+			const int iters = 16;
+			double sum = 0;
+			int nSum = 0;
+			for (int it = 0; it < iters; it++)
+			{
+				std::vector<float> c(colour);
+				for (UINT y = 0; y < H; y++)
+					for (UINT x = 0; x < W; x++)
+						if (depth[(size_t)y * W + x] < 1)
+							for (int ch = 0; ch < 3; ch++)
+								c[((size_t)y * W + x) * 4 + ch] += albedo * G[((size_t)(y / 2) * HW + x / 2) * 4 + ch];
+				Target tC = MakeTarget(W, H, F, c.data(), W * 16), tG = MakeTarget(HW, HH, F, G.data(), HW * 16);
+				Consts kl = k;
+				kl.c[3][2] = (float)it;
+				kl.c[5][2] = intensity;
+				kl.c[9][2] = 0;
+				kl.c[14][0] = damp && intensity > 1 ? 1 - 1 / intensity : 0;
+				Pass(radiance, kl, { &tRad }, { { "s_Colour", &tC }, { "s_Geo", &tGeo[0] }, { "s_Gi", &tG } });
+				Pass(trace, kl, { &tRaw }, { { "s_Geo", &tGeo[0] }, { "s_Rad", &tRad } });
+				Pass(temporal, kl, { &tHist[0] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tRaw }, { "s_Hist", &tHist[1] }, { "s_PrevGeo", &tGeo[0] } });
+				Pass(blur, kl, { &tTmp }, { { "s_Geo", &tGeo[0] }, { "s_Src", &tHist[0] } });
+				Consts kd = kl;
+				kd.c[10][0] = 0;
+				kd.c[10][1] = 1.5f;
+				kd.c[10][2] = 1;
+				Pass(blur, kd, { &tOut }, { { "s_Geo", &tGeo[0] }, { "s_Src", &tTmp } });
+				Free(tC);
+				Free(tG);
+				G = ReadBack(tOut);
+				double m = 0;
+				int nm = 0;
+				for (size_t i = 0; i < G.size(); i += 4)
+					if (geo[i + 3] > 0 && geo[i + 1] > 0.9f) // the floor
+						m += G[i + 1], nm++;
+				m /= nm ? nm : 1;
+				if (it == 0)
+					first = m;
+				if (it >= iters - 4)
+					sum += m, nSum++;
+			}
+			last = sum / nSum;
+		};
+		double f1, l1, f2, l2, f2d, l2d;
+		settle(1.0f, true, f1, l1);
+		settle(2.0f, false, f2, l2);
+		settle(2.0f, true, f2d, l2d);
+		const double g1 = l1 / f1, g2 = l2 / f2, g2d = l2d / f2d;
+		printf("feedback (albedo 0.9, floor light): intensity 1 %.3f -> %.3f (x %.2f); intensity 2 undamped %.3f -> %.3f (x %.2f), "
+			   "damped %.3f -> %.3f (x %.2f)\n",
+			f1, l1, g1, f2, l2, g2, f2d, l2d, g2d);
+		CHECK(fabs(f2d - 2 * f1) < 0.05 * f1, "intensity 2 should double the first bounce (%.3f vs %.3f)", f2d, f1);
+		CHECK(g2 > 1.15 * g1, "the test scene should show the undamped loop gaining more at intensity 2 (x %.2f vs x %.2f)", g2, g1);
+		CHECK(g2d <= 1.03 * g1, "damped, intensity 2 should gain no more from the feedback than intensity 1 (x %.2f vs x %.2f)", g2d, g1);
+		CHECK(g2d >= 1.0, "damped, the light should still build up over frames (x %.2f)", g2d);
 	}
 
 	printf(g_fail ? "%d FAILURES\n" : "all SSGI shader checks passed\n", g_fail);

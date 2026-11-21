@@ -27,6 +27,10 @@ static volatile bool g_on = true;
 static volatile float g_intensity = 1.0f;
 static volatile int g_view = 0;
 static float g_radius = 10.0f, g_maxScreenRadius = 1.0f, g_thickness = 0.5f, g_minBlend = 0.1f, g_radianceClamp = 4.0f, g_depthTolerance = 0.05f;
+static volatile float g_historyClip = 1.5f; // history clipped to this frame's mean +- this many standard deviations (0 = off)
+// Intensity is capped at 2: the radiance pass keeps the bounce feeding back into itself from gaining
+// more than it does at intensity 1 (see PS_Radiance in shaders/ssgi.hlsl), which holds up to 2.
+static const float kMaxIntensity = 2.0f;
 static int g_slices = 3, g_steps = 8;
 static volatile bool g_historyReset = false; // set when switched on/off (no stale light when turned back on)
 
@@ -47,7 +51,7 @@ bool GI_Init()
 		return false;
 	}
 	g_on = IniInt(S, "StartEnabled", 1) != 0;
-	g_intensity = Clamp(IniFloat(S, "Intensity", 1.0f), 0.0f, 8.0f);
+	g_intensity = Clamp(IniFloat(S, "Intensity", 1.0f), 0.0f, kMaxIntensity);
 	g_radius = Clamp(IniFloat(S, "Radius", 10.0f), 0.25f, 50.0f);
 	g_maxScreenRadius = Clamp(IniFloat(S, "MaxScreenRadius", 1.0f), 0.05f, 4.0f);
 	g_thickness = Clamp(IniFloat(S, "Thickness", 0.5f), 0.02f, 10.0f);
@@ -55,10 +59,11 @@ bool GI_Init()
 	g_steps = (int)Clamp((float)IniInt(S, "Steps", 8), 2, 24);
 	g_minBlend = Clamp(IniFloat(S, "TemporalBlend", 0.1f), 0.02f, 1.0f);
 	g_radianceClamp = Clamp(IniFloat(S, "RadianceClamp", 4.0f), 0.1f, 1000.0f);
+	g_historyClip = Clamp(IniFloat(S, "HistoryClamp", 1.5f), 0.0f, 4.0f);
 	g_view = (int)Clamp((float)IniInt(S, "DebugView", 0), 0, 3);
-	LogInfo("SSGI: intensity %.2f, radius %.2f m (at most %.2f x screen height), thickness %.2f m, %d slices x %d steps, temporal blend %.2f, radiance clamp %.1f%s.",
+	LogInfo("SSGI: intensity %.2f, radius %.2f m (at most %.2f x screen height), thickness %.2f m, %d slices x %d steps, temporal blend %.2f, radiance clamp %.1f, history clamp %.2f%s.",
 		(double)g_intensity, (double)g_radius, (double)g_maxScreenRadius, (double)g_thickness, g_slices, g_steps, (double)g_minBlend, (double)g_radianceClamp,
-		g_on ? "" : " (starting off)");
+		(double)g_historyClip, g_on ? "" : " (starting off)");
 	return true;
 }
 
@@ -78,6 +83,7 @@ float GI_GetSetting(int s)
 	case GS_STEPS: return (float)g_steps;
 	case GS_BLEND: return g_minBlend;
 	case GS_CLAMP: return g_radianceClamp;
+	case GS_HISTORY_CLAMP: return g_historyClip;
 	}
 	return 0;
 }
@@ -94,7 +100,7 @@ void GI_SetSetting(int s, float v)
 		}
 		break;
 	case GS_VIEW: g_view = (int)Clamp(v + 0.5f, 0, 3); break;
-	case GS_INTENSITY: g_intensity = Clamp(v, 0.0f, 8.0f); break;
+	case GS_INTENSITY: g_intensity = Clamp(v, 0.0f, kMaxIntensity); break;
 	case GS_RADIUS: g_radius = Clamp(v, 0.25f, 50.0f); break;
 	case GS_MAX_SCREEN: g_maxScreenRadius = Clamp(v, 0.05f, 4.0f); break;
 	case GS_THICKNESS: g_thickness = Clamp(v, 0.02f, 10.0f); break;
@@ -102,6 +108,7 @@ void GI_SetSetting(int s, float v)
 	case GS_STEPS: g_steps = (int)Clamp(v + 0.5f, 2, 24); break;
 	case GS_BLEND: g_minBlend = Clamp(v, 0.02f, 1.0f); break;
 	case GS_CLAMP: g_radianceClamp = Clamp(v, 0.1f, 1000.0f); break;
+	case GS_HISTORY_CLAMP: g_historyClip = Clamp(v, 0.0f, 4.0f); break;
 	}
 }
 
@@ -444,12 +451,17 @@ void GI_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 // every lit sample reads the light of its own surface point. (With the unjittered projections the
 // lookup would wander by up to half a pixel from frame to frame with the jitter, and TAA would
 // average that into a slightly blurred bounce light.)
-static void SetFrameConstants(IDirect3DDevice9* dev)
+static void GiRows(float rows[3][4])
 {
-	float rows[3][4];
 	bool reproject = g_outValid && g_camOk && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
 	if (!reproject)
 		core::IdentityRows(g_w, g_h, rows);
+}
+
+static void SetFrameConstants(IDirect3DDevice9* dev)
+{
+	float rows[3][4];
+	GiRows(rows);
 	dev->SetPixelShaderConstantF(GI_CONST, &rows[0][0], 3);
 }
 
@@ -613,7 +625,13 @@ static void RunPasses(IDirect3DDevice9* dev)
 	bool reproject = g_histValid && prevGeo && !g_cut && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
 	if (!reproject)
 		core::IdentityRows(g_w, g_h, rows);
-	const float c[11][4] = {
+	// The GI the game's shaders read this frame and where they read it, for the radiance pass to take
+	// part of it back out above intensity 1 (PS_Radiance). Nothing to take out where they got black.
+	IDirect3DBaseTexture9* giRead = GiTexture();
+	float giRows[3][4];
+	GiRows(giRows);
+	const float feedback = giRead != g_black.tex && g_intensity > 1.0f ? 1.0f - 1.0f / g_intensity : 0.0f;
+	const float c[15][4] = {
 		{ (float)g_w, (float)g_h, 1.0f / g_w, 1.0f / g_h },
 		{ (float)g_hw, (float)g_hh, 1.0f / g_hw, 1.0f / g_hh },
 		{ cam.A, cam.B, cam.P00, cam.P11 },
@@ -625,8 +643,12 @@ static void RunPasses(IDirect3DDevice9* dev)
 		{ rows[2][0], rows[2][1], rows[2][2], rows[2][3] },
 		{ minBlend, g_depthTolerance, reproject ? 1.0f : 0.0f, 1.0f / minBlend },
 		{ 1.5f, 0, 0, 0 },
+		{ giRows[0][0], giRows[0][1], giRows[0][2], giRows[0][3] },
+		{ giRows[1][0], giRows[1][1], giRows[1][2], giRows[1][3] },
+		{ giRows[2][0], giRows[2][1], giRows[2][2], giRows[2][3] },
+		{ feedback, g_historyClip, 0, 0 },
 	};
-	dev->SetPixelShaderConstantF(0, &c[0][0], 11);
+	dev->SetPixelShaderConstantF(0, &c[0][0], 15);
 	g_frame++;
 
 	GpuTiming* timing = geo ? BeginTiming(dev) : nullptr;
@@ -635,11 +657,16 @@ static void RunPasses(IDirect3DDevice9* dev)
 		// The lit colour at half res: the scene colour now, after the ambient occlusion and contact
 		// shadows (composited just before this), so the bounce light comes from the occluded light.
 		core::SetTarget(dev, g_rad.surf, g_hw, g_hh);
+		D.SetTexture(dev, 0, geo);
 		D.SetTexture(dev, 1, colourTex);
+		D.SetTexture(dev, 2, giRead);
 		core::SetSamplerClamp(dev, 1, D3DTEXF_LINEAR);
+		core::SetSamplerClamp(dev, 2, D3DTEXF_LINEAR);
 		D.SetPixelShader(dev, g_psRadiance);
 		core::DrawFullscreen(dev);
 		core::SetSamplerClamp(dev, 1, D3DTEXF_POINT);
+		core::SetSamplerClamp(dev, 2, D3DTEXF_POINT);
+		D.SetTexture(dev, 2, nullptr);
 
 		// Trace.
 		core::SetTarget(dev, g_raw.surf, g_hw, g_hh);

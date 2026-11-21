@@ -10,7 +10,8 @@
 // Device side (gi.cpp): when the opaque pass ends, the GI for the next frame is traced from this
 // frame's lit colour and z/w target (horizon-based gathering with a cosine-weighted sector mask, at
 // half resolution), accumulated over frames and filtered. Because the lit colour already holds the
-// previous bounce, light keeps bouncing over successive frames.
+// previous bounce, light keeps bouncing over successive frames (above intensity 1 the radiance pass
+// holds that loop to the gain it has at 1, so it can't run away: PS_Radiance in shaders/ssgi.hlsl).
 #pragma once
 
 #include <windows.h>
@@ -46,6 +47,7 @@ enum GiSettingId
 	GS_STEPS,
 	GS_BLEND,      // temporal blend
 	GS_CLAMP,      // radiance clamp
+	GS_HISTORY_CLAMP, // history clipped to this many standard deviations of the trace (0 = off)
 	GS_COUNT
 };
 float GI_GetSetting(int id);

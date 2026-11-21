@@ -41,7 +41,10 @@ lighting effects the 2009 renderer never had.
   sunlight. The bounce is added to the game's own ambient term before fog, so it is fogged like the
   rest of the scene. Ambient occlusion darkens only the game's baked ambient, not the bounce, which
   already carries its own occlusion; and the bounce is traced from the image after ambient occlusion
-  and contact shadows, so it comes from the occluded light.
+  and contact shadows, so it comes from the occluded light. Light keeps bouncing over successive
+  frames (each frame's bounce lights the next), held in check so it can't build up without end even
+  at the highest intensity; where the light changes (someone walks past a sunlit wall) the old bounce
+  goes at once instead of trailing behind.
 
 ### Atmosphere
 

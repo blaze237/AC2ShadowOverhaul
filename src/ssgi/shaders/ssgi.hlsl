@@ -5,7 +5,9 @@
 //  (geometry)  view-space normal + view z at half res: the prep shared with ambient occlusion
 //              (src/core/shaders/geoprep.hlsl, core/geoprep.h), computed once per frame
 //  PS_Radiance (half res)  lit colour (2x2 average, clamped), read after the ambient occlusion and
-//                          contact shadows are composited, so the bounce comes from occluded light
+//                          contact shadows are composited, so the bounce comes from occluded light;
+//                          above intensity 1, part of last frame's bounce is taken back out of it
+//                          (see the comment there)
 //  PS_Trace    (half res)  gathers light from the screen around each pixel: per slice through the
 //                          view direction, march out both ways; each sample covers the angles between
 //                          its front face and a point `thickness` behind it. A 16-sector mask over the
@@ -15,9 +17,11 @@
 //                          Bitmask", Therrien et al. 2023, with float sectors since ps_3_0 has no
 //                          integer bit operations; slice integration as in GTAO.)
 //  PS_Temporal (half res)  blends with last frame's result at the reprojected position, where the
-//                          depth there matches
-//  PS_Blur     (half res)  depth- and normal-aware blur, one direction per pass; the second pass
-//                          applies the intensity and writes the texture the game's shaders read
+//                          depth there matches, clipped to the range of this frame's trace around
+//                          the pixel
+//  PS_Blur     (half res)  depth- and normal-aware blur, one direction per pass, wider where fewer
+//                          frames are accumulated; the second pass applies the intensity and writes
+//                          the texture the game's shaders read
 //  PS_Debug    (full res)  debug views drawn over the scene colour
 //
 // Result: irradiance-like light colour E such that a surface of albedo a gets a * E added. A surface
@@ -37,12 +41,17 @@ float4 c_Reproj1  : register(c7);  //                                     -> v *
 float4 c_Reproj2  : register(c8);  //                                     -> w (view z then / view z now)
 float4 c_Temporal : register(c9);  // minimum blend, depth tolerance (relative), history valid, maximum frame count
 float4 c_Blur     : register(c10); // direction (half-res texels per tap), 1 = last pass (apply intensity), 0
+float4 c_GiRow0   : register(c11); // (z/w, x, y, 1) of a full-res pixel -> u * w in the GI texture the game's shaders read this frame
+float4 c_GiRow1   : register(c12); //                                     -> v * w
+float4 c_GiRow2   : register(c13); //                                     -> w
+float4 c_Feedback : register(c14); // share of that bounce taken out of the radiance, history clip (sigmas, 0 = off), 0, 0
 
 sampler2D s_Colour  : register(s1); // Radiance: game scene colour (linear)
 sampler2D s_Geo     : register(s0); // Trace/Temporal/Blur: the shared geometry prep (normal, z; z = 0: sky) (point)
 sampler2D s_Rad     : register(s1); // Trace: radiance (point)
 sampler2D s_Raw     : register(s1); // Temporal: trace output (point)
 sampler2D s_Hist    : register(s2); // Temporal: last frame's history (point)
+sampler2D s_Gi      : register(s2); // Radiance: the GI texture the game's shaders read this frame (linear)
 sampler2D s_PrevGeo : register(s3); // Temporal: last frame's geometry prep (point)
 sampler2D s_Src     : register(s1); // Blur: input (point)
 sampler2D s_Out     : register(s1); // Debug: a half-res result (linear)
@@ -82,14 +91,38 @@ float4 VS_Fullscreen(float4 p : POSITION) : POSITION
 
 // ---- Radiance ----------------------------------------------------------------------------------
 
+// The game's shaders added albedo x last frame's GI (G) to this colour, so the bounce feeds back into
+// itself: light keeps bouncing over the frames, each round scaled by intensity x albedo x the share
+// of the surroundings that is lit surface (f, at most 1). Up to intensity 1 that is the physical
+// many-bounce sum, and the loop gain (albedo x f) stays below 1. Above 1 it could pass 1 in bright
+// enclosed spaces and the light would climb every frame until the radiance clamp. So for intensity
+// I > 1 a share k = 1 - 1/I of min(colour, G) is taken back out (the albedo isn't known here, but the
+// bounce part of the colour is at most G, and at most the colour itself). Per channel, with D the rest
+// of the colour and a the albedo:
+//   - where the bounce outweighs the rest (min = colour): the trace sees (1 - k) (D + a G), gain
+//     I (1 - k) a f = a f, as at intensity 1;
+//   - where the rest outweighs it (min = G): the trace sees D + (a - k) G, gain I (a - k) f, between
+//     -(I - 1) f and f (a negative gain only damps; its size stays below 1 up to I = 2, the most the
+//     ini allows).
+// So the loop never gains more than it does at intensity 1, the extra intensity brightens the first
+// bounce, and the colour never drops below (1 - k) of itself. k = 0 up to intensity 1: unchanged.
+// G is read where the game's shaders read it for this block's centre (c11-c13, their c216-c218).
 float4 PS_Radiance(VPOS_T vposIn : VPOS) : COLOR
 {
-	float2 px = PIXEL(vposIn) * 2.0;
+	float2 j = PIXEL(vposIn);
+	float2 px = j * 2.0;
 	// Centre of the 2x2 block with bilinear filtering = its average. NaN / negative values from the
 	// game's HDR targets are dropped, very bright ones clamped (they'd make the noise flicker).
-	float3 rad = tex2Dlod(s_Colour, float4((px + 1.0) * c_Full.zw, 0, 0)).rgb;
-	rad = min(max(rad, 0), c_Proj2.w);
-	return float4(rad, 1);
+	float3 rad = max(tex2Dlod(s_Colour, float4((px + 1.0) * c_Full.zw, 0, 0)).rgb, 0);
+	float z = tex2Dlod(s_Geo, float4(HalfUv(j), 0, 0)).w;
+	if (c_Feedback.x > 0 && z > 0)
+	{
+		float4 q = float4(c_Proj.x + c_Proj.y / z, px + 0.5, 1.0);
+		float3 h = float3(dot(q, c_GiRow0), dot(q, c_GiRow1), dot(q, c_GiRow2));
+		float3 g = h.z > 0 ? max(tex2Dlod(s_Gi, float4(h.xy / h.z, 0, 0)).rgb, 0) : 0;
+		rad -= c_Feedback.x * min(rad, g);
+	}
+	return float4(min(rad, c_Proj2.w), 1);
 }
 
 // ---- Trace -------------------------------------------------------------------------------------
@@ -292,6 +325,27 @@ float4 PS_Temporal(VPOS_T vposIn : VPOS) : COLOR
 	if (wsum < 0.05)
 		return float4(cur, 1);
 	float4 hist = sum / wsum;
+	if (c_Feedback.y > 0)
+	{
+		// Clip the history to the range of this frame's trace around the pixel (mean +- c_Feedback.y
+		// standard deviations over 3x3 texels): where the light changed (a sunlit wall's bounce on the
+		// floor as someone walks past) the old light goes at once instead of fading over ~10 frames.
+		// The trace is noisy, but its noise pattern is spread over each 3x3 block (interleaved gradient
+		// noise), so the block's spread covers the noise and settled light stays inside the box.
+		float3 m1 = 0, m2 = 0;
+		[unroll] for (int y = -1; y <= 1; y++)
+		{
+			[unroll] for (int x = -1; x <= 1; x++)
+			{
+				float3 r = tex2Dlod(s_Raw, float4(uv + float2(x, y) * c_Half.zw, 0, 0)).rgb;
+				m1 += r;
+				m2 += r * r;
+			}
+		}
+		m1 /= 9.0;
+		float3 box = c_Feedback.y * sqrt(max(m2 / 9.0 - m1 * m1, 0));
+		hist.rgb = clamp(hist.rgb, m1 - box, m1 + box);
+	}
 	float count = min(hist.a + 1.0, c_Temporal.w);
 	float blend = max(1.0 / count, c_Temporal.x);
 	return float4(lerp(hist.rgb, cur, blend), count);
@@ -307,23 +361,34 @@ float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
 	float4 geo = tex2Dlod(s_Geo, float4(uv, 0, 0));
 	if (geo.w <= 0)
 		return 0;
+	// Wider where few frames are accumulated (just uncovered, or after a reset), narrower where many
+	// are: the noise left after n frames falls as 1 / sqrt(n), and so does the width that evens it out.
+	// x 2 for a fresh pixel, x 0.75 at 10 frames (the most a TemporalBlend of 0.1 keeps count of). It
+	// widens by taking more taps, not by spacing them further apart: the trace's noise pattern is spread
+	// over neighbouring texels, which spaced-out taps would skip. Taps with fewer frames than this pixel
+	// count for less, so fresh noise doesn't spread into settled light. (The first pass keeps the count
+	// in alpha for the second.)
+	float count = max(centre.a, 1.0);
+	float width = clamp(2.4 * rsqrt(count), 0.75, 2.0);
+	float taps = ceil(4.0 * width); // the Gaussian (sigma 2 x width taps) down to e^-2 of its peak
+	float falloff = -0.125 / (width * width);
 	float2 stepUv = c_Blur.xy * c_Half.zw;
 	float tolerance = 1.0 / (0.04 * geo.w);
 	float3 sum = centre.rgb;
 	float wsum = 1.0;
-	const float gauss[5] = { 1.0, 0.8825, 0.6065, 0.3247, 0.1353 }; // sigma 2 taps
-	[unroll] for (int i = 1; i <= 4; i++)
+	[loop] for (float i = 1; i <= taps; i++)
 	{
+		float gauss = exp(falloff * i * i);
 		[unroll] for (int sgn = -1; sgn <= 1; sgn += 2)
 		{
 			float2 tuv = uv + stepUv * (i * sgn);
 			float4 g = tex2Dlod(s_Geo, float4(tuv, 0, 0));
-			float3 c = tex2Dlod(s_Src, float4(tuv, 0, 0)).rgb;
+			float4 c = tex2Dlod(s_Src, float4(tuv, 0, 0));
 			float n = saturate(dot(g.xyz, geo.xyz));
 			n *= n;
 			n *= n;
-			float w = gauss[i] * saturate(1.0 - abs(g.w - geo.w) * tolerance) * n * n;
-			sum += c * w;
+			float w = gauss * saturate(1.0 - abs(g.w - geo.w) * tolerance) * n * n * saturate(c.a / count);
+			sum += c.rgb * w;
 			wsum += w;
 		}
 	}

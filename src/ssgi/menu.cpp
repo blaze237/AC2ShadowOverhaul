@@ -28,6 +28,7 @@ const core::MenuItem kItems[GS_COUNT] = {
 	{ "Steps", "SSGI", "Steps", true },
 	{ "Temporal blend", "SSGI", "TemporalBlend", true },
 	{ "Radiance clamp", "SSGI", "RadianceClamp", true },
+	{ "History clamp", "SSGI", "HistoryClamp", true },
 };
 const core::MenuDef kDef = { core::MENU_SSGI, "AC2 Shadow Overhaul - SSGI", "SSGI menu", "SSGIMenuKey", VK_F3, kItems, GS_COUNT, false, true };
 
@@ -37,7 +38,7 @@ const struct
 	const char* unit;
 	int decimals;
 } kFormat[GS_COUNT] = {
-	{ "", 0 }, { "", 0 }, { "", 2 }, { " m", 1 }, { " x height", 2 }, { " m", 2 }, { "", 0 }, { "", 0 }, { "", 2 }, { "", 1 },
+	{ "", 0 }, { "", 0 }, { "", 2 }, { " m", 1 }, { " x height", 2 }, { " m", 2 }, { "", 0 }, { "", 0 }, { "", 2 }, { "", 1 }, { "", 2 },
 };
 const char* const kViews[] = { "off", "GI light", "raw trace", "normals" };
 
@@ -53,6 +54,7 @@ float Step(int id, float v, int dir)
 	case GS_THICKNESS: return (up ? v < 0.499f : v < 0.501f) ? 0.05f : 0.25f;
 	case GS_BLEND: return 0.02f;
 	case GS_CLAMP: return (up ? v < 7.999f : v < 8.001f) ? 0.5f : 4.0f;
+	case GS_HISTORY_CLAMP: return 0.25f;
 	default: return 1.0f;
 	}
 }
@@ -70,6 +72,8 @@ protected:
 			snprintf(buf, n, "%s", v > 0.5f ? "ON" : "OFF");
 		else if (id == GS_VIEW)
 			snprintf(buf, n, "%s", kViews[(int)v & 3]);
+		else if (id == GS_HISTORY_CLAMP && v < 0.001f)
+			snprintf(buf, n, "off");
 		else
 			snprintf(buf, n, "%.*f%s", kFormat[id].decimals, (double)v, kFormat[id].unit);
 	}
