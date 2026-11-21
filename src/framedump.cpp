@@ -1872,7 +1872,7 @@ static HRESULT CreatePs(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixel
 	if (kind)
 		*kind = 0;
 	LitParts want;
-	want.ao = AO_Enabled();
+	want.ao = AO_Outputs();
 	want.gi = Fx_GiShaders();
 	if (!want.ao && !want.gi)
 		return o_CreatePixelShader(dev, code, out);

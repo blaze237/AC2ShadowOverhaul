@@ -26,6 +26,7 @@ enum
 	ITEM_AO_STRENGTH,
 	ITEM_CS_ON,
 	ITEM_CS_LENGTH,
+	ITEM_NORMALS,
 	ITEM_CH_ON,
 	ITEM_CH_SCALE,
 	ITEM_CH_MIN,
@@ -45,6 +46,7 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "AO strength", "AmbientOcclusion", "Strength", true },
 	{ "Contact shadows", "ContactShadows", "StartEnabled", true },
 	{ "Contact shadow length", "ContactShadows", "Length", true },
+	{ "Shading normals", "AmbientOcclusion", "ShadingNormals", true },
 	{ "Contact hardening", "SoftShadows", "ContactHardening", true },
 	{ "Hardening penumbra", "SoftShadows", "PenumbraScale", true },
 	{ "Hardening min width", "SoftShadows", "MinWidth", true },
@@ -141,6 +143,9 @@ protected:
 		case ITEM_CS_LENGTH:
 			snprintf(buf, n, "%.2f", CS_Length());
 			break;
+		case ITEM_NORMALS:
+			snprintf(buf, n, "%d", AO_ShadingNormals() ? 1 : 0);
+			break;
 		case ITEM_CH_ON:
 			snprintf(buf, n, "%d", SoftShadows_ContactHardening() ? 1 : 0);
 			break;
@@ -200,6 +205,10 @@ protected:
 			break;
 		case ITEM_CS_LENGTH:
 			snprintf(buf, n, "%.2f m", CS_Length());
+			break;
+		case ITEM_NORMALS:
+			// For AO, contact shadows and SSGI: n/a only with all three off in the ini.
+			snprintf(buf, n, "%s", !AO_Outputs() ? "n/a (AO, contact shadows, SSGI off)" : AO_ShadingNormals() ? "ON (the surfaces')" : "OFF (from depth)");
 			break;
 		case ITEM_CH_ON:
 			snprintf(buf, n, "%s", !SoftShadows_ContactHardening() ? "OFF" : SoftWidth() ? "ON" : "ON (soft shadows off)");
@@ -271,6 +280,11 @@ protected:
 		case ITEM_CS_LENGTH:
 			// 0.05 m steps up to half a metre, 0.25 m above
 			CS_SetLength(CS_Length() + ((dir > 0 ? CS_Length() < 0.499f : CS_Length() < 0.501f) ? 0.05f : 0.25f) * dir);
+			return true;
+		case ITEM_NORMALS:
+			if (!AO_Outputs())
+				return false;
+			AO_SetShadingNormals(dir > 0);
 			return true;
 		case ITEM_CH_ON:
 			SoftShadows_SetContactHardening(dir > 0);

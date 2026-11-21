@@ -196,6 +196,7 @@ struct E2EShader
 };
 static const E2EShader kE2EShaders[] = {
 	{ core::kGeoPrepPs, sizeof(core::kGeoPrepPs), FX_SHARED, "geo-prep" },
+	{ core::kGeoPrepNormalsPs, sizeof(core::kGeoPrepNormalsPs), FX_SHARED, "geo-prep-normals" }, // with the shading normals
 	{ kAoGtaoPs, sizeof(kAoGtaoPs), FX_AO, "gtao" },
 	{ kAoBlurPs, sizeof(kAoBlurPs), FX_AO, "ao-blur" },
 	{ kAoBlurNarrowPs, sizeof(kAoBlurNarrowPs), FX_AO, "ao-blur-narrow" }, // while TAA averages the frames

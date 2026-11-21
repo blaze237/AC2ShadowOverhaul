@@ -99,6 +99,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
 	bool ao = AO_Init();
 	ao = CS_Init() || ao;
 	bool fx = Fx_Init();
+	AO_NoteSsgi(Fx_GiShaders()); // SSGI alone still gets the shading normals through AO's outputs
 	FrameDump_Init(soft || tuning || ao || fx);
 	return TRUE;
 }

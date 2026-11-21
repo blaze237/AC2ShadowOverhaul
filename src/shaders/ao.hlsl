@@ -18,6 +18,7 @@ float4 c_Params : register(c4); // radius (m), pixels per (metre / z) [0.5 * P00
 float4 c_Params2: register(c5); // AO strength (exponent; 0 = AO off), view mode, blur direction x, y
 float4 c_Sun    : register(c6); // direction towards the sun (view space), contact shadow length (m; 0 = off)
 float4 c_Contact: register(c7); // thickness (m) = x + y * distance, strength, depth bias per metre of distance
+float4 c_Targets: register(c8); // Composite: the indirect light (x), sun light (y) target was written this frame (1) or not (0)
 
 sampler2D s_Depth    : register(s0); // game z/w, R32F, full res (point)
 sampler2D s_Geo      : register(s1); // GTAO: the shared geometry prep (core/geoprep.h): view normal, view z (point)
@@ -260,8 +261,13 @@ float4 PS_Composite(VPOS_T vposIn : VPOS) : COLOR
 	float2 vpos = PIXEL(vposIn);
 	float2 uv = (vpos + 0.5) * c_Full.zw;
 	float d = tex2Dlod(s_Depth, float4(uv, 0, 0)).x;
-	float3 indirect = tex2Dlod(s_Indirect, float4(uv, 0, 0)).rgb;
-	float3 sun = tex2Dlod(s_Sun, float4(uv, 0, 0)).rgb;
+	// A target the opaque pass didn't write this frame (ao.cpp binds only what something reads) holds
+	// an older frame's light, or nothing defined: not read, no light removed.
+	float3 indirect = 0, sun = 0;
+	[branch] if (c_Targets.x > 0.5)
+		indirect = tex2Dlod(s_Indirect, float4(uv, 0, 0)).rgb;
+	[branch] if (c_Targets.y > 0.5)
+		sun = tex2Dlod(s_Sun, float4(uv, 0, 0)).rgb;
 	float view = c_Params2.y;
 	if (view > 3.5)
 		return float4(sun, 1);

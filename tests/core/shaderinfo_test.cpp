@@ -229,6 +229,7 @@ static void CheckOwnShaders()
 		{ "kAoCompositePs", kAoCompositePs },
 		{ "kDepthToColourPs", kDepthToColourPs },
 		{ "kGeoPrepPs", core::kGeoPrepPs },
+		{ "kGeoPrepNormalsPs", core::kGeoPrepNormalsPs },
 		{ "kGiRadiancePs", ssgi::kGiRadiancePs },
 		{ "kGiTracePs", ssgi::kGiTracePs },
 		{ "kGiTemporalPs", ssgi::kGiTemporalPs },
