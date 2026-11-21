@@ -49,6 +49,9 @@ float4 c_Shafts   : register(c26); // sun position (screen uv), step (share of t
 float4 c_Shafts2  : register(c27); // sky brightness threshold, sun falloff exponent
 float4 c_ShaftCol : register(c28); // shaft colour (sun colour x strength x fade), w = 1: shafts on
 float4 c_ShRes    : register(c29); // shafts-res width, height, 1/width, 1/height
+float4 c_Noise    : register(c30); // noise volume uvw at the camera (wrapped, the wind's drift included), amount (0 = no noise)
+float4 c_Noise2   : register(c31); // noise uvw per metre, log2(noise texels per metre) (mip level of a 1 m step),
+                                   //   sky occlusion strength (0 = none), metres of cover height per atlas depth unit (SunAndSky)
 
 sampler2D s_Depth  : register(s0); // game z/w, R32F, full res (point, clamp)
 sampler2D s_Shadow : register(s1); // game sun shadow atlas, R32F (point, clamp)
@@ -56,6 +59,7 @@ sampler2D s_Cloud  : register(s2); // game cloud shadow texture (linear, wrap)
 sampler2D s_Fog    : register(s3); // fog-res in-scatter + transmittance (point, clamp)
 sampler2D s_Scene  : register(s4); // scene colour (linear, clamp)
 sampler2D s_Shafts : register(s5); // shafts-res (linear, border = 0)
+sampler3D s_Noise  : register(s6); // tiling 3D noise, mean 0.5, with mips (linear, mip linear, wrap)
 
 // tests/warp_test.cpp runs these shaders on D3D11 (WARP), where the pixel position is the pixel
 // centre (x + 0.5) rather than D3D9's integer VPOS.
@@ -121,9 +125,22 @@ float4 VS_Fullscreen(float4 p : POSITION) : POSITION
 
 // ---- Fog ray march -----------------------------------------------------------------------------
 
-// Sunlight reaching a point (0..1): the game's own cascade choice, atlas lookup and depth test,
+// x: sunlight reaching a point (0..1): the game's own cascade choice, atlas lookup and depth test,
 // one tap. Past the cascades it fades to lit like the game's shading does.
-float SunVisibility(float3 ls)
+// y: how open the point is to the sky (0..1), for the sky light the fog scatters, from the same tap.
+// The atlas holds the surface nearest the sun above every point, so a shadowed point also tells how
+// far above it the cover is: (depth - stored) metres along the sun direction, times its height
+// above the horizon = the height of the cover over the point (c_Noise2.w = sun height / atlas depth
+// units per metre). A roof, a vault or the ground over a tomb is a few metres up whatever the sun's
+// angle; a sunlit point, or one shaded by something kCoverHeight or more above it (a tall building
+// across a square), counts as open. Cover under a metre is the surface the sample sits on, shadowing
+// itself within the atlas's texel and bias (acne): that counts as open too, fading to the cover
+// height's share by 2 m. The sun is the only direction we can test: as it sinks almost everything is
+// shaded from low cover, so the plugin fades the strength out for a low sun (vol::Apply) instead of
+// reading that as enclosed.
+static const float kCoverHeight = 20.0;
+
+float2 SunAndSky(float3 ls)
 {
 	if (c_ShadowZ.z <= 0.0)
 		return 1.0;
@@ -133,8 +150,10 @@ float SunVisibility(float3 ls)
 	float depth = ls.z * c_ShadowZ.x + c_ShadowZ.y + dot(inCascade, c_Bias);
 	float stored = tex2Dlod(s_Shadow, float4(uv, 0, 0)).x;
 	float lit = stored >= depth ? 1.0 : 0.0;
+	float cover = (depth - stored) * c_Noise2.w; // metres over the point
+	float open = stored >= depth ? 1.0 : max(saturate(cover / kCoverHeight), saturate(2.0 - cover));
 	float fade = saturate((r + c_Fade.x) * c_Fade.y);
-	return dot(inCascade, 1.0) > 0.0 ? lerp(lit, 1.0, fade) : 1.0;
+	return dot(inCascade, 1.0) > 0.0 ? lerp(float2(lit, open), 1.0, fade) : 1.0;
 }
 
 // Henyey-Greenstein phase function scaled so that isotropic scattering (g = 0) is 1.
@@ -175,12 +194,24 @@ float4 PS_FogMarch(VPOS_T vposIn : VPOS) : COLOR
 		float t = lerp(t0, t1, jitter);
 		float3 P = eye + dir * t;
 		float density = c_Medium.x * exp(-c_Medium.y * max(P.z - c_Medium.z, 0.0));
-		float3 sun = sunLight * SunVisibility(ls0 + lsDir * t);
+		if (c_Noise.w > 0.0)
+		{
+			// Drifting 3D noise: density x (1 - amount .. 1 + amount), the same on average. The mip
+			// level is the step's length in noise texels: detail the step spacing can't resolve is
+			// filtered away (to the mean further out) instead of flickering as the noise drifts.
+			float3 uvw = c_Noise.xyz + dir * (t * c_Noise2.x);
+			float n = tex3Dlod(s_Noise, float4(uvw, log2(t1 - t0) + c_Noise2.y)).x;
+			density *= 1.0 + c_Noise.w * (n * 2.0 - 1.0);
+		}
+		float2 vis = SunAndSky(ls0 + lsDir * t);
+		float3 sun = sunLight * vis.x;
 		if (c_Fade.z > 0.0)
 			sun *= tex2Dlod(s_Cloud, float4(P.xy * c_Cloud.xy + c_Cloud.zw, 0, 0)).rgb;
+		// Sky light reaching the point: all of it at strength 0 (1 - 0 x ... = 1 exactly).
+		float sky = 1.0 - c_Noise2.z * (1.0 - vis.y);
 		// Exact for light and density constant over the step (albedo 1: all extinction is scattering).
 		float stepT = exp(-density * (t1 - t0));
-		scattered += transmittance * (sun + c_Ambient.rgb) * (1.0 - stepT);
+		scattered += transmittance * (sun + c_Ambient.rgb * sky) * (1.0 - stepT);
 		transmittance *= stepT;
 	}
 	return float4(scattered, transmittance);
