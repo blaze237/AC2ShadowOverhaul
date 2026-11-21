@@ -13,7 +13,7 @@
 // core/scene.h, fed before any effect sees a call; the opaque shaders get AO's outputs and SSGI's
 // bounce light from one rewrite (litshader.h). TAA reports its jitter and whether it runs this frame
 // to the same tracker, before the other effects' passes: they reconstruct positions with the
-// jittered projection (core/scene.h).
+// jittered projection and, while TAA averages the frames, lean on it (core/scene.h).
 //
 // Every effect draws its own passes through the original device functions, below the hooks, so no
 // effect ever sees another's draws. Text overlays (the menus, the MSAA warning) go through the

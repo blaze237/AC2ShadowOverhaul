@@ -6,6 +6,9 @@
 // with TAA's jitter of the frame folded in: the march casts a ray through each pixel of the
 // (jittered) z/w target, and the sun's place on screen is where the (jittered) sky shows it.
 //
+// TAA: while it averages frames (core::Scene_TaaAssist), the march's step offset noise shifts every
+// frame (core::Scene_NoiseOffset); otherwise it is the same every frame.
+//
 // Sun shadow map: the lit shaders transform world positions with g_WorldToLightProjVS (3 rows:
 // x, y across the sun in metres, centred near the camera; z along the direction towards the sun),
 // pick a cascade by max(|x|, |y|) against g_ShadowCascadesRangesMin/Max, map to the atlas with
@@ -710,7 +713,8 @@ static void Apply(IDirect3DDevice9* dev)
 	set4(22, F.sunCol[0] * sunI, F.sunCol[1] * sunI, F.sunCol[2] * sunI, 0);
 	if (F.fog)
 		set4(23, F.fogColor[0] * ambI, F.fogColor[1] * ambI, F.fogColor[2] * ambI, 0);
-	set4(24, fog ? fmaxf(g_set.density, 1e-7f) : 0.0f, g_set.heightFalloff, g_set.baseHeight, 0); // w: noise frame offset (0 until TAA-aware)
+	// w: added to the step noise (0 unless TAA averages frames)
+	set4(24, fog ? fmaxf(g_set.density, 1e-7f) : 0.0f, g_set.heightFalloff, g_set.baseHeight, core::Scene_NoiseOffset());
 	set4(26, sunUv[0], sunUv[1], 0, 0);
 	set4(27, g_set.shaftsThreshold, g_set.shaftsFalloff, 0, 0);
 	const float shaftI = g_set.shaftsIntensity * shaftFade;

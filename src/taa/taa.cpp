@@ -28,6 +28,11 @@ static float g_clipGamma = 1.25f;
 static float g_mipBias = -0.5f;
 static float g_jitterScale = 1.0f;
 static int g_debugView = 0;
+// [TAA] AssistEffects: while TAA runs, the other effects lean on its averaging (core/scene.h
+// Scene_TaaAssist): AO, contact shadows and fog vary their noise per frame, AO and contact shadows
+// blur less, SSGI keeps a shorter history. Their jitter-correct reconstruction doesn't depend on it:
+// that is a matter of correctness, not taste.
+static bool g_assist = true;
 // Strength k of the reversible c / (1 + k luma) the history is kept in (taa.hlsl Compress): damps
 // fireflies while keeping the 0..1 range nearly linear (k = 1 darkened edges in tests).
 static const float kHdrCompression = 0.25f;
@@ -52,6 +57,7 @@ TaaSettings Taa_GetSettings()
 	t.clipBox = g_clipGamma;
 	t.depthTolerance = g_depthTolerance;
 	t.debugView = g_debugView;
+	t.assist = g_assist;
 	return t;
 }
 
@@ -68,6 +74,7 @@ void Taa_SetSettings(const TaaSettings& t)
 	g_clipGamma = Clamp(t.clipBox, 0.5f, 4.0f);
 	g_depthTolerance = Clamp(t.depthTolerance, 0.001f, 1.0f);
 	g_debugView = t.debugView < 0 ? 0 : t.debugView > 2 ? 2 : t.debugView;
+	g_assist = t.assist;
 }
 
 bool Taa_Init()
@@ -88,9 +95,11 @@ bool Taa_Init()
 	g_clipGamma = Clamp(IniFloat(S, "ClipBox", 1.25f), 0.5f, 4.0f);
 	g_depthTolerance = Clamp(IniFloat(S, "DepthTolerance", 0.05f), 0.001f, 1.0f);
 	g_debugView = IniInt(S, "DebugView", 0);
-	LogInfo("TAA: feedback %.2f (moving %.2f), sharpness %.2f, mip bias %.2f, jitter %.2f, clip box %.2f, depth tolerance %.3f%s%s.",
+	g_assist = IniInt(S, "AssistEffects", 1) != 0;
+	LogInfo("TAA: feedback %.2f (moving %.2f), sharpness %.2f, mip bias %.2f, jitter %.2f, clip box %.2f, depth tolerance %.3f%s%s%s.",
 		(double)g_feedback, (double)g_motionFeedback, (double)g_sharpness, (double)g_mipBias, (double)g_jitterScale, (double)g_clipGamma,
-		(double)g_depthTolerance, g_on ? "" : " (starting off)", g_debugView ? ", debug view on" : "");
+		(double)g_depthTolerance, g_on ? "" : " (starting off)", g_debugView ? ", debug view on" : "",
+		g_assist ? ", assisting the other effects" : ", other effects as without TAA");
 	return true;
 }
 
@@ -422,7 +431,7 @@ void Taa_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 		UpdateJitter(dev);
 	}
 	// The other effects run between here and the resolve: tell them TAA resolves this frame.
-	core::Scene_TaaFrame(g_historyValid, g_frame);
+	core::Scene_TaaFrame(g_historyValid, g_frame, g_assist);
 }
 
 static void Resolve(IDirect3DDevice9* dev);
@@ -482,7 +491,7 @@ const char* Taa_Status()
 	if (!g_on)
 		return "off";
 	if (g_historyValid)
-		return "working";
+		return g_assist ? "working (also averaging AO, fog, SSGI)" : "working";
 	return "waiting for a 3D scene";
 }
 

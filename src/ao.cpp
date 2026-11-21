@@ -9,6 +9,11 @@
 // Camera: this frame's, from the shared scene tracker (core/scene.h, maths in core/camera.h), taken
 // once AO's own pass has started: the raster camera, with TAA's jitter folded in, because GTAO and
 // the contact shadows turn pixels of the (jittered) z/w target into view-space positions and back.
+//
+// TAA: while it averages frames (core::Scene_TaaAssist), the GTAO slice / step and contact shadow
+// step noise shifts every frame (core::Scene_NoiseOffsets) and the blur is narrower (sigma 1 instead
+// of 2: PS_BlurNarrow in ao.hlsl says why); otherwise the noise is the same every frame and the
+// passes are exactly those without TAA.
 
 #include "ao.h"
 #include "common.h"
@@ -90,7 +95,7 @@ static core::RenderTarget g_ao[2];           // half size: r = AO, g = view z, b
 static UINT g_w, g_h, g_hw, g_hh;
 static core::PassState g_state;
 static IDirect3DVertexShader9* g_vsFull;
-static IDirect3DPixelShader9 *g_psGtao, *g_psBlur, *g_psComposite;
+static IDirect3DPixelShader9 *g_psGtao, *g_psBlur, *g_psBlurNarrow, *g_psComposite;
 static IDirect3DVertexDeclaration9* g_decl;
 static bool g_failed = false;     // AO can't run on this device (logged once)
 static bool g_capsChecked = false;
@@ -132,7 +137,7 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 	{
 		HRESULT hr;
 		if (FAILED(hr = D.CreateVertexShader(dev, kAoFullscreenVs, &g_vsFull)) || FAILED(hr = D.CreatePixelShader(dev, kAoGtaoPs, &g_psGtao)) ||
-			FAILED(hr = D.CreatePixelShader(dev, kAoBlurPs, &g_psBlur)) ||
+			FAILED(hr = D.CreatePixelShader(dev, kAoBlurPs, &g_psBlur)) || FAILED(hr = D.CreatePixelShader(dev, kAoBlurNarrowPs, &g_psBlurNarrow)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kAoCompositePs, &g_psComposite)) || !(g_decl = core::FullscreenDecl(dev)))
 		{
 			Fail("could not create its shaders", hr);
@@ -357,6 +362,8 @@ static void Composite(IDirect3DDevice9* dev)
 	g_state.Save(dev);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
 	const core::CameraFloats& cam = core::Scene().rasterCamera.f; // jittered like the z/w target
+	float noise[2];
+	core::Scene_NoiseOffsets(noise); // (0, 0) unless TAA averages frames
 	// Normals at half res, shared with SSGI (which runs next and reuses them).
 	IDirect3DTexture9* geo = core::Geo_Ensure(dev, depthTex, g_w, g_h, cam);
 	if (!geo)
@@ -382,7 +389,7 @@ static void Composite(IDirect3DDevice9* dev)
 		{ (float)g_w, (float)g_h, 1.0f / g_w, 1.0f / g_h },
 		{ (float)g_hw, (float)g_hh, 1.0f / g_hw, 1.0f / g_hh },
 		{ cam.A, cam.B, cam.P00, cam.P11 },
-		{ cam.P02, cam.P12, 0, 0 }, // z: noise frame offset, 0 until the effects are made TAA-aware
+		{ cam.P02, cam.P12, noise[0], noise[1] }, // zw: added to the slice / step noise
 		{ g_radius, 0.5f * cam.P00 * g_w, 0.1f * g_h, 0.6f },
 		{ aoStrength, view, 1, 0 },
 		{ sunView[0], sunView[1], sunView[2], cs ? g_csLength : 0.0f },
@@ -398,7 +405,7 @@ static void Composite(IDirect3DDevice9* dev)
 	core::SetTarget(dev, g_ao[0].surf, g_hw, g_hh);
 	D.SetPixelShader(dev, g_psGtao);
 	core::DrawFullscreen(dev);
-	D.SetPixelShader(dev, g_psBlur);
+	D.SetPixelShader(dev, core::Scene_TaaAssist() ? g_psBlurNarrow : g_psBlur);
 	core::SetTarget(dev, g_ao[1].surf, g_hw, g_hh);
 	D.SetTexture(dev, 1, g_ao[0].tex);
 	core::DrawFullscreen(dev);

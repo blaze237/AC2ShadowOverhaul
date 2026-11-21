@@ -16,7 +16,8 @@
 //
 // The other effects: TAA reports its jitter (what c255 holds) and that it runs this frame to the
 // scene tracker (core::Scene_TaaJitter / Scene_TaaFrame), and the effects read it from there:
-// they reconstruct positions from the jittered z/w target with the jittered projection.
+// they reconstruct positions from the jittered z/w target with the jittered projection and, with
+// [TAA] AssistEffects, vary their noise per frame for the resolve to average (core/scene.h).
 #pragma once
 
 #include <windows.h>
@@ -38,6 +39,7 @@ struct TaaSettings
 	bool on;
 	float feedback, motionFeedback, sharpness, mipBias, jitterScale, clipBox, depthTolerance;
 	int debugView;
+	bool assist; // [TAA] AssistEffects: the other effects vary their noise per frame for TAA to average
 };
 TaaSettings Taa_GetSettings();
 void Taa_SetSettings(const TaaSettings& s);

@@ -19,7 +19,7 @@
 // What the other effects need to know about that is here too (SceneState::taa, rasterCamera),
 // reported by TAA through Scene_TaaJitter / Scene_TaaFrame: the effects never ask TAA itself. They
 // work without it; with it they reconstruct positions from the jittered z/w target with the jittered
-// projection.
+// projection, and (Scene_NoiseOffsets) vary their noise per frame for TAA to average.
 #pragma once
 
 #include <windows.h>
@@ -50,7 +50,7 @@ inline bool IsSkyViewport(const D3DVIEWPORT9& vp) { return vp.MinZ >= 0.99f; }
 //
 // Timing: TAA decides a frame's jitter at the Present before it, puts it into c255 when the game
 // binds a scene-sized target, and resolves at the first read of the scene colour, after every other
-// effect. `running`, `historyValid` and `frame` are set when TAA recognises this frame's
+// effect. `running`, `assist`, `historyValid` and `frame` are set when TAA recognises this frame's
 // main pass (the first binding of its z/w target); the jitter when the camera is read (the first
 // opaque draw with the camera matrices, which already has the jitter in c255). Both come before
 // every effect pass of the frame (AO and SSGI at the end of the opaque pass, the volumetrics after
@@ -61,6 +61,7 @@ inline bool IsSkyViewport(const D3DVIEWPORT9& vp) { return vp.MinZ >= 0.99f; }
 struct TaaFrameState
 {
 	bool running = false;      // TAA resolves this frame: it is on and recognised this frame's main pass
+	bool assist = false;       // ... and [TAA] AssistEffects: the effects may lean on its averaging
 	bool historyValid = false; // TAA resolved the frame before too (so it blends this one with a
 	                           // history); false on the first frame after it was switched on, a
 	                           // frame it couldn't resolve, a Reset or a resolution change
@@ -128,6 +129,18 @@ const SceneState& Scene();
 bool Scene_MsaaRecently(); // MSAA seen on the main pass in the last 120 frames
 bool Scene_CameraCut();    // this frame's camera jumped from the last frame's (see IsCameraCut)
 
+// The effects may lean on TAA this frame: it runs and [TAA] AssistEffects is on. Their noise then
+// varies per frame (Scene_NoiseOffsets) and their spatial filters may be lighter, since TAA's history
+// averages successive frames.
+bool Scene_TaaAssist();
+// Offsets (0..1) to add to an effect's per-pixel noise before frac(): a 2D low-discrepancy sequence
+// (R2, Roberts 2018) over TAA's frames while Scene_TaaAssist(), so successive frames sample other
+// directions and steps and every pixel's samples over time are evenly spread; (0, 0) otherwise, the
+// same pattern every frame as without TAA (frac(n + 0) = n: the output doesn't change at all).
+void Scene_NoiseOffsets(float out[2]);
+// The same for one-dimensional noise: the golden ratio sequence (the best spread in 1D), else 0.
+float Scene_NoiseOffset();
+
 // ---- Hooks (framedump.cpp calls these first, before the effects) -------------------------------
 
 void Scene_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code); // where its camera matrices are
@@ -145,6 +158,6 @@ void Scene_OnDeviceReady(IDirect3DSurface9* backBuffer); // after creation / Res
 // read takes the value current at its draw.
 void Scene_TaaJitter(bool on, const float ndc[2], const float px[2]);
 // TAA recognised this frame's main pass and will resolve it.
-void Scene_TaaFrame(bool historyValid, unsigned frame);
+void Scene_TaaFrame(bool historyValid, unsigned frame, bool assist);
 
 } // namespace core

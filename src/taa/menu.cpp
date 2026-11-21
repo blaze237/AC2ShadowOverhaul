@@ -21,6 +21,7 @@ enum
 	ITEM_JITTER,
 	ITEM_CLIP,
 	ITEM_DEPTH_TOL,
+	ITEM_ASSIST,
 	ITEM_DEBUG,
 	ITEM_COUNT
 };
@@ -37,11 +38,12 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "Jitter size", "TAA", "JitterScale", true },
 	{ "Clip box", "TAA", "ClipBox", true },
 	{ "Depth tolerance", "TAA", "DepthTolerance", true },
+	{ "Average other effects' noise", "TAA", "AssistEffects", true },
 	{ "Debug view", "TAA", "DebugView", true },
 };
 // Saves aren't logged (each change is).
 const core::MenuDef kDef = { core::MENU_TAA, "AC2 Shadow Overhaul - TAA", "TAA menu", "TAAMenuKey", VK_F1, kItems, ITEM_COUNT, false, false };
-const float kStep[ITEM_COUNT] = { 0, 0.05f, 0.01f, 0.01f, 0.1f, 0.1f, 0.05f, 0.005f, 0 };
+const float kStep[ITEM_COUNT] = { 0, 0.05f, 0.01f, 0.01f, 0.1f, 0.1f, 0.05f, 0.005f, 0, 0 };
 const char* const kDebugViews[] = { "off", "history source", "motion" };
 
 float* FloatOf(TaaSettings& t, int item)
@@ -68,8 +70,8 @@ protected:
 	void Format(int item, char* buf, size_t n) override
 	{
 		TaaSettings t = Taa_GetSettings();
-		if (item == ITEM_ON)
-			snprintf(buf, n, "%s", t.on ? "ON" : "OFF");
+		if (item == ITEM_ON || item == ITEM_ASSIST)
+			snprintf(buf, n, "%s", (item == ITEM_ON ? t.on : t.assist) ? "ON" : "OFF");
 		else if (item == ITEM_DEBUG)
 			snprintf(buf, n, "%s", kDebugViews[t.debugView]);
 		else
@@ -80,8 +82,8 @@ protected:
 	void IniValue(int item, char* buf, size_t n) override
 	{
 		TaaSettings t = Taa_GetSettings();
-		if (item == ITEM_ON)
-			snprintf(buf, n, "%d", t.on ? 1 : 0);
+		if (item == ITEM_ON || item == ITEM_ASSIST)
+			snprintf(buf, n, "%d", (item == ITEM_ON ? t.on : t.assist) ? 1 : 0);
 		else if (item == ITEM_DEBUG)
 			snprintf(buf, n, "%d", t.debugView);
 		else
@@ -93,6 +95,8 @@ protected:
 		TaaSettings t = Taa_GetSettings();
 		if (item == ITEM_ON)
 			t.on = dir > 0;
+		else if (item == ITEM_ASSIST)
+			t.assist = dir > 0;
 		else if (item == ITEM_DEBUG)
 			t.debugView = (t.debugView + dir + 3) % 3;
 		else

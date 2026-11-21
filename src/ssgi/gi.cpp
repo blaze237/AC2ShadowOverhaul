@@ -603,6 +603,12 @@ static void RunPasses(IDirect3DDevice9* dev)
 		core::SetSamplerClamp(dev, s, D3DTEXF_POINT);
 
 	const int cur = g_cur, prev = 1 - g_cur;
+	// While TAA averages the frames, its history comes on top of ours: a light that changes would
+	// then take half as long again to settle (tests/taa "light": 35 frames to 90 % instead of 23).
+	// Our minimum blend is doubled then, which brings the two together back to about what ours took
+	// alone (26 frames), and TAA's averaging more than makes up for the noise it lets through
+	// (tests/ssgi_warp_test: less than half the noise of the normal blend alone).
+	const float minBlend = core::Scene_TaaAssist() ? fminf(2.0f * g_minBlend, 1.0f) : g_minBlend;
 	float rows[3][4];
 	bool reproject = g_histValid && prevGeo && !g_cut && core::ReprojectionRows(g_prevCam.viewProj, Cam().viewProj, g_w, g_h, rows);
 	if (!reproject)
@@ -617,7 +623,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 		{ rows[0][0], rows[0][1], rows[0][2], rows[0][3] },
 		{ rows[1][0], rows[1][1], rows[1][2], rows[1][3] },
 		{ rows[2][0], rows[2][1], rows[2][2], rows[2][3] },
-		{ g_minBlend, g_depthTolerance, reproject ? 1.0f : 0.0f, 1.0f / g_minBlend },
+		{ minBlend, g_depthTolerance, reproject ? 1.0f : 0.0f, 1.0f / minBlend },
 		{ 1.5f, 0, 0, 0 },
 	};
 	dev->SetPixelShaderConstantF(0, &c[0][0], 11);

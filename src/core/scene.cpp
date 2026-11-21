@@ -36,11 +36,35 @@ void Scene_TaaJitter(bool on, const float ndc[2], const float px[2])
 	}
 }
 
-void Scene_TaaFrame(bool historyValid, unsigned frame)
+void Scene_TaaFrame(bool historyValid, unsigned frame, bool assist)
 {
 	S.taa.running = true;
 	S.taa.historyValid = historyValid;
 	S.taa.frame = frame;
+	S.taa.assist = assist;
+}
+
+bool Scene_TaaAssist() { return S.taa.running && S.taa.assist; }
+
+void Scene_NoiseOffsets(float out[2])
+{
+	out[0] = out[1] = 0.0f;
+	if (!Scene_TaaAssist())
+		return;
+	// R2: n / g and n / g^2 modulo 1, g the plastic number (the 2D analogue of the golden ratio). In
+	// double, so the offsets stay exact for any frame count; the first frame gets (0, 0).
+	const double a1 = 0.7548776662466927, a2 = 0.5698402909980532;
+	const double n = (double)S.taa.frame;
+	out[0] = (float)(n * a1 - floor(n * a1));
+	out[1] = (float)(n * a2 - floor(n * a2));
+}
+
+float Scene_NoiseOffset()
+{
+	if (!Scene_TaaAssist())
+		return 0.0f;
+	const double g = 0.6180339887498949, n = (double)S.taa.frame;
+	return (float)(n * g - floor(n * g));
 }
 
 ZwBinding InspectRt1(IDirect3DSurface9* s, IDirect3DSurface9* rt0)
@@ -301,7 +325,7 @@ void Scene_EndFrame()
 		}
 	}
 	S.camera.ok = S.rasterCamera.ok = false;
-	S.taa.running = S.taa.historyValid = S.taa.jittered = false;
+	S.taa.running = S.taa.assist = S.taa.historyValid = S.taa.jittered = false;
 	for (int k = 0; k < 2; k++)
 		S.taa.jitterNdc[k] = S.taa.jitterPx[k] = 0.0f;
 	S.sunOk = S.sunColourOk = S.fogOk = false;

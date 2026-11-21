@@ -53,6 +53,7 @@ static const Shader kAo[] = {
 	{ "VS_Fullscreen", "vs_3_0", "kAoFullscreenVs" },
 	{ "PS_GTAO", "ps_3_0", "kAoGtaoPs" },
 	{ "PS_Blur", "ps_3_0", "kAoBlurPs" },
+	{ "PS_BlurNarrow", "ps_3_0", "kAoBlurNarrowPs" }, /* while TAA averages the frames */
 	{ "PS_Composite", "ps_3_0", "kAoCompositePs" },
 	{ "PS_DepthCopy", "ps_2_0", "kDepthToColourPs" },
 };

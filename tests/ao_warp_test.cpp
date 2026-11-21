@@ -19,7 +19,10 @@
 //  - jitter: the scene rendered with one of TAA's sub-pixel offsets; the view positions the
 //    geometry prep and GTAO reconstruct (their own ViewPos, through a test entry point appended to
 //    the real source) match the ray-cast truth with the offset folded into P02 / P12, and are off
-//    by the offset without it; the prep's normals on the floor and the left wall lose their tilt.
+//    by the offset without it; the prep's normals on the floor and the left wall lose their tilt;
+//  - noise: AO and contact shadows averaged over 16 frames with the per-frame offsets the mod sets
+//    while TAA runs (core::Scene_NoiseOffsets) are closer to what GTAO converges to than one frame;
+//    and the narrow blur used then is as good as the wide one on a single frame and better averaged.
 //
 // ao_warp_test pitched            - a second scene: camera looking down onto open ground with a box, a
 //                                   10 cm post and a sunlit wall seen at a glancing angle (false
@@ -1030,6 +1033,119 @@ int main(int argc, char** argv)
 		memcpy(cProj2, saved, sizeof(saved));
 		tDepthJ.tex->Release();
 		tPos.tex->Release();
+	}
+	{
+		// Noise: one frame against 16 frames averaged with the offsets the mod sets while TAA runs.
+		// The reference is what the same GTAO converges to over many frames: the mean of 64 frames
+		// with offsets on an 8 x 8 grid, unblurred. (Not GTAO with more slices and steps: its horizons
+		// are maxima over the steps, so 3 x 6 samples stay a little below 24 x 48 however many frames
+		// are averaged; that difference is the method's, and TAA can't change it. What TAA removes is
+		// the noise around this mean.)
+		const float saved[4] = { cProj2[0], cProj2[1], cProj2[2], cProj2[3] };
+		pass(geoCode, geoPs, tGeo, HW, HH, sGeo, across, false);
+		// The narrow blur the mod uses while TAA averages the frames (sigma 1 instead of 2).
+		ID3DBlob* lightCode = CompileEntry("PS_BlurNarrow", "ps_4_0");
+		if (!lightCode)
+			return 1;
+		ID3D11PixelShader* lightPs = nullptr;
+		dev->CreatePixelShader(lightCode->GetBufferPointer(), lightCode->GetBufferSize(), nullptr, &lightPs);
+		// One frame of the mod's chain (GTAO, blur across, blur down) with offsets `o`; blur 0 stops
+		// after GTAO, 1 = the blur without TAA, 2 = the narrow one. Returns AO (r) and contact (b).
+		auto frame = [&](const float o[2], int blurred) {
+			cProj2[2] = o[0];
+			cProj2[3] = o[1];
+			pass(gtaoCode, gtao, tAo[0], HW, HH, s0, across, false);
+			if (blurred)
+			{
+				pass(blurred == 2 ? lightCode : blurCode, blurred == 2 ? lightPs : blur, tAo[1], HW, HH, s1, across, false);
+				pass(blurred == 2 ? lightCode : blurCode, blurred == 2 ? lightPs : blur, tAo[0], HW, HH, s2, down, false);
+			}
+			return ReadHalf(dev, ctx, tAo[0], HW, HH);
+		};
+		const size_t texels = (size_t)HW * HH * 4;
+		std::vector<float> ref(texels, 0.0f);
+		for (int i = 0; i < 64; i++)
+		{
+			const float o[2] = { (i % 8 + 0.5f) / 8, (i / 8 + 0.5f) / 8 };
+			std::vector<float> r = frame(o, 0);
+			for (size_t k = 0; k < texels; k++)
+				ref[k] += r[k] / 64;
+		}
+		const int N = 16;
+		const float zero[2] = { 0, 0 };
+		std::vector<float> single = frame(zero, 1), singleRaw = frame(zero, 0), singleLight = frame(zero, 2);
+		std::vector<float> avgBlur(texels, 0.0f), avgRaw(texels, 0.0f), avgLight(texels, 0.0f), prevBlur, prevRaw, prevLight;
+		double flickerBlur = 0, flickerRaw = 0, flickerLight = 0;
+		for (int f = 0; f < N; f++)
+		{
+			float o[2];
+			R2((unsigned)f + 1, o);
+			std::vector<float> b = frame(o, 1), raw = frame(o, 0), light = frame(o, 2);
+			for (size_t k = 0; k < texels; k++)
+			{
+				avgBlur[k] += b[k] / N;
+				avgRaw[k] += raw[k] / N;
+				avgLight[k] += light[k] / N;
+			}
+			for (size_t k = 0; f > 0 && k < texels; k += 4)
+			{
+				flickerBlur += fabs(b[k] - prevBlur[k]);
+				flickerRaw += fabs(raw[k] - prevRaw[k]);
+				flickerLight += fabs(light[k] - prevLight[k]);
+			}
+			prevBlur = b;
+			prevRaw = raw;
+			prevLight = light;
+		}
+		// Mean |error| over the texels that aren't sky (AO clamped as the composite does); contact
+		// shadows only where the reference or the one-frame result is shadowed (most texels are lit
+		// and exact either way).
+		auto err = [&](const std::vector<float>& v, int ch) {
+			double sum = 0;
+			int n = 0;
+			for (size_t k = 0; k < texels; k += 4)
+			{
+				size_t t = k / 4;
+				if (depth[(t / HW * 2) * W + (t % HW) * 2] >= 1.0f)
+					continue;
+				if (ch == 2 && ref[k + 2] > 0.99f && singleRaw[k + 2] > 0.99f)
+					continue;
+				float a = v[k + ch], b = ref[k + ch];
+				if (ch == 0)
+				{
+					a = fminf(fmaxf(a, 0), 1);
+					b = fminf(fmaxf(b, 0), 1);
+				}
+				sum += fabs(a - b);
+				n++;
+			}
+			return n ? sum / n : 1e9;
+		};
+		double e1 = err(single, 0), eAvg = err(avgBlur, 0), e1Raw = err(singleRaw, 0), eRaw = err(avgRaw, 0);
+		double e1Light = err(singleLight, 0), eLight = err(avgLight, 0);
+		double c1 = err(single, 2), cAvg = err(avgBlur, 2), c1Raw = err(singleRaw, 2), cRaw = err(avgRaw, 2);
+		double c1Light = err(singleLight, 2), cLight = err(avgLight, 2);
+		const double changes = (double)HW * HH * (N - 1);
+		printf("  AO against what GTAO converges to (mean |error|), one frame -> %d frames averaged: blur without TAA (sigma 2) %.4f -> "
+			   "%.4f (%.0f%%); narrow blur with TAA (sigma 1) %.4f -> %.4f; no blur %.4f -> %.4f\n",
+			N, e1, eAvg, 100.0 * eAvg / e1, e1Light, eLight, e1Raw, eRaw);
+		printf("  contact shadows (shadowed texels): blur without TAA %.4f -> %.4f; narrow blur %.4f -> %.4f; no blur %.4f -> %.4f\n", c1,
+			cAvg, c1Light, cLight, c1Raw, cRaw);
+		printf("  AO frame-to-frame change with the offsets (what TAA has to absorb): blur without TAA %.4f, narrow %.4f, none %.4f\n",
+			flickerBlur / changes, flickerLight / changes, flickerRaw / changes);
+		// The contact shadow noise is checked before the blur: blurred, its error is the blur's
+		// spread of the shadow edge, which no averaging changes.
+		bool okNoise = eAvg < 0.8 * e1 && cRaw < 0.8 * c1Raw;
+		fails += !okNoise;
+		printf("  averaging frames with the per-frame offsets gets closer to it than one frame: %s\n", okNoise ? "yes" : "NO");
+		// The narrow blur pays only if a single frame (just after a disocclusion, or in fast motion,
+		// where TAA keeps little history) is no worse than with the wide blur, and the average is better.
+		bool okNarrow = e1Light < 1.15 * e1 && eLight < 0.85 * eAvg && c1Light < c1 && cLight < cAvg;
+		fails += !okNarrow;
+		printf("  narrow blur with TAA: one frame no worse than the wide blur (AO %.4f vs %.4f, contact %.4f vs %.4f), averaged better "
+			   "(AO %.4f vs %.4f, contact %.4f vs %.4f): %s\n",
+			e1Light, e1, c1Light, c1, eLight, eAvg, cLight, cAvg, okNarrow ? "yes" : "NO");
+		memcpy(cProj2, saved, sizeof(saved));
 	}
 	printf("ao (WARP): %s (pictures: tests/ao_warp_ao.png, ao_warp_contact.png, ao_warp_composite.png)\n", fails ? "FAILED" : "all ok");
 	return fails ? 3 : 0;

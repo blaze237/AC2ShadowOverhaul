@@ -13,6 +13,12 @@
 //             reference (and clearly better than without reprojection)
 //   object  - static camera, a box sliding across: no ghost trail where the box was
 //   hdr     - bright values survive without NaNs and the output pass's round trip is exact
+//   light   - static camera, the light on everything x 1.5 at once (a light switched on), and the
+//             same change settling the way SSGI's bounce light does: its temporal pass blends at
+//             least 10 % per frame without TAA (tests/ssgi: 22 frames to 90 %) and 20 % while TAA
+//             averages (11 frames). How many frames TAA's output lags behind its input: with 10 %
+//             the two histories together take half as long again as SSGI alone without TAA, with
+//             20 % about as long (gi.cpp doubles the blend while TAA averages).
 // Writes taa_warp_<case>.png (left: one sample per pixel, middle: TAA, right: reference).
 //
 // The HLSL is compiled for shader model 4 in backwards-compatibility mode with TAA_D3D11 defined
@@ -549,6 +555,7 @@ struct Run
 	Camera prev;
 	Settings s;
 	std::vector<float> rgba, zw;
+	float light = 1.0f; // the scene's colour (not the sky) x this: a light changing (the light case)
 
 	void Init(Pass& r, Pass& o)
 	{
@@ -576,6 +583,10 @@ struct Run
 		unsigned phase = (f & 7) + 1;
 		float ox = halton(phase, 2) - 0.5f, oy = halton(phase, 3) - 0.5f;
 		RenderFrame(c, ox, oy, rgba, zw);
+		for (size_t i = 0; light != 1.0f && i < zw.size(); i++)
+			if (zw[i] < 1.0f)
+				for (int k = 0; k < 3; k++)
+					rgba[i * 4 + k] *= light;
 		std::vector<uint16_t> half(rgba.size());
 		for (size_t i = 0; i < rgba.size(); i++)
 		{
@@ -964,6 +975,73 @@ nearTaa = Rmse(b, ref, &nearMask);
 		CHECK(ghost < 0.01, "object: ghost trail behind the box (%.4f)", ghost);
 		CHECK(eAll < 0.6 * Rmse(single, ref), "object: whole image error %.4f", eAll);
 		SavePanel("object", single, o, ref);
+	}
+
+	// --- light ---
+	{
+		printf("== light changing, still camera\n");
+		BuildScene(false);
+		Cam c = MakeCam(0.3, 1.7, 0.0, 0.05, 0.12);
+		// Mean over the pixels that aren't sky of an RGBA image (green).
+		std::vector<float> zw0, col0;
+		RenderFrame(c, 0, 0, col0, zw0);
+		auto mean = [&](const std::vector<float>& img) {
+			double sum = 0;
+			int n = 0;
+			for (size_t i = 0; i < zw0.size(); i++)
+				if (zw0[i] < 1.0f)
+				{
+					sum += img[i * 4 + 1];
+					n++;
+				}
+			return sum / n;
+		};
+		// Frames until the output (and the input) has 90 % of the change: at once (blend 1) or settling
+		// by `blend` of the rest per frame.
+		auto lag = [&](float blend, int& inFrames, int& outFrames) {
+			Run r;
+			r.Init(resolve, output);
+			unsigned fr = 0;
+			std::vector<float> o;
+			for (; fr < 16; fr++)
+				o = r.Frame(c, fr, 0);
+			double outBefore = mean(o), inBefore = mean(r.rgba);
+			std::vector<double> outs, ins;
+			for (int k = 0; k < 64; k++, fr++)
+			{
+				r.light = 1.0f + 0.5f * (1.0f - powf(1.0f - blend, (float)(k + 1)));
+				o = r.Frame(c, fr, 0);
+				outs.push_back(mean(o));
+				ins.push_back(mean(r.rgba));
+			}
+			// The settled values: the light at x 1.5 (both curves end there; the last frames are close).
+			r.light = 1.5f;
+			for (int k = 0; k < 16; k++, fr++)
+				o = r.Frame(c, fr, 0);
+			double outAfter = mean(o), inAfter = 1.5 * inBefore;
+			inFrames = outFrames = -1;
+			for (int k = 0; k < 64; k++)
+			{
+				if (inFrames < 0 && ins[k] - inBefore >= 0.9 * (inAfter - inBefore))
+					inFrames = k + 1;
+				if (outFrames < 0 && outs[k] - outBefore >= 0.9 * (outAfter - outBefore))
+					outFrames = k + 1;
+			}
+		};
+		int stepIn, stepOut, in10, out10, in20, out20;
+		lag(1.0f, stepIn, stepOut);
+		lag(0.1f, in10, out10);
+		lag(0.2f, in20, out20);
+		printf("  light x 1.5 at once: the input has 90%% of the change after %d frame(s), TAA's output after %d (its clip box hardly\n"
+			   "  narrows on a uniformly brighter textured image, so mostly its feedback decides)\n",
+			stepIn, stepOut);
+		printf("  settling like SSGI's bounce light at 10%% per frame (SSGI without TAA): input after %d frames, TAA's output after %d\n", in10,
+			out10);
+		printf("  settling at 20%% per frame (SSGI while TAA averages): input after %d frames, TAA's output after %d\n", in20, out20);
+		CHECK(stepOut > 0 && stepOut <= 30, "light: TAA takes %d frames to follow a light switched on", stepOut);
+		// Together, SSGI's doubled blend and TAA follow a change about as fast as SSGI did alone.
+		CHECK(out20 > 0 && out20 <= in10 + 4 && out20 < out10 - 6, "light: SSGI at 20%% + TAA take %d frames (SSGI alone at 10%%: %d; at 10%% + TAA: %d)",
+			out20, in10, out10);
 	}
 
 	// --- follow ---

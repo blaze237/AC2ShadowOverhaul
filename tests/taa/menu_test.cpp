@@ -51,7 +51,13 @@ int main()
 	CHECK(Taa_GetSettings().on == t0.on, "a key acted while the menu was hidden");
 
 	Press(VK_F1); // open
-	Press('9'); // Debug view
+	Press('9'); // Average other effects' noise ([TAA] AssistEffects)
+	CHECK(g_menu.Selected() == ITEM_ASSIST, "key 9 selected item %d", g_menu.Selected());
+	Press(VK_LEFT);
+	CHECK(!Taa_GetSettings().assist, "AssistEffects not switched off");
+	Press(VK_RIGHT);
+	CHECK(Taa_GetSettings().assist, "AssistEffects not switched back on");
+	Press('0'); // Debug view
 	Press(VK_DOWN); // wraps to TAA
 	Press(VK_DOWN); // Sharpness
 	CHECK(g_menu.Selected() == ITEM_SHARPNESS, "number key / arrows selected item %d", g_menu.Selected());
@@ -76,6 +82,7 @@ int main()
 	// The merged ini has StartEnabled / DebugView in several sections: read [TAA]'s.
 	CHECK(GetPrivateProfileIntA("TAA", "StartEnabled", -1, ini.c_str()) == 0, "on/off not saved as [TAA] StartEnabled");
 	CHECK(GetPrivateProfileIntA("TAA", "DebugView", -1, ini.c_str()) == 0, "DebugView not saved");
+	CHECK(GetPrivateProfileIntA("TAA", "AssistEffects", -1, ini.c_str()) == 1, "AssistEffects not saved");
 	CHECK(text.find("; Sharpening of the result") != std::string::npos, "comments lost");
 
 	Press(VK_F1); // close

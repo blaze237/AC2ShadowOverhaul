@@ -13,7 +13,7 @@
 float4 c_Full   : register(c0); // full-res width, height, 1/width, 1/height
 float4 c_Half   : register(c1); // AO-res width, height, 1/width, 1/height
 float4 c_Proj   : register(c2); // A, B (z/w = A + B / z), P00, P11
-float4 c_Proj2  : register(c3); // P02, P12 (off-centre), noise frame offset (0 for now: see PS_GTAO), 0
+float4 c_Proj2  : register(c3); // P02, P12 (off-centre; with TAA's jitter folded in), noise offsets (slice, step: see PS_GTAO)
 float4 c_Params : register(c4); // radius (m), pixels per (metre / z) [0.5 * P00 * width], max radius (px), falloff share
 float4 c_Params2: register(c5); // AO strength (exponent; 0 = AO off), view mode, blur direction x, y
 float4 c_Sun    : register(c6); // direction towards the sun (view space), contact shadow length (m; 0 = off)
@@ -148,11 +148,11 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 	float3 N = tex2Dlod(s_Geo, float4((vpos + 0.5) * c_Half.zw, 0, 0)).xyz;
 
 	// Per-pixel rotation and step offset (interleaved gradient noise; the blur removes the pattern).
-	// c_Proj2.z shifts the pattern per frame; 0 for now (the same pattern every frame, as the blur
-	// expects). With TAA resolving the image it can vary by frame, as SSGI's does.
-	float2 seed = vpos + c_Proj2.z * 5.588238;
-	float noiseA = frac(52.9829189 * frac(dot(seed, float2(0.06711056, 0.00583715))));
-	float noiseB = frac(52.9829189 * frac(dot(seed + float2(17.0, 31.0), float2(0.06711056, 0.00583715))));
+	// c_Proj2.zw is added to them: 0 without TAA (the same pattern every frame, as the blur expects;
+	// frac(n + 0) = n, so nothing changes), an R2 sequence over the frames while TAA averages them
+	// (core::Scene_NoiseOffsets), so every pixel's slices and steps over time are evenly spread.
+	float noiseA = frac(frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715)))) + c_Proj2.z);
+	float noiseB = frac(frac(52.9829189 * frac(dot(vpos + float2(17.0, 31.0), float2(0.06711056, 0.00583715)))) + c_Proj2.w);
 
 	float contact = ContactShadow(P, N, z, noiseB);
 
@@ -210,17 +210,19 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 
 // ---- Depth-aware blur (half res, one direction per pass) ---------------------------------------
 
-float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
+// Gaussian weights of the taps 1..4 texels from the centre (the centre weighs 1).
+static const float kGauss2[5] = { 1.0, 0.8825, 0.6065, 0.3247, 0.1353 }; // sigma 2
+static const float kGauss1[5] = { 1.0, 0.6065, 0.1353, 0.0111, 0.0 };    // sigma 1
+
+float4 Blur(float2 vpos, const float gauss[5], int taps)
 {
-	float2 vpos = PIXEL(vposIn);
 	float2 uv = (vpos + 0.5) * c_Half.zw;
 	float3 centre = tex2Dlod(s_AO, float4(uv, 0, 0)).xyz;
 	float2 stepUv = c_Params2.zw * c_Half.zw;
 	float tolerance = 1.0 / (0.08 * centre.y);
 	float sum = centre.x, wsum = 1.0;
 	float csSum = centre.z;
-	const float gauss[5] = { 1.0, 0.8825, 0.6065, 0.3247, 0.1353 }; // sigma 2
-	[unroll] for (int i = 1; i <= 4; i++)
+	[unroll] for (int i = 1; i <= taps; i++)
 	{
 		float3 a = tex2Dlod(s_AO, float4(uv + stepUv * i, 0, 0)).xyz;
 		float3 b = tex2Dlod(s_AO, float4(uv - stepUv * i, 0, 0)).xyz;
@@ -231,6 +233,21 @@ float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
 		wsum += wa + wb;
 	}
 	return float4(sum / wsum, centre.y, csSum / wsum, 0);
+}
+
+float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
+{
+	return Blur(PIXEL(vposIn), kGauss2, 4);
+}
+
+// The narrow blur, used while TAA averages the frames (core::Scene_TaaAssist; the noise pattern then
+// changes every frame). On tests/ao_warp_test's scene, one frame of it is as close to what GTAO
+// converges to as one frame of the sigma 2 blur (it leaves more noise but less spread), and 16
+// frames averaged are 30 % closer; the contact shadows' error is mostly the wide blur's spread of
+// their edge, which no averaging removes.
+float4 PS_BlurNarrow(VPOS_T vposIn : VPOS) : COLOR
+{
+	return Blur(PIXEL(vposIn), kGauss1, 3);
 }
 
 // ---- Composite (full res) ----------------------------------------------------------------------

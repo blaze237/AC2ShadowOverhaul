@@ -17,7 +17,10 @@
 //    ViewPos, through a test entry point appended to the real source) go through the jittered pixels
 //    with the offset folded into P02 / P12; two frames rendered with different offsets reproject
 //    onto the right texels with each frame's jittered camera (core::Jittered), and measurably off
-//    with the unjittered ones.
+//    with the unjittered ones;
+//  - a light switched on (the red wall's radiance x 3): how many frames the temporal pass takes to
+//    follow it (its blend is at least TemporalBlend = 0.1 per frame), the lag TAA comes on top of
+//    (tests/taa's "light settling" case measures what TAA adds).
 // Writes ssgi_warp_gi.png (the final GI light) to look at.
 #include <windows.h>
 #include <d3d11.h>
@@ -904,6 +907,114 @@ int main()
 			nf, ef, eu);
 		CHECK(nf > 500 && nu > 500, "too few texels kept their history (%d, %d)", nf, nu);
 		CHECK(ef < 0.05 && eu > 0.25 && eu > 5 * ef, "jittered reprojection: %.3f texels off with the jittered cameras, %.3f without", ef, eu);
+	}
+
+	// ---- A light switched on: the red wall's radiance x 3 from frame 0 on, static camera. How many
+	// frames until the temporal pass has 90 % of the change at the floor by the wall? With the
+	// minimum blend as without TAA (TemporalBlend, 0.1) and doubled, as while TAA averages the frames
+	// (gi.cpp: the two histories together would otherwise settle half as fast again).
+	{
+		prep(tGeo[0], tDepth);
+		float px, py;
+		Project(pNear, eye0, px, py);
+		std::vector<float> bright(colour);
+		for (UINT y = 0; y < H; y++)
+			for (UINT x = 0; x < W; x++)
+				if (Cast((float)x, (float)y, eye0).surface == 1)
+					for (int c = 0; c < 3; c++)
+						bright[((size_t)y * W + x) * 4 + c] *= 3.0f;
+		Target tBright = MakeTarget(W, H, F, bright.data(), W * 16), tRawBright = MakeTarget(HW, HH, F);
+		Pass(radiance, k, { &tRad }, { { "s_Colour", &tBright } });
+		Pass(trace, k, { &tRawBright }, { { "s_Geo", &tGeo[0] }, { "s_Rad", &tRad } });
+		Pass(radiance, k, { &tRad }, { { "s_Colour", &tColour } });
+		Pass(trace, k, { &tRaw }, { { "s_Geo", &tGeo[0] }, { "s_Rad", &tRad } });
+		float after[4];
+		Avg(ReadBack(tRawBright), px, py, after, 1);
+		auto settle = [&](float minBlend, float before[4]) {
+			Consts kt = k;
+			kt.c[9][0] = minBlend;
+			kt.c[9][3] = 1.0f / minBlend;
+			// Settled before the change: the same trace until the blend is at its minimum.
+			kt.c[9][2] = 0;
+			Pass(temporal, kt, { &tHist[0] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tRaw }, { "s_Hist", &tHist[1] }, { "s_PrevGeo", &tGeo[0] } });
+			kt.c[9][2] = 1;
+			int cur = 1;
+			for (int i = 0; i < 12; i++, cur ^= 1)
+				Pass(temporal, kt, { &tHist[cur] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tRaw }, { "s_Hist", &tHist[cur ^ 1] }, { "s_PrevGeo", &tGeo[0] } });
+			Avg(ReadBack(tHist[cur ^ 1]), px, py, before, 1);
+			for (int i = 1; i <= 60; i++, cur ^= 1)
+			{
+				Pass(temporal, kt, { &tHist[cur] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tRawBright }, { "s_Hist", &tHist[cur ^ 1] }, { "s_PrevGeo", &tGeo[0] } });
+				float v[4];
+				Avg(ReadBack(tHist[cur]), px, py, v, 1);
+				if ((v[0] - before[0]) >= 0.9f * (after[0] - before[0]))
+					return i;
+			}
+			return -1;
+		};
+		float before[4];
+		int frames = settle(0.1f, before), framesTaa = settle(0.2f, before);
+		printf("light switched on (red wall x 3): the floor by the wall goes %.3f -> %.3f; the temporal pass has 90%% of it after %d frames, "
+			   "%d with the blend doubled as while TAA averages (+1: the game's shaders read it the frame after)\n",
+			before[0], after[0], frames, framesTaa);
+		CHECK(frames > 0 && frames <= 25, "the temporal pass follows a light change in %d frames (expected about 22: 0.9^n < 0.1)", frames);
+		CHECK(framesTaa > 0 && framesTaa <= 12, "with the blend doubled it follows in %d frames (expected about 11: 0.8^n < 0.1)", framesTaa);
+
+		// What the doubled blend costs in noise: the trace varies by frame (its own noise index), the
+		// temporal pass averages it. Against what the trace converges to (32 frames averaged), the
+		// temporal output after 30 frames, alone and then followed by an average like TAA's history
+		// on a still image (feedback 0.95; an idealised TAA: no clipping), for both blends.
+		const size_t n = (size_t)HW * HH * 4;
+		std::vector<float> conv(n, 0.0f);
+		std::vector<std::vector<float>> raws;
+		for (int f = 0; f < 32; f++)
+		{
+			Consts kf = k;
+			kf.c[3][2] = (float)f;
+			Pass(trace, kf, { &tRaw }, { { "s_Geo", &tGeo[0] }, { "s_Rad", &tRad } });
+			raws.push_back(ReadBack(tRaw));
+			for (size_t i = 0; i < n; i++)
+				conv[i] += raws.back()[i] / 32;
+		}
+		auto noise = [&](float minBlend, double& alone, double& withTaa) {
+			Consts kt = k;
+			kt.c[9][0] = minBlend;
+			kt.c[9][3] = 1.0f / minBlend;
+			std::vector<float> taa;
+			int cur = 0;
+			for (int f = 0; f < 64; f++, cur ^= 1)
+			{
+				Target tIn = MakeTarget(HW, HH, F, raws[(f * 7 + 3) % 32].data(), HW * 16); // the frames in another order than averaged
+				kt.c[9][2] = f ? 1.0f : 0.0f;
+				Pass(temporal, kt, { &tHist[cur] }, { { "s_Geo", &tGeo[0] }, { "s_Raw", &tIn }, { "s_Hist", &tHist[cur ^ 1] }, { "s_PrevGeo", &tGeo[0] } });
+				tIn.tex->Release();
+				std::vector<float> h = ReadBack(tHist[cur]);
+				if (taa.empty())
+					taa = h;
+				for (size_t i = 0; i < n; i++)
+					taa[i] += (h[i] - taa[i]) * 0.05f;
+				if (f == 63)
+				{
+					double e = 0, et = 0, level = 0;
+					for (size_t i = 0; i < n; i += 4)
+						for (int c = 0; c < 3; c++)
+						{
+							e += fabs(h[i + c] - conv[i + c]);
+							et += fabs(taa[i + c] - conv[i + c]);
+							level += conv[i + c];
+						}
+					alone = e / level;
+					withTaa = et / level;
+				}
+			}
+		};
+		double a1, t1, a2, t2;
+		noise(0.1f, a1, t1);
+		noise(0.2f, a2, t2);
+		printf("noise of the temporal output against what the trace converges to (mean |error| / mean level): blend 0.1 %.4f, then "
+			   "TAA-like averaging %.4f; blend 0.2 %.4f, then TAA-like averaging %.4f\n",
+			a1, t1, a2, t2);
+		CHECK(t2 < a1, "with TAA averaging, the doubled blend should still be less noisy than the normal blend alone (%.4f vs %.4f)", t2, a1);
 	}
 
 	// ---- Blur + intensity: one run of the full chain on frame 0's trace.

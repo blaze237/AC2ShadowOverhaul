@@ -193,6 +193,7 @@ static const E2EShader kE2EShaders[] = {
 	{ core::kGeoPrepPs, sizeof(core::kGeoPrepPs), FX_SHARED, "geo-prep" },
 	{ kAoGtaoPs, sizeof(kAoGtaoPs), FX_AO, "gtao" },
 	{ kAoBlurPs, sizeof(kAoBlurPs), FX_AO, "ao-blur" },
+	{ kAoBlurNarrowPs, sizeof(kAoBlurNarrowPs), FX_AO, "ao-blur-narrow" }, // while TAA averages the frames
 	{ kAoCompositePs, sizeof(kAoCompositePs), FX_AO, "ao-composite" },
 	{ ssgi::kGiRadiancePs, sizeof(ssgi::kGiRadiancePs), FX_SSGI, "gi-radiance" },
 	{ ssgi::kGiTracePs, sizeof(ssgi::kGiTracePs), FX_SSGI, "gi-trace" },

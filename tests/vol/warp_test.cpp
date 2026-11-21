@@ -23,7 +23,9 @@
 //    gave before the offset was added (hashes recorded from those shaders);
 //  - jitter: the ray each fog pixel marches along (the shader's own ViewRay / WorldDir, through a
 //    test entry point appended to the real source) goes through the jittered pixel with TAA's
-//    offset folded into P02 / P12, and misses it by the offset without.
+//    offset folded into P02 / P12, and misses it by the offset without;
+//  - noise: the fog averaged over 16 frames with the per-frame offset the mod sets while TAA runs
+//    (core::Scene_NoiseOffset) is closer to what the march converges to than one frame.
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -1105,6 +1107,66 @@ int main(int argc, char** argv)
 		out.rtv->Release();
 		out.t->Release();
 	}
+	{
+		// Noise: the beams view (shafts through the alleys) over 16 frames with the per-frame offsets the
+		// mod sets while TAA runs, against what the march converges to (64 frames, offsets evenly spaced,
+		// unblurred). One frame of the shipped chain (march, blur across, blur down) against the average
+		// of 16; the same with a narrower blur. (Measured: one frame of the narrower blur is about a
+		// third further off, 16 averaged about a quarter closer, both around 0.1 % of the fog's level,
+		// which nobody would see; so the mod keeps its one blur with and without TAA.)
+		const int N = 16, R = 64;
+		Settings b = d;
+		Outputs first = RunView(b); // renders the scene once
+		const size_t n = first.march.size();
+		std::vector<float> ref(n, 0.0f), avg(n, 0.0f), avgNarrow(n, 0.0f), avgRaw(n, 0.0f);
+		for (int i = 0; i < R; i++)
+		{
+			b.noise = (i + 0.5f) / R;
+			Outputs o = RunView(b, true);
+			for (size_t k = 0; k < n; k++)
+				ref[k] += o.march[k] / R;
+		}
+		b.noise = 0;
+		Outputs single = RunView(b, true);
+		b.narrowBlur = true;
+		Outputs singleNarrow = RunView(b, true);
+		for (int f = 1; f <= N; f++)
+		{
+			const double g = 0.6180339887498949;
+			b.noise = (float)(f * g - floor(f * g)); // core::Scene_NoiseOffset
+			b.narrowBlur = false;
+			Outputs o = RunView(b, true);
+			b.narrowBlur = true;
+			Outputs on = RunView(b, true);
+			for (size_t k = 0; k < n; k++)
+			{
+				avg[k] += o.fog[k] / N;
+				avgNarrow[k] += on.fog[k] / N;
+				avgRaw[k] += o.march[k] / N;
+			}
+		}
+		// Mean |error| of the in-scatter (rgb) and the transmittance.
+		auto err = [&](const std::vector<float>& v, bool transmittance) {
+			double sum = 0, level = 0;
+			for (size_t k = 0; k < n; k += 4)
+				for (int c = transmittance ? 3 : 0; c < (transmittance ? 4 : 3); c++)
+				{
+					sum += fabs(v[k + c] - ref[k + c]);
+					level += ref[k + c];
+				}
+			return sum / level; // relative to the mean level
+		};
+		double e1 = err(single.fog, false), eAvg = err(avg, false), e1n = err(singleNarrow.fog, false), eAvgN = err(avgNarrow, false);
+		double eRaw1 = err(single.march, false), eRaw = err(avgRaw, false);
+		double t1 = err(single.fog, true), tAvg = err(avg, true);
+		printf("fog in-scatter against what the march converges to (mean |error| / mean level), one frame -> %d averaged: blur %.4f -> %.4f; "
+			   "narrow blur %.4f -> %.4f; unblurred %.4f -> %.4f; transmittance (blur) %.5f -> %.5f\n",
+			N, e1, eAvg, e1n, eAvgN, eRaw1, eRaw, t1, tAvg);
+		Check(eAvg < 0.9 * e1 && eRaw < 0.5 * eRaw1,
+			"noise: the fog averaged over frames with the per-frame offsets is closer to it than one frame (blurred, unblurred)", eAvg / e1,
+			eRaw / eRaw1);
+	}
+
 	printf("%s: %d failure(s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails);
 	return g_fails ? 1 : 0;
 }
