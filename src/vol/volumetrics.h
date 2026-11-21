@@ -72,5 +72,6 @@ const char* Vol_Status();
 bool Menu_Init();
 void Menu_OnPresent(IDirect3DDevice9* dev);
 void Menu_Flush();
+void Menu_SetAllOn(bool on); // the "All volumetric effects" switch (the all-effects key; not saved)
 
 } // namespace vol

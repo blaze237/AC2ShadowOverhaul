@@ -30,6 +30,9 @@ enum MenuId
 	MENU_TAA,
 	MENU_VOLUMETRICS,
 };
+// A key is held and the game window has focus (the test hooks apply). Used by the all-effects key.
+bool MenuKeyHeld(int vk);
+
 int MenuOwner();
 void MenuClaim(int id);   // this menu was opened
 void MenuRelease(int id); // this menu was closed (only clears ownership if it still has it)

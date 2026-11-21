@@ -373,3 +373,8 @@ void Menu::OnPresent(IDirect3DDevice9* dev)
 }
 
 } // namespace core
+
+namespace core
+{
+bool MenuKeyHeld(int vk) { return HasFocus() && KeyDown(vk); }
+}

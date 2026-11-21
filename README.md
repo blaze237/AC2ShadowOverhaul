@@ -139,7 +139,10 @@ opening one closes the other.
 | F11 | Volumetrics: fog and sun shafts | `VolumetricsMenuKey` |
 | F1 | TAA (with a status line saying whether it is working) | `TAAMenuKey` |
 
-The menu keys are the only keys the mod uses while every menu is hidden.
+**F12** (`[Menu] AllEffectsKey`) switches every effect off and back on at once, for a quick comparison
+with the vanilla game: shadows, AO, contact shadows, SSGI, the volumetrics and TAA. Turning them back on
+restores whatever was on before, and it isn't saved. While everything is off a small note says so in
+the top-left corner. The menu keys and F12 are the only keys the mod uses while every menu is hidden.
 
 | Key | Action (while a menu is shown) |
 |---|---|

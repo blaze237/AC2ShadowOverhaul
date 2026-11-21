@@ -273,3 +273,6 @@ bool Tuning_Init()
 	SoftShadows_SetBuildAllWidths(true);
 	return true;
 }
+
+void Tuning_SetAllOn(bool on) { SetAllOn(on); }
+bool Tuning_AllOn() { return g_allOn; }

@@ -204,4 +204,6 @@ void Menu_Flush() { g_menu.Flush(); }
 
 bool Menu_Init() { return g_menu.Init(); }
 
+void Menu_SetAllOn(bool on) { SetAllOn(on); }
+
 } // namespace vol

@@ -54,6 +54,8 @@ void Shadows_SetSetting(int which, float value);
 bool Tuning_Init();
 void Tuning_Flush(); // writes unsaved menu changes to the ini
 bool Tuning_Enabled();
+void Tuning_SetAllOn(bool on); // the "All shadow effects" switch (the all-effects key; not saved)
+bool Tuning_AllOn();
 struct IDirect3DDevice9;
 void Tuning_OnPresent(IDirect3DDevice9* dev);
 void FrameDump_Init(bool deviceHooksNeeded);
