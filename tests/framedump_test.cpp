@@ -550,14 +550,15 @@ int main()
 			before == 3 && after == 2 ? "yes" : "NO");
 		WritePrivateProfileStringA("SoftShadows", "FilterWidth", "3", ini); // leave the test ini as it was
 
-		// Contact hardening (off in the ini): the menu item after "Contact shadow length" (0, then
-		// Down) switches the game's shader to its contact hardening variant, live.
+		// Contact hardening (off in the ini): the menu item two below "Contact shadow length" (0, then
+		// Down past "Shading normals") switches the game's shader to its contact hardening variant, live.
 		press('5');
 		press(VK_RIGHT); // back to width 3, the variant handed to the game
 		dev->SetPixelShader(gp);
 		dev->GetPixelShader(&cur);
 		bool plainAgain = cur == gp;
 		press('0');
+		press(VK_DOWN);
 		press(VK_DOWN);
 		press(VK_RIGHT);
 		dev->SetPixelShader(gp);

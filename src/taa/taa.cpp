@@ -533,7 +533,9 @@ static void Resolve(IDirect3DDevice9* dev)
 
 	const core::Camera& cam = core::Scene().camera;
 	float reproj[4][4];
-	bool valid = g_historyValid && g_prevCam.ok && core::ReprojectionMatrix(cam, g_prevCam, reproj);
+	// A camera cut (core::IsCameraCut, against the history's own camera) starts the history again: where
+	// the depths of the two shots happen to agree (sky, flat ground) it would otherwise fade across.
+	bool valid = g_historyValid && g_prevCam.ok && !core::IsCameraCut(cam, g_prevCam) && core::ReprojectionMatrix(cam, g_prevCam, reproj);
 	if (!valid)
 		memset(reproj, 0, sizeof(reproj));
 
