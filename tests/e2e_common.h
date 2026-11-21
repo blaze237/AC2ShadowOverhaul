@@ -44,14 +44,19 @@ struct E2EEffects
 };
 
 // Copies the shipped ini (the repo root is two or three folders up from the test's folder) to
-// scripts\ and switches the effect groups. Also deletes the last run's log.
+// scripts\ and switches the effect groups. Also deletes the last run's log. The repo root is the
+// folder with src\core\scene.h: from tests\combined, three folders up is the repo's parent, which
+// may have an AC2ShadowOverhaul.ini of its own (an older plugin's).
 static bool E2E_WriteIni(const E2EEffects& on)
 {
 	CreateDirectoryA("scripts", nullptr);
 	bool copied = false;
-	for (const char* src : { "..\\..\\..\\AC2ShadowOverhaul.ini", "..\\..\\AC2ShadowOverhaul.ini" })
-		if (!copied && GetFileAttributesA(src) != INVALID_FILE_ATTRIBUTES)
-			copied = CopyFileA(src, E2E_INI, FALSE) != 0;
+	for (const char* root : { "..\\..\\..\\", "..\\..\\" })
+	{
+		std::string r = root;
+		if (!copied && GetFileAttributesA((r + "src\\core\\scene.h").c_str()) != INVALID_FILE_ATTRIBUTES)
+			copied = CopyFileA((r + "AC2ShadowOverhaul.ini").c_str(), E2E_INI, FALSE) != 0;
+	}
 	if (!copied)
 	{
 		printf("FAIL  could not find the shipped AC2ShadowOverhaul.ini\n");

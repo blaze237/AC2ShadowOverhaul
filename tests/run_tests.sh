@@ -26,6 +26,8 @@
 #   - end to end: TAA alone, then with every effect on
 #  Everything at once (combined_test.cpp, combined/)
 #   - the frame order of all effects, one menu open at a time, MSAA, refusal next to an old plugin
+#   - the effects with TAA: the jitter they get is the game's c255, their noise offsets move only while
+#     TAA runs (on, switched off and on in the menu, disabled in the ini, AssistEffects=0)
 #
 # (*) needs the game's shaders exported by the F8 frame dump: pixel shaders (*.cso) in
 #     ../re/shaders/dump (or set SHADERS=dir), vertex shaders (vs_*.cso) in ../re/shaders/vs (or set
@@ -220,7 +222,7 @@ cd ..
 if build "combined end to end" $CXX $FLAGS -o combined_test.exe combined_test.cpp -ld3d9; then
 	e2e_dir combined
 	mv combined_test.exe combined/AssassinsCreedIIGame.exe
-	for mode in order menus msaa refusal; do
+	for mode in order menus msaa taa taaoff noassist refusal; do
 		run "combined: $mode" combined -- ./AssassinsCreedIIGame.exe $mode
 	done
 fi

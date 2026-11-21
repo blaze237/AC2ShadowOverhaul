@@ -15,8 +15,18 @@
 //            volumetrics use the same sun
 //   menus    only one menu is open at a time: F9 (shadows) then F3 (SSGI) hides the F9 menu, and so
 //            on through F1 (TAA) and F11 (volumetrics); the arrows only reach the menu shown last
-//   msaa     a multisampled scene colour and z/w target: the MSAA warning is logged and no effect
-//            draws anything
+//   msaa     a multisampled scene colour and z/w target: the MSAA warning is logged, no effect draws
+//            anything, and the game's draws never get TAA's jitter (c255 stays 0)
+//   taa      the effects with TAA (core/scene.h): every frame, the projection terms AO, SSGI and the
+//            volumetrics get (c3.xy of their passes) are the unjittered ones plus exactly the c255
+//            the game's draws got that frame; the noise offsets (AO c3.zw, fog c24.w) step through
+//            their low-discrepancy sequences only while TAA runs; AO uses its narrow blur and SSGI
+//            its doubled blend then; every effect pass runs with c255 = 0, no mip bias, and its own
+//            vertex shader. Switched off in the F1 menu: no jitter, offsets 0, everything as without
+//            TAA; switched back on: it all comes back
+//   taaoff   [TAA] Enabled=0: no jitter, offsets 0, the passes as without TAA
+//   noassist [TAA] AssistEffects=0: the jitter is still folded in (that is correctness), but the
+//            noise offsets stay 0, the wide AO blur and SSGI's own blend stay
 //   refusal  a dummy AC2SSGI.asi next to the plugin: it logs the refusal and installs no hooks (the
 //            message box it shows on its own thread is closed by the test, if it appears)
 #include <windows.h>
@@ -321,9 +331,14 @@ struct Game
 	}
 };
 
-static bool Setup(Game& g, bool msaa)
+// `ini` (section, key, value triples, nullptr-terminated) is written over the shipped settings.
+static bool Setup(Game& g, bool msaa, const char* const* ini = nullptr)
 {
-	if (!E2E_WriteIni(E2EEffects::All()) || !E2E_LoadPlugin())
+	if (!E2E_WriteIni(E2EEffects::All()))
+		return false;
+	for (; ini && ini[0]; ini += 3)
+		E2E_SetIni(ini[0], ini[1], ini[2]);
+	if (!E2E_LoadPlugin())
 		return false;
 	g.msaa = msaa;
 	if (!g.Create())
@@ -532,6 +547,215 @@ static int TestMsaa()
 		all &= line.find(name) != std::string::npos;
 	Check(all, "it names every effect that is on (AO, contact shadows, SSGI, fog, shafts, TAA)");
 	Check(c.Effects() == 0, "no effect passes (AO %d, SSGI %d, volumetrics %d, TAA %d)", c.n[FX_AO], c.n[FX_SSGI], c.n[FX_VOL], c.n[FX_TAA]);
+	bool still = true;
+	for (size_t i = first; i < g.log->draws.size(); i++)
+		still &= g.log->draws[i].c255[0] == 0 && g.log->draws[i].c255[1] == 0;
+	Check(still, "the game's draws never get TAA's jitter (c255 = 0 throughout)");
+	return 0;
+}
+
+// ---- taa / taaoff / noassist -------------------------------------------------------------------------
+
+// What one frame's draws and passes got (copies: the mock's draw log grows and moves).
+struct TaaFrame
+{
+	float c255[2] = {};             // at the first opaque draw
+	bool sceneSame = true;          // every scene draw (opaque, sky, transparent) got that c255
+	MockDraw draws[4] = {};         // the GTAO, march, SSGI trace and SSGI temporal passes
+	const MockDraw *gtao = nullptr, *march = nullptr, *trace = nullptr, *temporal = nullptr; // into draws[], if seen
+	TaaFrame() = default;
+	TaaFrame(const TaaFrame& o) { *this = o; }
+	TaaFrame& operator=(const TaaFrame& o)
+	{
+		memcpy(c255, o.c255, sizeof(c255));
+		sceneSame = o.sceneSame;
+		memcpy(draws, o.draws, sizeof(draws));
+		const MockDraw* const* from[4] = { &o.gtao, &o.march, &o.trace, &o.temporal };
+		const MockDraw** to[4] = { &gtao, &march, &trace, &temporal };
+		for (int k = 0; k < 4; k++)
+			*to[k] = *from[k] ? &draws[k] : nullptr;
+		aoBlur = o.aoBlur;
+		passesClean = o.passesClean;
+		gameBias = o.gameBias;
+		taaPasses = o.taaPasses;
+		return *this;
+	}
+	const char* aoBlur = nullptr;   // which AO blur ran
+	bool passesClean = true;        // every effect pass: c255 = 0, sampler 0's mip bias 0, not the game's vertex shader
+	float gameBias = 0;             // sampler 0's mip bias at the first opaque draw
+	int taaPasses = 0;
+};
+
+static float BiasOf(DWORD v)
+{
+	float f;
+	memcpy(&f, &v, 4);
+	return f;
+}
+
+static TaaFrame Inspect(const Game& g, const Game::Tags& t)
+{
+	const MockLog& L = *g.log;
+	TaaFrame f;
+	const MockDraw& opaque = L.draws[t.firstOpaque];
+	f.c255[0] = opaque.c255[0];
+	f.c255[1] = opaque.c255[1];
+	f.gameBias = BiasOf(opaque.lodBias0);
+	for (size_t i : { t.firstOpaque, t.lastOpaque, t.sky, t.trans })
+		f.sceneSame &= L.draws[i].c255[0] == f.c255[0] && L.draws[i].c255[1] == f.c255[1];
+	for (size_t i = t.begin; i < t.end; i++)
+	{
+		const MockDraw& d = L.draws[i];
+		const char* name = E2E_PassName(d);
+		if (!name)
+			continue;
+		f.passesClean &= d.c255[0] == 0 && d.c255[1] == 0 && d.c255[2] == 0 && d.c255[3] == 0 && BiasOf(d.lodBias0) == 0.0f && d.vs != g.gameVs;
+		const char* const kept[4] = { "gtao", "march", "gi-trace", "gi-temporal" };
+		const MockDraw** slot[4] = { &f.gtao, &f.march, &f.trace, &f.temporal };
+		for (int k = 0; k < 4; k++)
+			if (!strcmp(name, kept[k]))
+			{
+				f.draws[k] = d;
+				*slot[k] = &f.draws[k];
+			}
+		else if (!f.aoBlur && !strncmp(name, "ao-blur", 7))
+			f.aoBlur = name;
+		f.taaPasses += E2E_Effect(d) == FX_TAA;
+	}
+	return f;
+}
+
+// (b - a) mod 1 is `step` (mod 1): consecutive terms of the sequence n * step mod 1.
+static bool NextInSequence(float a, float b, double step)
+{
+	double d = (double)b - a - step;
+	d -= floor(d);
+	return d < 1e-4 || d > 1 - 1e-4;
+}
+
+static const double kR2a = 0.7548776662466927, kR2b = 0.5698402909980532, kGolden = 0.6180339887498949;
+
+// The frames f (indices into `fr`, f > 0) with everything as with TAA running and assisting.
+static void CheckAssisted(const std::vector<TaaFrame>& fr, size_t from, const char* what)
+{
+	bool jitter = true, folded = true, aoSeq = true, fogSeq = true, blur = true, blend = true, clean = true, bias = true, complete = true;
+	float worst = 0;
+	for (size_t f = from; f < fr.size(); f++)
+	{
+		const TaaFrame& a = fr[f];
+		const TaaFrame& p = fr[f - 1];
+		complete &= a.gtao && a.march && a.trace && a.temporal && a.aoBlur && p.gtao && p.march && a.taaPasses == 2;
+		if (!complete)
+			break;
+		jitter &= (a.c255[0] != 0 || a.c255[1] != 0) && a.sceneSame && (a.c255[0] != p.c255[0] || a.c255[1] != p.c255[1]);
+		for (const MockDraw* d : { a.gtao, a.march, a.trace })
+			for (int k = 0; k < 2; k++)
+				worst = fmaxf(worst, fabsf(d->psConst[3][k] - a.c255[k]));
+		aoSeq &= NextInSequence(p.gtao->psConst[3][2], a.gtao->psConst[3][2], kR2a) && NextInSequence(p.gtao->psConst[3][3], a.gtao->psConst[3][3], kR2b);
+		fogSeq &= NextInSequence(p.march->psConst[24][3], a.march->psConst[24][3], kGolden);
+		blur &= !strcmp(a.aoBlur, "ao-blur-narrow");
+		blend &= fabsf(a.temporal->psConst[9][0] - 0.2f) < 1e-6f && fabsf(a.temporal->psConst[9][3] - 5.0f) < 1e-5f;
+		clean &= a.passesClean;
+		bias &= a.gameBias == -0.5f;
+	}
+	folded = worst < 2e-6f; // the game's camera here is centred: P02 = P12 = 0 up to the float matrices' rounding
+	Check(complete, "%s: every frame has the AO, SSGI, volumetrics and TAA passes", what);
+	Check(jitter, "%s: the game's scene draws get TAA's jitter, the same in all of a frame's draws, a new one each frame", what);
+	Check(folded, "%s: AO, SSGI and the volumetrics get P02 / P12 = the unjittered ones + the c255 the game's draws got that frame "
+				  "(worst difference %.2g)",
+		what, worst);
+	Check(aoSeq, "%s: AO's noise offsets (c3.zw) step through R2 frame by frame", what);
+	Check(fogSeq, "%s: the fog's noise offset (c24.w) steps through the golden ratio sequence frame by frame", what);
+	Check(blur, "%s: AO uses its narrow blur", what);
+	Check(blend, "%s: SSGI's minimum temporal blend is doubled (0.2)", what);
+	Check(bias, "%s: the game's scene draws get TAA's mip bias (-0.5)", what);
+	Check(clean, "%s: every effect pass draws with c255 = 0, no mip bias on sampler 0, and its own vertex shader", what);
+}
+
+// Frames [from, end) as without TAA. `jitterFolded`: the jitter is still there and folded in (AssistEffects=0).
+static void CheckUnassisted(const std::vector<TaaFrame>& fr, size_t from, const char* what, bool taaRuns, bool jitterFolded)
+{
+	bool jitter = true, offsets = true, blur = true, blend = true, clean = true, complete = true;
+	float worst = 0;
+	for (size_t f = from; f < fr.size(); f++)
+	{
+		const TaaFrame& a = fr[f];
+		complete &= a.gtao && a.march && a.trace && a.temporal && a.aoBlur && a.taaPasses == (taaRuns ? 2 : 0);
+		if (!complete)
+			break;
+		jitter &= jitterFolded ? (a.c255[0] != 0 || a.c255[1] != 0) && a.sceneSame : a.c255[0] == 0 && a.c255[1] == 0;
+		for (const MockDraw* d : { a.gtao, a.march, a.trace })
+			for (int k = 0; k < 2; k++)
+				worst = fmaxf(worst, fabsf(d->psConst[3][k] - a.c255[k]));
+		offsets &= a.gtao->psConst[3][2] == 0 && a.gtao->psConst[3][3] == 0 && a.march->psConst[24][3] == 0;
+		blur &= !strcmp(a.aoBlur, "ao-blur");
+		blend &= a.temporal->psConst[9][0] == 0.1f && a.temporal->psConst[9][3] == 1.0f / 0.1f;
+		clean &= a.passesClean;
+	}
+	Check(complete, "%s: every frame has the AO, SSGI and volumetrics passes%s", what, taaRuns ? " and TAA's" : ", none of TAA");
+	Check(jitter && worst < 2e-6f, "%s: %s (worst difference of P02 / P12 from the c255 the game got %.2g)", what,
+		jitterFolded ? "the scene is jittered and the effects get the jitter folded in" : "no jitter (c255 = 0), the effects get the unjittered P02 / P12",
+		worst);
+	Check(offsets, "%s: the noise offsets are 0 (AO c3.zw, fog c24.w): the same pattern every frame as without TAA", what);
+	Check(blur, "%s: AO uses its usual blur", what);
+	Check(blend, "%s: SSGI's minimum temporal blend is the ini's (0.1)", what);
+	Check(clean, "%s: every effect pass draws with c255 = 0, no mip bias on sampler 0, and its own vertex shader", what);
+}
+
+static int TestTaa(const char* mode)
+{
+	const bool off = !strcmp(mode, "taaoff"), noAssist = !strcmp(mode, "noassist");
+	const char* const iniOff[] = { "TAA", "Enabled", "0", nullptr };
+	const char* const iniNoAssist[] = { "TAA", "AssistEffects", "0", nullptr };
+	Game g;
+	if (!Setup(g, false, off ? iniOff : noAssist ? iniNoAssist : nullptr))
+		return 1;
+	std::vector<TaaFrame> fr;
+	for (int i = 0; i < 10; i++)
+		fr.push_back(Inspect(g, g.Frame()));
+	if (getenv("TAA_DEBUG")) // the constants frame by frame, for debugging
+		for (const TaaFrame& f : fr)
+			printf("  c255 %.6f %.6f | gtao c3 %.6f %.6f %.6f %.6f | march c3 %.6f %.6f c24w %.6f | trace c3 %.6f %.6f | blend %.6f %.6f | %s\n",
+				f.c255[0], f.c255[1], f.gtao ? f.gtao->psConst[3][0] : -1, f.gtao ? f.gtao->psConst[3][1] : -1,
+				f.gtao ? f.gtao->psConst[3][2] : -1, f.gtao ? f.gtao->psConst[3][3] : -1, f.march ? f.march->psConst[3][0] : -1,
+				f.march ? f.march->psConst[3][1] : -1, f.march ? f.march->psConst[24][3] : -1, f.trace ? f.trace->psConst[3][0] : -1,
+				f.trace ? f.trace->psConst[3][1] : -1, f.temporal ? f.temporal->psConst[9][0] : -1, f.temporal ? f.temporal->psConst[9][3] : -1,
+				f.aoBlur ? f.aoBlur : "-");
+	// TAA jitters from its third frame on (it needs one resolved frame first).
+	if (off)
+	{
+		CheckUnassisted(fr, 1, "TAA disabled in the ini", false, false);
+		return 0;
+	}
+	if (noAssist)
+	{
+		CheckUnassisted(fr, 3, "AssistEffects=0", true, true);
+		return 0;
+	}
+	CheckAssisted(fr, 3, "TAA on");
+
+	// Switched off in the F1 menu (its first item), then on again.
+	auto press = [&](int vk, const char* expect) {
+		int before = E2E_LogCount(expect);
+		g_keys[vk] = true;
+		g.Frame();
+		for (int i = 0; i < 20 && E2E_LogCount(expect) == before; i++)
+			g.Frame();
+		g_keys[vk] = false;
+		g.Frame();
+		return E2E_LogCount(expect) == before + 1;
+	};
+	bool menu = press(VK_F1, "TAA menu shown") && press(VK_LEFT, "Menu: TAA = OFF");
+	Check(menu, "F1, Left: TAA switched off in the menu");
+	fr.clear();
+	for (int i = 0; i < 6; i++)
+		fr.push_back(Inspect(g, g.Frame()));
+	CheckUnassisted(fr, 1, "TAA switched off", false, false);
+	Check(press(VK_RIGHT, "Menu: TAA = ON"), "Right: TAA switched on again");
+	fr.clear();
+	for (int i = 0; i < 8; i++)
+		fr.push_back(Inspect(g, g.Frame()));
+	CheckAssisted(fr, 3, "TAA on again");
 	return 0;
 }
 
@@ -635,8 +859,10 @@ int main(int argc, char** argv)
 		r = TestMsaa();
 	else if (!strcmp(mode, "refusal"))
 		r = TestRefusal();
+	else if (!strcmp(mode, "taa") || !strcmp(mode, "taaoff") || !strcmp(mode, "noassist"))
+		r = TestTaa(mode);
 	else
-		return printf("usage: AssassinsCreedIIGame.exe order|menus|msaa|refusal\n"), 2;
+		return printf("usage: AssassinsCreedIIGame.exe order|menus|msaa|refusal|taa|taaoff|noassist\n"), 2;
 	if (r)
 		return r;
 	printf("%s: %d failure(s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails);
