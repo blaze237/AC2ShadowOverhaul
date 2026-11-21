@@ -10,7 +10,8 @@
 // changes and saves settings; a device Reset works.
 //
 // Usage: AssassinsCreedIIGame.exe [all]
-//   (default) SSGI alone: ambient occlusion, contact shadows, volumetrics and TAA Enabled=0
+//   (default) SSGI alone: ambient occlusion, contact shadows, volumetrics and TAA Enabled=0 (the
+//             opaque shaders still get AO's outputs, and AO binds its targets, for the shading normals)
 //   all       every effect on: the AO passes (4) run too, before ours, the geometry prep they share
 //             runs once (before both), and the game's shaders get both the AO output and the bounce light
 #include <windows.h>
@@ -173,10 +174,8 @@ int main(int argc, char** argv)
 		// Soft shadows are part of the plugin: several variants of each shader are created (also with
 		// FilterWidth=0, for the menu to switch live), all with our output.
 		CHECK(st->psWithS13 > 28, "expected the 28 rewritable dumped shaders and their variants, got %d", st->psWithS13);
-		if (all)
-			CHECK(st->psWithOC2 >= 28, "the AO output is missing (%d shaders)", st->psWithOC2);
-		else
-			CHECK(st->psWithOC2 == 0, "AO is off, yet %d shaders got its output", st->psWithOC2);
+		// AO's outputs either way: alone, SSGI gets the shading normals through them (ao.h).
+		CHECK(st->psWithOC2 >= 28, "the AO outputs (for %s) are missing (%d shaders)", all ? "AO" : "the shading normals", st->psWithOC2);
 	}
 	else
 		printf("(no shader dump found: shader rewrite not checked here)\n");
@@ -202,6 +201,7 @@ int main(int argc, char** argv)
 		IDirect3DPixelShader9* skyPs;
 		bool aoBeforeOurs;              // every AO pass came before our first one
 		bool sharedFirst;               // the shared geometry prep came before both
+		bool shadingNormals;            // ... with the opaque shaders' normals (AO's targets bound for them)
 	};
 	IDirect3DPixelShader9* skyPsSet = gamePs.empty() ? nullptr : gamePs[0];
 	auto frame = [&](const Mat4& vp) {
@@ -241,6 +241,7 @@ int main(int argc, char** argv)
 		r.up = st->upDraws - up0;
 		r.fx = E2E_CountPasses(log, d0, log->draws.size());
 		size_t lastAo = 0, firstOurs = (size_t)-1, firstAo = (size_t)-1, shared = (size_t)-1;
+		r.shadingNormals = false;
 		for (size_t i = d0; i < log->draws.size(); i++)
 		{
 			E2EEffect e = E2E_Effect(log->draws[i]);
@@ -251,7 +252,10 @@ int main(int argc, char** argv)
 			if (e == FX_SSGI && firstOurs == (size_t)-1)
 				firstOurs = i;
 			if (e == FX_SHARED)
+			{
 				shared = i;
+				r.shadingNormals = !strcmp(E2E_PassName(log->draws[i]), "geo-prep-normals");
+			}
 		}
 		r.aoBeforeOurs = !r.fx.n[FX_AO] || lastAo < firstOurs;
 		// The shared geometry prep comes before everything that reads it.
@@ -297,6 +301,7 @@ int main(int argc, char** argv)
 	printf("frame 2: %s, s13 width %u, reprojection rows off by %.2g (relative)\n", describe(f1).c_str(), f1.opaqueS13, worst);
 	CHECK(passesOk(f1, ours), "frame 2: %s, expected the shared prep once first, SSGI %d, AO %d (before SSGI)", describe(f1).c_str(), ours, ao);
 	CHECK(f1.opaqueS13 == (W + 1) / 2, "frame 2: s13 should be the GI texture, is %u wide", f1.opaqueS13);
+	CHECK(f1.shadingNormals, "frame 2: the geometry prep didn't use the opaque pass's shading normals%s", all ? "" : " (SSGI alone)");
 	CHECK(worst < 1e-3f, "frame 2: c216-c218 don't hold the reprojection rows");
 	CHECK(f1.postS13 != (W + 1) / 2, "frame 2: the GI texture stays bound outside the scene colour");
 	CHECK(f1.skyRt0 == colour && f1.skyRt1 == nullptr && f1.skyFreq1 == (D3DSTREAMSOURCE_INSTANCEDATA | 1), "frame 2: state not restored");

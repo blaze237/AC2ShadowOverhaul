@@ -26,6 +26,7 @@ enum
 	ITEM_AO_STRENGTH,
 	ITEM_CS_ON,
 	ITEM_CS_LENGTH,
+	ITEM_NORMALS,
 	ITEM_ALL_ON,     // master switch for every effect; not saved
 	ITEM_FRAME_DUMP, // writes a frame dump ([Debug] FrameDump=1 only); not a setting
 	ITEM_COUNT
@@ -41,6 +42,7 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "AO strength", "AmbientOcclusion", "Strength", true },
 	{ "Contact shadows", "ContactShadows", "StartEnabled", true },
 	{ "Contact shadow length", "ContactShadows", "Length", true },
+	{ "Shading normals", "AmbientOcclusion", "ShadingNormals", true },
 	{ "All shadow effects", nullptr, nullptr, true },
 	{ "Frame dump", nullptr, nullptr, false },
 };
@@ -133,6 +135,9 @@ protected:
 		case ITEM_CS_LENGTH:
 			snprintf(buf, n, "%.2f", CS_Length());
 			break;
+		case ITEM_NORMALS:
+			snprintf(buf, n, "%d", AO_ShadingNormals() ? 1 : 0);
+			break;
 		default:
 			buf[0] = 0;
 			break;
@@ -178,6 +183,10 @@ protected:
 			break;
 		case ITEM_CS_LENGTH:
 			snprintf(buf, n, "%.2f m", CS_Length());
+			break;
+		case ITEM_NORMALS:
+			// For AO, contact shadows and SSGI: n/a only with all three off in the ini.
+			snprintf(buf, n, "%s", !AO_Outputs() ? "n/a (AO, contact shadows, SSGI off)" : AO_ShadingNormals() ? "ON (the surfaces')" : "OFF (from depth)");
 			break;
 		case ITEM_ALL_ON:
 			snprintf(buf, n, "%s", g_allOn ? "ON" : "OFF (vanilla)");
@@ -237,6 +246,11 @@ protected:
 		case ITEM_CS_LENGTH:
 			// 0.05 m steps up to half a metre, 0.25 m above
 			CS_SetLength(CS_Length() + ((dir > 0 ? CS_Length() < 0.499f : CS_Length() < 0.501f) ? 0.05f : 0.25f) * dir);
+			return true;
+		case ITEM_NORMALS:
+			if (!AO_Outputs())
+				return false;
+			AO_SetShadingNormals(dir > 0);
 			return true;
 		case ITEM_ALL_ON:
 			SetAllOn(dir > 0);

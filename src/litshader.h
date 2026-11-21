@@ -1,7 +1,8 @@
 // The game's lit opaque pixel shaders: one lighting dataflow analysis, and one rewrite that adds
 // what ambient occlusion and SSGI need to them in a single pass (litshader.cpp).
 //
-//   AO   oC2 = the game's baked indirect light x (1 - fog), oC3 = shadowed sun light x (1 - fog)
+//   AO   oC2 = the game's baked indirect light x (1 - fog), oC3 = shadowed sun light x (1 - fog),
+//        their alpha the shading normal (octahedral + 2; 0 where it isn't found)
 //        (the AO composite removes (1 - AO) x oC2 + (1 - contact shadow) x oC3 from the scene)
 //   SSGI the indirect term gets albedo x tex2D(s13, reprojected position) added before the combine
 //
@@ -24,6 +25,7 @@ struct LitRewriteResult
 {
 	bool ao = false;        // the AO outputs were added (with the light, or 0 where it wasn't found)
 	bool aoMatched = false; // ... and carry the light
+	bool normal = false;    // ... and the shading normal (oC2.w, oC3.w; else 0 there)
 	bool gi = false;        // the bounce light was added
 	std::string aoWhy;      // why AO was not added or not matched
 	std::string giWhy;      // why the bounce light was not added

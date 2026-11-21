@@ -18,13 +18,26 @@
 // mov) until the final mad into oC0, which gives the fog factor. The albedo (for the bounce light)
 // is the factor the sun or ambient light is multiplied by that carries neither taint.
 //
-// Inserted code. AO (fresh temps T, S; constant Ka = (0, 1, 0, 0)):
+// Shading normal. g_AmbientCube is evaluated with the per-pixel normal the shader lights with
+// (normal map and two-sided flip applied; world space, like the sun direction it is dotted with):
+//     cmp faceSel.xyz, N, 1, 0 / cmp ..., -N, ...     (which cube face per axis: the signs)
+//     mul sq.xyz, N, N                                  (the weights: the squares)
+//     mul t, sq.x, g_AmbientCube[0] ... sq.z, g_AmbientCube[5]
+// N is taken to be the normal only when exactly one top-level "mul sq.xyz, N, N" before the
+// combine has each of sq.x, sq.y, sq.z multiplying a g_AmbientCube register and N's own value is
+// also sign-tested by a cmp; otherwise there is no normal (oC2.w = oC3.w = 0, as before).
+//
+// Inserted code. AO (fresh temps T, S, and N for the normal; constant Ka = (0, 1, 2, 2^-20)):
 //     before the combine:   mov rT.xyz, <indirect term> ; mov rS.xyz, <sun term>
 //                           (mul instead of mov for a term that is a mad's product)
+//     before the square:    mov rN.xyz, N
 //     before the final:     mad rT.xyz, rT, -fog, rT ; mad rS.xyz, rS, -fog, rS ;
-//                           mov rT.w, Ka.x ; mov rS.w, Ka.x ; mov oC2, rT ; mov oC3, rS
+//                           rT.w, rS.w = octahedral encoding of rN + 2 (Ka.x = 0 without a normal) ;
+//                           mov oC2, rT ; mov oC3, rS
 //   Shaders that write oC1 but don't match get "mov oC2, Ka.x ; mov oC3, Ka.x" at the top, so the
 //   targets never keep a value from a surface hidden behind them.
+//   The encoding: p = N / (|N.x| + |N.y| + |N.z|); where N.z < 0, p.xy = (1 - |p.yx|) * sign(p.xy);
+//   + 2 so that 0 (a target cleared, an unmatched shader) is never a normal (core/geoprep.hlsl).
 // SSGI (fresh temps G, Q; constant Kg = (1, 0, 0, 0)), right before the combine:
 //     Q.x  = z / w            (a copy of the instructions that compute oC1.x; 1 if they can't be copied)
 //     Q.yz = vPos.xy, Q.w = 1
@@ -36,7 +49,8 @@
 //   bound samples black and renders exactly as before.
 // Both: the SSGI code first, then the AO capture of the game's own indirect term (still in its
 //   register: SSGI's sum goes to G), then the combine reading G. So oC2 never holds the bounce
-//   light. T reuses Q and S the albedo copy (both dead by then), so both parts need 3 fresh temps.
+//   light. T reuses Q and S the albedo copy (both dead by then), so both parts need 3 fresh temps
+//   (4 with the normal).
 // Nothing else in the shader changes.
 
 #include "litshader.h"
@@ -498,6 +512,84 @@ bool AnalyseLighting(const DWORD* code, const std::vector<Inst>& insts, const co
 	return true;
 }
 
+// The shading normal (see the top): the token index of "mul sq.xyz, N, N" and its source N.
+bool FindNormal(const DWORD* code, const std::vector<Inst>& insts, const core::ConstantTable& vars, size_t combI, size_t& normalI,
+	DWORD& normalSrc)
+{
+	const core::ShaderConstant* amb = vars.Find("g_AmbientCube", core::RS_FLOAT4);
+	if (!amb)
+		return false;
+	const int lo = amb->reg, hi = amb->reg + amb->count;
+	auto isCube = [&](DWORD t) { return RegType(t) == REG_CONST && !Relative(t) && RegNum(t) >= lo && RegNum(t) < hi; };
+	// Straight-line neighbourhood of an instruction: no flow control or branch boundary in between.
+	auto plain = [&](const Inst& in) {
+		return !(IsFlowControl(in.op) || in.op == OP_IF || in.op == OP_IFC || in.op == OP_ELSE || in.op == OP_ENDIF || in.predicated);
+	};
+	int found = 0, depth = 0;
+	for (size_t j = 0; j < combI; j++)
+	{
+		const Inst& in = insts[j];
+		if (in.op == OP_IF || in.op == OP_IFC || in.op == OP_REP || in.op == OP_LOOP)
+			depth++;
+		else if (in.op == OP_ENDIF || in.op == OP_ENDREP || in.op == OP_ENDLOOP)
+			depth--;
+		if (depth != 0 || in.op != OP_MUL || in.predicated || in.len != 3)
+			continue;
+		const DWORD* p = &code[in.pos + 1];
+		const DWORD n = p[1];
+		if (RegType(p[0]) != REG_TEMP || (DstMask(p[0]) & (X | Y | Z)) != (X | Y | Z) || p[2] != n || RegType(n) != REG_TEMP ||
+			Relative(n) || SrcMod(n) != 0 || !IdentityXyz(n) || (p[0] & 0x00F00000u))
+			continue;
+		const int sq = RegNum(p[0]), nReg = RegNum(n);
+		// Every square weighs a g_AmbientCube face, read before the squares are overwritten.
+		int weighed = 0;
+		for (size_t k = j + 1; k < insts.size() && plain(insts[k]); k++)
+		{
+			const Inst& u = insts[k];
+			const DWORD* q = &code[u.pos + 1];
+			if ((u.op == OP_MUL || u.op == OP_MAD) && u.len >= 3)
+				for (int s = 1; s <= 2; s++)
+				{
+					DWORD a = q[s], b = q[3 - s];
+					if (RegType(a) == REG_TEMP && RegNum(a) == sq && !Relative(a) && SrcMod(a) == 0 && isCube(b) &&
+						SwzComp(a, 0) == SwzComp(a, 1) && SwzComp(a, 1) == SwzComp(a, 2) && SwzComp(a, 2) == SwzComp(a, 3) && SwzComp(a, 0) < 3)
+						weighed |= 1 << SwzComp(a, 0);
+				}
+			if (WritesTemp(code, u, sq, X | Y | Z))
+				break;
+		}
+		if (weighed != 7)
+			continue;
+		// The same value of N sign-tested by a cmp: back to the instruction that wrote it, and on to
+		// the next that writes it (none after j if the square is done in place).
+		bool signs = false;
+		auto signTest = [&](const Inst& u) {
+			const DWORD* q = &code[u.pos + 1];
+			return u.op == OP_CMP && RegType(q[1]) == REG_TEMP && RegNum(q[1]) == nReg && !Relative(q[1]) && IdentityXyz(q[1]) &&
+				(SrcMod(q[1]) == 0 || SrcMod(q[1]) == 1);
+		};
+		for (size_t k = j; k-- > 0 && !signs && plain(insts[k]);)
+		{
+			if (WritesTemp(code, insts[k], nReg, X | Y | Z))
+				break;
+			signs = signTest(insts[k]);
+		}
+		if (!WritesTemp(code, in, nReg, X | Y | Z))
+			for (size_t k = j + 1; k < insts.size() && !signs && plain(insts[k]); k++)
+			{
+				signs = signTest(insts[k]);
+				if (WritesTemp(code, insts[k], nReg, X | Y | Z))
+					break;
+			}
+		if (!signs)
+			continue;
+		found++;
+		normalI = j;
+		normalSrc = n;
+	}
+	return found == 1;
+}
+
 // The instructions computing oC1.x (the z/w target): the write itself and at most one temp it reads,
 // computed from inputs and constants only. Returns false if they're more involved.
 bool FindDepthSlice(const DWORD* code, const std::vector<Inst>& insts, size_t& writeI, size_t& defI, bool& haveDef)
@@ -716,6 +808,12 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 	}
 	if (!ao && !gi)
 		return false;
+	// The shading normal, with the AO outputs that carry it: N after S.
+	size_t normalI = 0;
+	DWORD normalSrc = 0;
+	const int N = S + 1;
+	const bool normal = aoMatched && N <= 31 && FindNormal(code, insts, vars, L.combI, normalI, normalSrc);
+	r.normal = normal;
 
 	size_t writeI = 0, defI = 0;
 	bool haveDef = false;
@@ -728,7 +826,16 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 	const size_t firstReal = FirstRealInstruction(insts, endPos);
 	out.insert(out.end(), code, code + firstReal);
 	size_t cursor = firstReal;
+	bool normalDue = normal; // "mov rN.xyz, N" still to insert before the square
 	auto copyTo = [&](size_t pos) {
+		const size_t at = insts[normalI].pos;
+		if (normalDue && at >= cursor && at <= pos)
+		{
+			out.insert(out.end(), code + cursor, code + at);
+			cursor = at;
+			e.I(OP_MOV, { Dst(REG_TEMP, N, X | Y | Z), normalSrc });
+			normalDue = false;
+		}
 		out.insert(out.end(), code + cursor, code + pos);
 		cursor = pos;
 	};
@@ -742,7 +849,7 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 		e.I(OP_DEF, { Dst(REG_CONST, Kg, 0xF), FloatBits(1.0f), FloatBits(0.0f), FloatBits(0.0f), FloatBits(0.0f) });
 	}
 	if (ao)
-		e.I(OP_DEF, { Dst(REG_CONST, Ka, 0xF), FloatBits(0.0f), FloatBits(1.0f), FloatBits(0.0f), FloatBits(0.0f) });
+		e.I(OP_DEF, { Dst(REG_CONST, Ka, 0xF), FloatBits(0.0f), FloatBits(1.0f), FloatBits(2.0f), FloatBits(1.0f / 1048576.0f) });
 
 	if (ao && !aoMatched)
 	{
@@ -861,7 +968,31 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 				NegateSrc(L.fogSrc, negFog);
 				e.I(OP_MAD, { Dst(REG_TEMP, R, X | Y | Z), Src(REG_TEMP, R, kIdentity), negFog, Src(REG_TEMP, R, kIdentity) });
 			}
-			e.I(OP_MOV, { Dst(REG_TEMP, R, W), Src(REG_CONST, Ka, Rep(0)) });
+			if (!normal)
+				e.I(OP_MOV, { Dst(REG_TEMP, R, W), Src(REG_CONST, Ka, Rep(0)) });
+		}
+		if (normal)
+		{
+			// rT.w, rS.w = octahedral N + 2 (see the top); rN.w is scratch.
+			auto mod = [](DWORD src, int m) { return (src & ~0x0F000000u) | ((DWORD)m << 24); };
+			const DWORD nXyz = Src(REG_TEMP, N, kIdentity), one = Src(REG_CONST, Ka, Rep(1)), minusOne = Src(REG_CONST, Ka, Rep(1), true);
+			auto n = [&](int c) { return Src(REG_TEMP, N, Rep(c)); };
+			const DWORD tw = Dst(REG_TEMP, T, W), sw = Dst(REG_TEMP, S, W), nw = Dst(REG_TEMP, N, W);
+			const DWORD tW = Src(REG_TEMP, T, Rep(3)), sW = Src(REG_TEMP, S, Rep(3)), nW = n(3);
+			e.I(OP_DP3, { nw, mod(nXyz, 0xB), one });                             // |x| + |y| + |z|
+			e.I(OP_MAX, { nw, nW, Src(REG_CONST, Ka, Rep(3)) });                  // (a zero normal stays finite)
+			e.I(OP_RCP, { nw, nW });
+			e.I(OP_MUL, { Dst(REG_TEMP, N, X | Y | Z), nXyz, nW });               // p
+			e.I(OP_CMP, { tw, n(0), one, minusOne });                             // sign(p.x)
+			e.I(OP_ADD, { sw, mod(n(1), 0xC), one });                             // 1 - |p.y|
+			e.I(OP_MUL, { tw, tW, sW });
+			e.I(OP_CMP, { sw, n(1), one, minusOne });                             // sign(p.y)
+			e.I(OP_ADD, { nw, mod(n(0), 0xC), one });                             // 1 - |p.x|
+			e.I(OP_MUL, { sw, sW, nW });
+			e.I(OP_CMP, { tw, n(2), n(0), tW });                                  // upper half: p, lower: folded
+			e.I(OP_CMP, { sw, n(2), n(1), sW });
+			e.I(OP_ADD, { tw, tW, Src(REG_CONST, Ka, Rep(2)) });
+			e.I(OP_ADD, { sw, sW, Src(REG_CONST, Ka, Rep(2)) });
 		}
 		e.I(OP_MOV, { Dst(REG_COLOROUT, 2, 0xF), Src(REG_TEMP, T, kIdentity) });
 		e.I(OP_MOV, { Dst(REG_COLOROUT, 3, 0xF), Src(REG_TEMP, S, kIdentity) });
@@ -878,6 +1009,10 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 			g_aoLastLayout.finalAt = insts[L.finalI].pos;
 		}
 		g_aoLastLayout.matched = aoMatched;
+		g_aoLastLayout.normal = normal;
+		g_aoLastLayout.normalTemp = normal ? N : -1;
+		g_aoLastLayout.normalAt = normal ? insts[normalI].pos : 0;
+		g_aoLastLayout.normalSrc = normal ? normalSrc : 0;
 		g_aoLastLayout.temp = T;
 		g_aoLastLayout.sunTemp = S;
 		g_aoLastLayout.constReg = Ka;

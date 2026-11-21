@@ -419,6 +419,63 @@ int main()
 					GetPrivateProfileIntA("ContactShadows", "StartEnabled", -1, ini) == 1
 				? "yes"
 				: "NO");
+
+		// Only the targets something reads this frame are bound (and read by the composite): with
+		// the shading normals off (menu item 11, below contact shadow length: '0' then Down), the
+		// indirect light for AO alone, the sun light for contact shadows alone; with them on, both.
+		auto binds = [&](IDirect3DSurface9*& b2, IDirect3DSurface9*& b3, int& passes) {
+			dev->BeginScene();
+			dev->SetRenderTarget(0, sceneSurf);
+			dev->SetRenderTarget(1, zSurf);
+			b2 = b3 = nullptr;
+			dev->GetRenderTarget(2, &b2);
+			dev->GetRenderTarget(3, &b3);
+			dev->SetPixelShader(litPs);
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+			// The game's reset of 2 and 3 between batches puts back only ours.
+			dev->SetRenderTarget(1, NULL);
+			dev->SetRenderTarget(2, NULL);
+			dev->SetRenderTarget(3, NULL);
+			dev->SetRenderTarget(1, zSurf);
+			IDirect3DSurface9 *r2 = nullptr, *r3 = nullptr;
+			dev->GetRenderTarget(2, &r2);
+			dev->GetRenderTarget(3, &r3);
+			if (r2 != b2 || r3 != b3)
+				b2 = b3 = (IDirect3DSurface9*)1; // marks "not kept as bound"
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+			dev->SetRenderTarget(1, NULL);
+			int at = stats->draws;
+			dev->SetPixelShader(ps);
+			dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 1, tri, sizeof(V));
+			passes = stats->draws - at - 1;
+			dev->EndScene();
+			dev->Present(NULL, NULL, NULL, NULL);
+		};
+		IDirect3DSurface9 *b2 = nullptr, *b3 = nullptr;
+		int passes = 0;
+		MenuPress(dev, '0');
+		MenuPress(dev, VK_DOWN);
+		MenuPress(dev, VK_LEFT); // shading normals off
+		MenuPress(dev, '9');
+		MenuPress(dev, VK_LEFT); // contact shadows off
+		binds(b2, b3, passes);
+		bool aoOnly = b2 == rt2 && !b3 && passes == 5;
+		MenuPress(dev, '9');
+		MenuPress(dev, VK_RIGHT);
+		MenuPress(dev, '6');
+		MenuPress(dev, VK_LEFT); // AO off
+		binds(b2, b3, passes);
+		bool csOnly = !b2 && b3 == rt3 && passes == 5;
+		MenuPress(dev, '6');
+		MenuPress(dev, VK_RIGHT); // AO on
+		MenuPress(dev, '0');
+		MenuPress(dev, VK_DOWN);
+		MenuPress(dev, VK_RIGHT); // shading normals on
+		binds(b2, b3, passes);
+		bool both = b2 == rt2 && b3 == rt3 && passes == 5;
+		printf("ao: only the targets read this frame bound: AO alone the indirect light, contact shadows alone the sun light, "
+			   "shading normals both (5 passes each): %s\n",
+			aoOnly && csOnly && both ? "yes" : "NO");
 		dev->SetRenderTarget(0, bb);
 	}
 

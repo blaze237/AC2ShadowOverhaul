@@ -4,7 +4,8 @@
 // The frame (from F8 dumps): ... main opaque pass with RT0 = scene colour (FP16) and RT1 = z/w
 // (R32F), toggled off and on between batches; then RT1 is unbound and the sky is drawn, then
 // transparents. We bind our indirect-light target as RT2 and our sun-light target as RT3 whenever
-// the game binds a z/w target as RT1, and run our passes at the first thing after the pass.
+// the game binds a z/w target as RT1 (each only in frames where something reads it, see
+// FrameTargets), and run our passes at the first thing after the pass.
 //
 // Camera: this frame's, from the shared scene tracker (core/scene.h, maths in core/camera.h), taken
 // once AO's own pass has started: the raster camera, with TAA's jitter folded in, because GTAO and
@@ -21,6 +22,7 @@
 #include "core/scene.h"
 #include "core/fxpass.h"
 #include "core/geoprep.h"
+#include "ssgi/gi.h"
 #include <math.h>
 #include <stdio.h>
 #include <unordered_map>
@@ -30,11 +32,16 @@
 static bool g_enabled = false;     // the shared machinery (shader outputs, passes) is set up
 static bool g_aoConfigured = false; // [AmbientOcclusion] Enabled
 static bool g_csConfigured = false; // [ContactShadows] Enabled
-static volatile bool g_on = true, g_csOn = true;
+static bool g_ssgiConfigured = false; // [SSGI] Enabled: the shaders get the outputs for the normals
+static volatile bool g_on = true, g_csOn = true, g_normalsOn = true;
 static volatile float g_radius = 1.5f, g_strength = 0.5f, g_csLength = 0.5f;
 static volatile int g_view = 0;
 
 bool AO_Enabled() { return g_enabled; }
+bool AO_Outputs() { return g_enabled || g_ssgiConfigured; }
+void AO_NoteSsgi(bool configured) { g_ssgiConfigured = configured; }
+bool AO_ShadingNormals() { return g_normalsOn; }
+void AO_SetShadingNormals(bool on) { g_normalsOn = on; }
 bool AO_Active() { return g_aoConfigured && g_on; }
 bool CS_Active() { return g_csConfigured && g_csOn; }
 void CS_SetOn(bool on) { g_csOn = on; }
@@ -53,6 +60,8 @@ bool AO_Init()
 	const char* S = "AmbientOcclusion";
 	g_aoConfigured = IniInt(S, "Enabled", 1) != 0;
 	g_enabled = g_aoConfigured || g_csConfigured;
+	// Read even with AO off: contact shadows and SSGI use the normals too.
+	g_normalsOn = IniInt(S, "ShadingNormals", 1) != 0;
 	if (!g_aoConfigured)
 	{
 		LogInfo("Ambient occlusion: off ([AmbientOcclusion] Enabled=0).");
@@ -182,10 +191,10 @@ void AO_OnLostDevice() { ReleaseTargets(); }
 
 // ---- Opaque pass tracking ----------------------------------------------------------------------
 
-static bool g_inPass = false;   // our target is bound as RT2
+static bool g_inPass = false;   // the opaque pass is drawing (our targets, those in use, are bound)
 static bool g_pending = false;  // the pass ended; AO is due before the next thing that draws
 static bool g_done = false;     // AO applied this frame (or skipped for good this frame)
-static bool g_cleared = false;  // indirect target cleared this frame
+static bool g_cleared = false;  // this frame's targets chosen (FrameTargets) and cleared
 static int g_passDraws = 0;
 static IDirect3DSurface9* g_depthSurf;  // the game's z/w target during the pass
 static IDirect3DSurface9* g_colourSurf; // the game's scene colour target during the pass
@@ -215,6 +224,29 @@ static bool IsOpaquePass(IDirect3DSurface9* s, IDirect3DSurface9* rt0, UINT& w, 
 
 static void Composite(IDirect3DDevice9* dev);
 
+// Which of our targets this frame's opaque pass writes, chosen once per frame at its first batch (a
+// menu change mid-frame takes effect the next frame, so a target is never half written): the
+// indirect light for AO and its "indirect light" view, the sun light for contact shadows and the
+// "sun light" view, both for the shading normals (one octahedral component in each alpha), which
+// GTAO, contact shadows (their debug views too) and SSGI read. The AO and contact shadow views
+// themselves need neither colour.
+static bool g_useIndirect = false, g_useSun = false, g_useNormals = false;
+
+static bool FrameTargets()
+{
+	g_useNormals = g_normalsOn && (AO_Active() || CS_Active() || g_view || ssgi::GI_Active());
+	g_useIndirect = AO_Active() || g_view == 2 || g_useNormals;
+	g_useSun = CS_Active() || g_view == 4 || g_useNormals;
+	return AO_Active() || CS_Active() || g_view || g_useNormals;
+}
+
+static IDirect3DSurface9* OurTarget(DWORD index)
+{
+	if (index == 2)
+		return g_useIndirect ? g_indirect.surf : nullptr;
+	return index == 3 && g_useSun ? g_sun.surf : nullptr;
+}
+
 // Between its opaque batches the game unbinds render target 1 and also resets targets 2 and 3, so
 // only a change of render target 0 (or a draw, clear, ...) ends the pass.
 bool AO_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s)
@@ -227,14 +259,17 @@ bool AO_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 
 void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 {
-	if (!g_enabled || g_failed || index == 0)
+	if (!AO_Outputs() || g_failed || index == 0)
 		return;
 	if (index >= 2)
 	{
 		if (!g_inPass || index > 3)
 			return;
 		if (!s)
-			D.SetRenderTarget(dev, index, index == 2 ? g_indirect.surf : g_sun.surf); // the game reset the slot: keep ours bound
+		{
+			if (OurTarget(index))
+				D.SetRenderTarget(dev, index, OurTarget(index)); // the game reset the slot: keep ours bound
+		}
 		else
 		{
 			static bool warned = false;
@@ -251,17 +286,22 @@ void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 	if (s)
 	{
 		UINT w, h;
-		if (g_done || !(AO_Active() || CS_Active() || g_view) || !IsOpaquePass(s, rt0, w, h) || !EnsureResources(dev, w, h))
+		if (g_done || (!g_cleared && !FrameTargets()) || !IsOpaquePass(s, rt0, w, h) || !EnsureResources(dev, w, h))
 			return;
 		if (!g_cleared)
 		{
-			D.ColorFill(dev, g_indirect.surf, NULL, 0);
-			D.ColorFill(dev, g_sun.surf, NULL, 0);
+			// 0 everywhere: no light to remove, and no normal (the geometry prep falls back to the
+			// depth's) where nothing writes them.
+			if (g_useIndirect)
+				D.ColorFill(dev, g_indirect.surf, NULL, 0);
+			if (g_useSun)
+				D.ColorFill(dev, g_sun.surf, NULL, 0);
 			g_cleared = true;
 			g_passDraws = 0;
 		}
-		D.SetRenderTarget(dev, 2, g_indirect.surf);
-		D.SetRenderTarget(dev, 3, g_sun.surf);
+		for (DWORD i = 2; i <= 3; i++)
+			if (OurTarget(i))
+				D.SetRenderTarget(dev, i, OurTarget(i));
 		g_inPass = true;
 		g_pending = false;
 		g_depthSurf = s;
@@ -269,8 +309,9 @@ void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 	}
 	else if (g_inPass)
 	{
-		D.SetRenderTarget(dev, 2, nullptr);
-		D.SetRenderTarget(dev, 3, nullptr);
+		for (DWORD i = 2; i <= 3; i++)
+			if (OurTarget(i))
+				D.SetRenderTarget(dev, i, nullptr);
 		g_inPass = false;
 		if (g_passDraws > 0)
 			g_pending = true;
@@ -309,8 +350,9 @@ bool AO_BeforePresent(IDirect3DDevice9* dev)
 	if (g_inPass)
 	{
 		// The pass never unbound its z/w target: leave the frame alone.
-		D.SetRenderTarget(dev, 2, nullptr);
-		D.SetRenderTarget(dev, 3, nullptr);
+		for (DWORD i = 2; i <= 3; i++)
+			if (OurTarget(i))
+				D.SetRenderTarget(dev, i, nullptr);
 		g_inPass = false;
 	}
 	g_done = g_cleared = g_pending = false;
@@ -343,6 +385,12 @@ static void Composite(IDirect3DDevice9* dev)
 {
 	g_pending = false;
 	g_done = true;
+	// The pass wrote the shading normals: the geometry prep (made next, by GTAO below or by SSGI)
+	// reads them.
+	if (g_useNormals)
+		core::Geo_SetShadingNormals(g_indirect.tex, g_sun.tex);
+	if (!(AO_Active() || CS_Active() || g_view))
+		return; // the pass ran for SSGI's normals only
 	if (!g_camOk)
 	{
 		static bool warned = false;
@@ -396,6 +444,9 @@ static void Composite(IDirect3DDevice9* dev)
 		{ 0.05f, 0.01f, 1.0f, 0.002f }, // contact shadows: thickness base (m), thickness per metre, strength, depth bias per metre
 	};
 	dev->SetPixelShaderConstantF(0, &c[0][0], 8);
+	// The composite reads only the targets written this frame (the others hold an older frame's).
+	const float targets[4] = { g_useIndirect ? 1.0f : 0.0f, g_useSun ? 1.0f : 0.0f, 0, 0 };
+	dev->SetPixelShaderConstantF(8, targets, 1);
 	memcpy(g_lastConsts, c, sizeof(c));
 	g_haveLastConsts = true;
 
@@ -418,8 +469,8 @@ static void Composite(IDirect3DDevice9* dev)
 	// Composite: scene colour -= (1 - AO) x indirect + (1 - contact) x sun (colour channels only).
 	core::SetTarget(dev, g_colourSurf, g_w, g_h);
 	D.SetTexture(dev, 1, g_ao[0].tex);
-	D.SetTexture(dev, 2, g_indirect.tex);
-	D.SetTexture(dev, 3, g_sun.tex);
+	D.SetTexture(dev, 2, g_useIndirect ? g_indirect.tex : nullptr);
+	D.SetTexture(dev, 3, g_useSun ? g_sun.tex : nullptr);
 	if (g_view == 0)
 	{
 		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);

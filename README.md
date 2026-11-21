@@ -36,6 +36,11 @@ lighting effects the 2009 renderer never had.
 - **Contact shadows.** Short shadows traced through the scene depth towards the sun, for the small
   detail the shadow map is too coarse for: where feet, crates and ledges meet the ground, folds in
   clothing, window frames. Only sunlight is darkened.
+- **Surface normals.** Ambient occlusion, contact shadows and SSGI read each surface's own normal
+  as the game lights it, normal map detail included, which the game's shaders now pass along with
+  their lighting; where a shader doesn't, or the normal doesn't fit the surface the depth shows, the
+  normal worked out from the depth is used, as before. `ShadingNormals` in the F9 menu switches it
+  for comparison.
 - **Bounce light (SSGI).** Light bounces off lit surfaces onto nearby ones: a sunlit wall brightens
   the street in front of it, red cloth tints the floor next to it, and courtyards fill with reflected
   sunlight. The bounce is added to the game's own ambient term before fog, so it is fogged like the

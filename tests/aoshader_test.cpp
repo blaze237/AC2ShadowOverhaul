@@ -10,7 +10,12 @@
 //     and shaders that weren't matched must write oC2 = 0;
 //  4. oC3 must equal what the shadowed sun light contributes: the colour minus the colour with the
 //     shadow operand of the combine zeroed, and minus the colour with the cloud shadow map black
-//     (the clouds only dim the sun); unmatched shaders write oC3 = 0.
+//     (the clouds only dim the sun); unmatched shaders write oC3 = 0;
+//  5. oC2.w / oC3.w must decode (octahedral, - 2, as core/shaders/geoprep.hlsl does) to the normal
+//     the shader squares for g_AmbientCube, read by the interpreter at that instruction, and be 0
+//     where no normal was found; every shader with the ambient cube and the light found must have
+//     its normal found. The rewrite with the SSGI bounce light too (as the plugin makes it with both
+//     on) must write the same normal.
 #include "../src/common.cpp"
 #include "../src/core/shaderinfo.cpp"
 #include "../src/softshadows.cpp"
@@ -57,6 +62,8 @@ struct Inputs
 	bool noLightmapColour = false, noCloud = false;
 	size_t zeroAt = 0;   // before the instruction at this token index, zero the components that
 	DWORD zeroSrc = 0;   // this source token reads for x, y, z (a temp register)
+	size_t observeAt = 0; // before the instruction at this token index, record what this source reads
+	DWORD observeSrc = 0;
 };
 
 struct Outputs
@@ -64,6 +71,7 @@ struct Outputs
 	float oC[4][4];
 	bool written[4];
 	bool killed;
+	float observed[4];
 };
 
 static float TexValue(uint32_t seed, int sampler, float u, float v, int comp)
@@ -187,6 +195,8 @@ static bool Run(const std::vector<DWORD>& code, Inputs in, Outputs& o, std::stri
 			err = "flow control";
 			return false;
 		}
+		if (in.observeAt && i - 1 - len == in.observeAt)
+			read(in.observeSrc, o.observed);
 		if (in.zeroAt && i - 1 - len == in.zeroAt && RegType(in.zeroSrc) == REG_TEMP)
 			for (int k = 0; k < 3; k++)
 				r[RegNum(in.zeroSrc)][SwzComp(in.zeroSrc, k)] = 0;
@@ -296,8 +306,27 @@ static float Rand() { return (g_rng = g_rng * 1664525u + 1013904223u) / 42949672
 
 static bool Bad(float f) { return f != f || fabsf(f) > 1e30f; }
 
+// The octahedral decoding of core/shaders/geoprep.hlsl (OctDecode, after the - 2).
+static void OctDecode(float ex, float ey, float n[3])
+{
+	n[0] = ex;
+	n[1] = ey;
+	n[2] = 1.0f - fabsf(ex) - fabsf(ey);
+	if (n[2] < 0)
+	{
+		float x = (1.0f - fabsf(n[1])) * (n[0] >= 0 ? 1.0f : -1.0f), y = (1.0f - fabsf(n[0])) * (n[1] >= 0 ? 1.0f : -1.0f);
+		n[0] = x;
+		n[1] = y;
+	}
+	float l = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+	for (int k = 0; k < 3; k++)
+		n[k] /= l;
+}
+
+static int g_normalShaders = 0, g_normalMissing = 0;
+
 // Checks one input program (the game's shader, possibly soft-shadow rewritten).
-static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& failed)
+static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& failed, bool count = false)
 {
 	std::vector<DWORD> out;
 	bool matched = false;
@@ -323,7 +352,24 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 	const core::ShaderConstant* lm = vars.Find("g_WorldLightMapSampler", core::RS_SAMPLER);
 	const core::ShaderConstant* cloud = vars.Find("g_CloudShadowSampler", core::RS_SAMPLER);
 
-	int trials = 0, mism = 0, indBad = 0, cutBad = 0, zeroBad = 0, sunBad = 0, cloudBad = 0;
+	// With the SSGI part as well (its own temps come first, so the normal's register moves).
+	std::vector<DWORD> merged;
+	{
+		LitParts both;
+		both.ao = both.gi = true;
+		LitRewriteResult mr;
+		if (L.normal && (!Lit_RewritePS(code.data(), both, merged, mr) || !mr.normal))
+			merged.clear();
+	}
+	int trials = 0, mism = 0, indBad = 0, cutBad = 0, zeroBad = 0, sunBad = 0, cloudBad = 0, normalBad = 0, normalTrials = 0, mergedBad = 0;
+	float normalWorst = 0;
+	// The normal must be found in every shader with the light found and the ambient cube here.
+	const bool normalMissing = matched && amb && !L.normal;
+	if (count)
+	{
+		g_normalShaders += L.normal;
+		g_normalMissing += normalMissing;
+	}
 	float worst = 0;
 	std::string err;
 	for (int n = 0; n < 400 && trials < 150; n++)
@@ -348,6 +394,8 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 		in.texSeed = (uint32_t)(Rand() * 4e9);
 		in.lmSampler = lm ? lm->reg : -1;
 		in.cloudSampler = cloud ? cloud->reg : -1;
+		in.observeAt = L.normal ? L.normalAt : 0;
+		in.observeSrc = L.normalSrc;
 		Outputs a, b, z;
 		if (!Run(code, in, a, err))
 			return "interpreter: " + err;
@@ -437,6 +485,35 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 				}
 			}
 		}
+		if (L.normal)
+		{
+			// Decoded from the outputs against the normal the original shader squared.
+			const float* nv = a.observed;
+			float l = sqrtf(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+			float ex = b.oC[2][3] - 2.0f, ey = b.oC[3][3] - 2.0f;
+			if (!(fabsf(ex) <= 1.0001f && fabsf(ey) <= 1.0001f))
+				normalBad++;
+			else if (l > 1e-3f)
+			{
+				float d[3];
+				OctDecode(fminf(fmaxf(ex, -1), 1), fminf(fmaxf(ey, -1), 1), d);
+				float err2 = 0;
+				for (int k = 0; k < 3; k++)
+					err2 = fmaxf(err2, fabsf(d[k] - nv[k] / l));
+				normalWorst = fmaxf(normalWorst, err2);
+				normalBad += !(err2 < 1e-4f);
+				normalTrials++;
+			}
+		}
+		else if (b.oC[2][3] != 0 || b.oC[3][3] != 0)
+			normalBad++;
+		if (!merged.empty())
+		{
+			Outputs m;
+			if (!Run(merged, in, m, err))
+				return "interpreter (with SSGI): " + err;
+			mergedBad += m.oC[2][3] != b.oC[2][3] || m.oC[3][3] != b.oC[3][3];
+		}
 		if (!matched && (b.oC[2][0] != 0 || b.oC[2][1] != 0 || b.oC[2][2] != 0 || b.oC[2][3] != 0 || b.oC[3][0] != 0 ||
 							b.oC[3][1] != 0 || b.oC[3][2] != 0 || b.oC[3][3] != 0))
 			zeroBad++;
@@ -450,17 +527,23 @@ static std::string Check(const std::vector<DWORD>& code, int& matchedOut, bool& 
 	std::string note = branches && cloudBad ? " (sun term includes the branch's omni light)" : "";
 	if (branches)
 		cloudBad = 0;
-	if (mism || indBad || cutBad || zeroBad || sunBad || cloudBad || !trials)
+	if (mism || indBad || cutBad || zeroBad || sunBad || cloudBad || normalBad || normalMissing || (L.normal && !normalTrials) || mergedBad ||
+		(L.normal && merged.empty()) || !trials)
 	{
 		failed = true;
 		snprintf(buf, sizeof(buf),
-			"FAILED (%d trials: %d changed oC0/oC1, %d term / %d ambient / %d sun / %d cloud mismatches (worst %g), %d non-zero)", trials,
-			mism, cutBad, indBad, sunBad, cloudBad, worst, zeroBad);
+			"FAILED (%d trials: %d changed oC0/oC1, %d term / %d ambient / %d sun / %d cloud mismatches (worst %g), %d non-zero, "
+			"%d normal mismatches (worst %g), %d with SSGI%s%s)",
+			trials, mism, cutBad, indBad, sunBad, cloudBad, worst, zeroBad, normalBad, normalWorst, mergedBad, normalMissing ? ", NORMAL NOT FOUND" : "",
+			L.normal && merged.empty() ? ", NO NORMAL WITH SSGI" : "");
 		return buf;
 	}
+	char nbuf[64] = "";
+	if (L.normal)
+		snprintf(nbuf, sizeof(nbuf), ", normal r%d (worst %.1e; same with SSGI)", L.normalTemp, normalWorst);
 	if (matched)
-		snprintf(buf, sizeof(buf), "indirect + sun found, temps r%d/r%d, %d trials ok%s%s", L.temp, L.sunTemp, trials,
-			amb ? "" : " (ambient cube from the vertex shader: term check only)", note.c_str());
+		snprintf(buf, sizeof(buf), "indirect + sun found, temps r%d/r%d%s, %d trials ok%s%s", L.temp, L.sunTemp, nbuf, trials,
+			amb ? "" : " (ambient cube from the vertex shader: term check only, no normal)", note.c_str());
 	else
 		snprintf(buf, sizeof(buf), "oC2 = oC3 = 0 (%s), %d trials ok", reason.c_str(), trials);
 	return buf;
@@ -500,7 +583,7 @@ int main(int argc, char** argv)
 		shaders++;
 		int m1, m2;
 		bool f1, f2;
-		std::string plain = Check(code, m1, f1);
+		std::string plain = Check(code, m1, f1, true);
 		std::string softText = "no soft shadow variant";
 		std::vector<DWORD> soft;
 		std::string why;
@@ -520,7 +603,8 @@ int main(int argc, char** argv)
 		printf("%.8s %s | soft w3: %s%s\n", fd.cFileName, plain.c_str(), softText.c_str(), m1 != m2 ? "  MATCH DIFFERS" : "");
 	} while (FindNextFileA(h, &fd));
 	FindClose(h);
-	printf("\n%d shaders: %d with the indirect and sun light found, %d writing oC2 = oC3 = 0, %d with failures\n", shaders, matchedCount, zeroCount,
-		failures);
+	printf("\n%d shaders: %d with the indirect and sun light found (%d of them with the shading normal, %d missing it), %d writing "
+		   "oC2 = oC3 = 0, %d with failures\n",
+		shaders, matchedCount, g_normalShaders, g_normalMissing, zeroCount, failures);
 	return failures ? 3 : 0;
 }

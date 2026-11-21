@@ -8,7 +8,17 @@
 // what occludes it, and AO would darken it twice.
 //
 // Device side: while the game has its z/w target bound as render target 1, our float16 "indirect"
-// target is bound as render target 2. When the opaque pass ends (render target 1 unbound, before
+// target is bound as render target 2 and the "sun" target as 3, each only in frames where something
+// reads it: the indirect light for AO (or its debug view), the sun light for contact shadows (or
+// its view), both for the shading normals (below). A slot left unbound discards the shader's write
+// to it (D3D9: "if oCn is written but there is no corresponding render target, the write is
+// ignored"), and the composite then doesn't read that target either.
+//
+// Shading normals: the rewrite also packs the lit shader's own per-pixel normal (world space, the
+// one it evaluates g_AmbientCube with: normal maps included) into the free alpha channels, oC2.w
+// and oC3.w (octahedral, + 2, so 0 = none). While [AmbientOcclusion] ShadingNormals is on and AO,
+// contact shadows or SSGI run, both targets are bound and handed to the shared geometry prep
+// (core/geoprep.h), which uses that normal instead of the one from the depth where there is one. When the opaque pass ends (render target 1 unbound, before
 // the next draw: the sky), GTAO is computed at half resolution from the z/w target (normals from the geometry
 // prep shared with SSGI, core/geoprep.h), blurred, and
 // (1 - AO) x indirect is subtracted from the scene colour. Fog, sun light, sky and everything
@@ -22,7 +32,11 @@
 
 // [AmbientOcclusion] from the ini. Returns Enabled.
 bool AO_Init();
-bool AO_Enabled();     // configured on: shaders get the extra output (needs a restart to change)
+bool AO_Enabled();     // AO or contact shadows configured on (needs a restart to change)
+// SSGI is configured on (called once at startup, after its ini is read): the opaque shaders then get
+// the outputs too, for the shading normals alone if AO and contact shadows are off.
+void AO_NoteSsgi(bool configured);
+bool AO_Outputs();     // the opaque shaders get oC2 / oC3 (AO, contact shadows or SSGI configured on)
 bool AO_Active();      // currently applied (menu switch)
 void AO_SetOn(bool on);
 float AO_Radius();     // metres
@@ -33,6 +47,10 @@ void AO_SetStrength(float s);
 // 4 = show the sun light buffer
 int AO_View();
 void AO_SetView(int view);
+// [AmbientOcclusion] ShadingNormals: GTAO, contact shadows and SSGI use the lit shaders' normals
+// (live switch; off = the normals from the depth, exactly as before).
+bool AO_ShadingNormals();
+void AO_SetShadingNormals(bool on);
 
 // Contact shadows: short screen-space rays towards the sun through the scene depth, darkening the
 // sun light (not the ambient) where the shadow map is too coarse to show them. [ContactShadows].
@@ -59,6 +77,10 @@ struct AoRewriteLayout
 	DWORD addend = 0;     // its source token carrying the ambient light (zeroing it removes the indirect term)
 	DWORD sunSrc = 0;     // its source token carrying the shadow (zeroing it removes the sun term)
 	size_t finalAt = 0;   // token index (original code) of the instruction writing oC0.xyz
+	bool normal = false;  // the shading normal was found and is packed into oC2.w / oC3.w
+	int normalTemp = -1;  // temp register it is copied to
+	size_t normalAt = 0;  // token index (original code) of the instruction squaring it for g_AmbientCube
+	DWORD normalSrc = 0;  // its source token there (the normal)
 };
 extern AoRewriteLayout g_aoLastLayout;
 

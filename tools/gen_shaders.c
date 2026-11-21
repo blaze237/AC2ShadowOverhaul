@@ -48,6 +48,7 @@ typedef struct
 
 static const Shader kCore[] = {
 	{ "PS_GeoPrep", "ps_3_0", "kGeoPrepPs" }, /* runs inside AO's / SSGI's passes, with their vertex shader */
+	{ "PS_GeoPrepNormals", "ps_3_0", "kGeoPrepNormalsPs" }, /* the same with the shading normals (core/geoprep.h) */
 };
 static const Shader kAo[] = {
 	{ "VS_Fullscreen", "vs_3_0", "kAoFullscreenVs" },
