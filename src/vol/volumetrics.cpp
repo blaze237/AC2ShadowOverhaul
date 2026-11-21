@@ -13,11 +13,18 @@
 // x, y across the sun in metres, centred near the camera; z along the direction towards the sun),
 // pick a cascade by max(|x|, |y|) against g_ShadowCascadesRangesMin/Max, map to the atlas with
 // g_ShadowScales/Offsets and compare z * g_ShadowNearFar.x + .y with the stored depth (lit when
-// stored >= depth). The fog does the same, one tap per ray march step.
+// stored >= depth). The fog does the same, one tap per ray march step. The same tap also says how
+// high the cover over a shaded point is, which takes the sky light away under roofs, vaults and in
+// tombs (SunAndSky in the shader).
+//
+// Noise: a tiling 3D noise volume (noise.h), made once and kept in D3DPOOL_MANAGED (it survives
+// Reset), drifts with the wind over a QueryPerformanceCounter clock; the shader modulates the
+// density with it.
 
 #include "volumetrics.h"
 #include "common.h"
 #include "shaders_gen.h"
+#include "noise.h"
 #include "core/scene.h"
 #include "core/fxpass.h"
 #include "core/shaderinfo.h"
@@ -44,6 +51,13 @@ void Vol_ClampSettings()
 	g_set.sunIntensity = Clampf(g_set.sunIntensity, 0.0f, 20.0f);
 	g_set.anisotropy = Clampf(g_set.anisotropy, 0.0f, 0.9f);
 	g_set.ambientIntensity = Clampf(g_set.ambientIntensity, 0.0f, 10.0f);
+	g_set.skyOcclusion = Clampf(g_set.skyOcclusion, 0.0f, 1.0f);
+	g_set.noiseAmount = Clampf(g_set.noiseAmount, 0.0f, 1.0f);
+	g_set.noiseSize = Clampf(g_set.noiseSize, 2.0f, 200.0f);
+	g_set.windSpeed = Clampf(g_set.windSpeed, 0.0f, 20.0f);
+	g_set.windDirection = fmodf(g_set.windDirection, 360.0f);
+	if (g_set.windDirection < 0.0f)
+		g_set.windDirection += 360.0f;
 	g_set.maxDistance = Clampf(g_set.maxDistance, 25.0f, 3000.0f);
 	g_set.steps = Clampi(g_set.steps, 8, 128);
 	g_set.resolution = Clampi(g_set.resolution, 1, 4);
@@ -65,6 +79,11 @@ void Vol_LoadSettings()
 	g_set.sunIntensity = IniFloat(F, "SunIntensity", g_set.sunIntensity);
 	g_set.anisotropy = IniFloat(F, "Anisotropy", g_set.anisotropy);
 	g_set.ambientIntensity = IniFloat(F, "AmbientIntensity", g_set.ambientIntensity);
+	g_set.skyOcclusion = IniFloat(F, "SkyOcclusion", g_set.skyOcclusion);
+	g_set.noiseAmount = IniFloat(F, "NoiseAmount", g_set.noiseAmount);
+	g_set.noiseSize = IniFloat(F, "NoiseSize", g_set.noiseSize);
+	g_set.windSpeed = IniFloat(F, "WindSpeed", g_set.windSpeed);
+	g_set.windDirection = IniFloat(F, "WindDirection", g_set.windDirection);
 	g_set.maxDistance = IniFloat(F, "MaxDistance", g_set.maxDistance);
 	g_set.steps = IniInt(F, "Steps", g_set.steps);
 	g_set.resolution = IniInt(F, "Resolution", g_set.resolution);
@@ -94,11 +113,13 @@ bool Vol_Init()
 		LogInfo("Volumetric fog and sun shafts are both disabled in the ini; doing nothing.");
 		return false;
 	}
-	LogInfo("Volumetric fog: %s (density %.4f/m, height falloff %.3f/m above %.1f m, sun %.2f, g %.2f, ambient %.2f, %.0f m, "
-			"%d steps at 1/%d resolution, %s).",
+	LogInfo("Volumetric fog: %s (density %.4f/m, height falloff %.3f/m above %.1f m, sun %.2f, g %.2f, ambient %.2f, sky occlusion %.2f, "
+			"%.0f m, %d steps at 1/%d resolution, %s; noise %.2f, %.0f m, wind %.1f m/s towards %.0f deg).",
 		!g_set.fogConfigured ? "disabled" : g_set.fogOn ? "on" : "starting off", (double)g_set.density, (double)g_set.heightFalloff,
 		(double)g_set.baseHeight, (double)g_set.sunIntensity, (double)g_set.anisotropy, (double)g_set.ambientIntensity,
-		(double)g_set.maxDistance, g_set.steps, g_set.resolution, g_set.placement ? "after transparents" : "before transparents");
+		(double)g_set.skyOcclusion, (double)g_set.maxDistance, g_set.steps, g_set.resolution,
+		g_set.placement ? "after transparents" : "before transparents", (double)g_set.noiseAmount, (double)g_set.noiseSize,
+		(double)g_set.windSpeed, (double)g_set.windDirection);
 	LogInfo("Sun shafts: %s (intensity %.2f, length %.2f, threshold %.2f, sun falloff %.1f, decay %.3f).",
 		!g_set.shaftsConfigured ? "disabled" : g_set.shaftsOn ? "on" : "starting off", (double)g_set.shaftsIntensity,
 		(double)g_set.shaftsLength, (double)g_set.shaftsThreshold, (double)g_set.shaftsFalloff, (double)g_set.shaftsDecay);
@@ -336,6 +357,13 @@ static IDirect3DPixelShader9 *g_psMarch, *g_psBlur, *g_psMask, *g_psRadial, *g_p
 static IDirect3DVertexDeclaration9* g_decl;
 static bool g_failed = false;
 static const UINT kShaftsDiv = 4;
+// The noise volume (noise.h): kNoiseSize^3 L8 with mips, the cube kNoiseTile x NoiseSize metres
+// across. Made the first time the noise is wanted; if it can't be (no volume texture support, or a
+// D3D9Ex device, which has no D3DPOOL_MANAGED), the fog runs without noise.
+static IDirect3DVolumeTexture9* g_noise;
+static bool g_noiseFailed = false;
+static const UINT kNoiseSize = 64;
+static const float kNoiseTile = 8.0f; // the largest blobs are 1/8 of the cube (noise.h)
 
 template <typename T> static void Rel(T*& p)
 {
@@ -426,6 +454,64 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 	g_sh = sh;
 	LogInfo("Render targets created for %ux%u (fog at %ux%u, shafts at %ux%u).", w, h, lw, lh, sw, sh);
 	return true;
+}
+
+// The noise volume, made once (D3DPOOL_MANAGED: kept across Reset, like the shaders).
+static bool EnsureNoise(IDirect3DDevice9* dev)
+{
+	if (g_noise || g_noiseFailed)
+		return g_noise != nullptr;
+	g_noiseFailed = true; // until it's done
+	D3DCAPS9 caps = {};
+	dev->GetDeviceCaps(&caps);
+	if (!(caps.TextureCaps & D3DPTEXTURECAPS_VOLUMEMAP) || !(caps.TextureCaps & D3DPTEXTURECAPS_MIPVOLUMEMAP) ||
+		caps.MaxVolumeExtent < kNoiseSize)
+	{
+		LogWarn("The GPU has no (mipmapped) volume textures: the fog runs without its noise.");
+		return false;
+	}
+	std::vector<std::vector<uint8_t>> levels;
+	MakeNoiseVolume((int)kNoiseSize, levels);
+	IDirect3DVolumeTexture9* tex = nullptr;
+	HRESULT hr = dev->CreateVolumeTexture(kNoiseSize, kNoiseSize, kNoiseSize, (UINT)levels.size(), 0, D3DFMT_L8, D3DPOOL_MANAGED, &tex, nullptr);
+	if (FAILED(hr) || !tex)
+	{
+		LogWarn("Could not create the fog's noise volume (0x%08lX): the fog runs without its noise.", hr);
+		return false;
+	}
+	for (UINT l = 0; l < (UINT)levels.size(); l++)
+	{
+		const UINT s = kNoiseSize >> l;
+		D3DLOCKED_BOX box = {};
+		if (FAILED(hr = tex->LockBox(l, &box, nullptr, 0)) || !box.pBits)
+		{
+			tex->Release();
+			LogWarn("Could not fill the fog's noise volume (0x%08lX): the fog runs without its noise.", hr);
+			return false;
+		}
+		for (UINT z = 0; z < s; z++)
+			for (UINT y = 0; y < s; y++)
+				memcpy((uint8_t*)box.pBits + z * box.SlicePitch + y * box.RowPitch, &levels[l][((size_t)z * s + y) * s], s);
+		tex->UnlockBox(l);
+	}
+	g_noise = tex;
+	g_noiseFailed = false;
+	LogInfo("Fog noise volume created (%u^3, %u mip levels).", kNoiseSize, (UINT)levels.size());
+	return true;
+}
+
+// Seconds since the first call, for the wind (QueryPerformanceCounter: steady whatever the frame rate).
+static double NoiseClock()
+{
+	static LARGE_INTEGER freq, start;
+	LARGE_INTEGER now;
+	QueryPerformanceCounter(&now);
+	if (!freq.QuadPart)
+	{
+		QueryPerformanceFrequency(&freq);
+		start = now;
+	}
+	return (double)(now.QuadPart - start.QuadPart) / (double)freq.QuadPart;
 }
 
 void Vol_OnLostDevice()
@@ -677,7 +763,8 @@ static void Apply(IDirect3DDevice9* dev)
 	const Shadow& S = F.sh;
 	const bool clouds = F.cloudTex && (F.cloudUV[0] != 0 || F.cloudUV[1] != 0);
 	const float sunI = g_set.sunIntensity, ambI = g_set.ambientIntensity;
-	float c[30][4] = {};
+	const bool noise = fog && g_set.noiseAmount > 0.0f && EnsureNoise(dev);
+	float c[32][4] = {};
 	auto set4 = [&](int r, float x, float y, float z, float w) {
 		c[r][0] = x;
 		c[r][1] = y;
@@ -706,6 +793,36 @@ static void Apply(IDirect3DDevice9* dev)
 		copy4(17, S.offsetY);
 		copy4(18, S.bias);
 		set4(19, S.fade[0], S.fade[1], clouds ? 1.0f : 0.0f, 0);
+		// Sky occlusion (SunAndSky): cover height (m) = (depth - stored) / |atlas units per metre| x sun height.
+		// The sun is the only direction the atlas tests, so with a low sun most of the town is shaded
+		// from low cover and would read as indoors: below ~6 degrees the occlusion is off (the fog has
+		// its full sky light as before), growing to full strength at ~20 degrees.
+		const float sunZ = F.sunDir[2], unitsPerMetre = fabsf(S.nearFar[0]);
+		if (sunZ > 0.0f && unitsPerMetre > 0.0f)
+		{
+			c[31][2] = g_set.skyOcclusion * Clampf((sunZ - 0.1f) / 0.25f, 0.0f, 1.0f);
+			c[31][3] = sunZ / unitsPerMetre;
+		}
+	}
+	if (noise)
+	{
+		// uvw = (P - wind x time) / cube size, as the noise at the camera plus the ray's offset from it:
+		// the large world coordinates and the ever-growing time are wrapped here in double precision,
+		// so the shader only adds small numbers.
+		const double tile = kNoiseTile * g_set.noiseSize, time = NoiseClock(), dirRad = g_set.windDirection * (3.14159265358979 / 180.0);
+		// The noise also rises slowly (a quarter of the wind speed), so it changes shape as it drifts
+		// instead of sliding past like a picture.
+		const double wind[3] = { cos(dirRad) * g_set.windSpeed, sin(dirRad) * g_set.windSpeed, 0.25 * g_set.windSpeed };
+		for (int k = 0; k < 3; k++)
+		{
+			const double u = (C.eye[k] - wind[k] * time) / tile;
+			c[30][k] = (float)(u - floor(u));
+		}
+		c[30][3] = g_set.noiseAmount;
+		c[31][0] = (float)(1.0 / tile);
+		// Mip level = log2(step length in texels) + this; the extra half level keeps clear of detail
+		// the step spacing only just resolves.
+		c[31][1] = (float)(log2(kNoiseSize / tile) + 0.5);
 	}
 	if (clouds)
 		copy4(20, F.cloudUV);
@@ -721,7 +838,7 @@ static void Apply(IDirect3DDevice9* dev)
 	if (shafts)
 		set4(28, F.sunCol[0] * shaftI, F.sunCol[1] * shaftI, F.sunCol[2] * shaftI, 1);
 	set4(29, (float)g_sw, (float)g_sh, 1.0f / g_sw, 1.0f / g_sh);
-	dev->SetPixelShaderConstantF(0, &c[0][0], 30);
+	dev->SetPixelShaderConstantF(0, &c[0][0], 32);
 
 	dev->SetTexture(0, depthTex);
 	if (fog)
@@ -729,11 +846,19 @@ static void Apply(IDirect3DDevice9* dev)
 		// Ray march -> fog[0]; blur across -> fog[1]; blur down -> fog[0].
 		dev->SetTexture(1, shadowed ? F.atlas : nullptr);
 		dev->SetTexture(2, clouds ? F.cloudTex : nullptr);
+		if (noise)
+		{
+			Sampler(dev, 6, D3DTEXF_LINEAR, D3DTADDRESS_WRAP);
+			dev->SetSamplerState(6, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+			dev->SetSamplerState(6, D3DSAMP_ADDRESSW, D3DTADDRESS_WRAP);
+			dev->SetTexture(6, g_noise);
+		}
 		core::SetTarget(dev, g_fog[0].surf, g_lw, g_lh);
 		D.SetPixelShader(dev, g_psMarch);
 		core::DrawFullscreen(dev);
 		dev->SetTexture(1, nullptr);
 		dev->SetTexture(2, nullptr);
+		dev->SetTexture(6, nullptr);
 		D.SetPixelShader(dev, g_psBlur);
 		const float across[4] = { 1, 0, 0, 0 }, down[4] = { 0, 1, 0, 0 };
 		dev->SetPixelShaderConstantF(25, across, 1);
@@ -796,7 +921,9 @@ static void Apply(IDirect3DDevice9* dev)
 			F.sunDir[0], F.sunDir[1], F.sunDir[2], F.sunCol[0], F.sunCol[1], F.sunCol[2], F.fog ? "" : "NOT FOUND", F.fog ? F.fogColor[0] : 0,
 			F.fog ? F.fogColor[1] : 0, F.fog ? F.fogColor[2] : 0, shadowed ? "used" : F.shadow ? "found but no light matrix" : "NOT FOUND",
 			clouds ? "used" : "off", g_passDraws);
-		LogInfo("  applied %s.", g_skySeen && g_set.placement == 0 ? "after the sky, before transparents" : "when the game left the scene target");
+		LogInfo("  applied %s; sky occlusion %.2f for this sun (of %.2f); noise %s.",
+			g_skySeen && g_set.placement == 0 ? "after the sky, before transparents" : "when the game left the scene target", (double)c[31][2],
+			(double)g_set.skyOcclusion, noise ? "on" : g_set.noiseAmount > 0 ? "unavailable" : "off");
 	}
 }
 

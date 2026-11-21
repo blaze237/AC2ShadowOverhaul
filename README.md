@@ -49,6 +49,9 @@ lighting effects the 2009 renderer never had.
   sunlight gets between buildings, through arches or past towers you see shafts of light in the air.
   It follows the stretched shadow cascades, and is drawn before smoke, glass and other transparent
   effects. The sky is never dimmed, so the sun and the game's bloom around it are unchanged.
+  Cover overhead (roofs, vaults, arcades, tombs, narrow alleys) holds back the sky light the fog
+  scatters, so enclosed spaces don't glow with haze, and slowly drifting 3D noise breaks the fog
+  into wisps.
 - **Sun shafts.** Light streaks from the bright sky around the sun when it is partly hidden behind
   buildings, trees or clouds.
 

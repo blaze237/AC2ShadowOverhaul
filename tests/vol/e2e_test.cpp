@@ -377,6 +377,13 @@ int main(int argc, char** argv)
 				"cascades, bias, fade and cloud shadows from the game's constants");
 			Check(first.tex[1] == atlasTex && first.tex[2] == cloudTex, "the game's shadow atlas and cloud shadow texture are sampled");
 			Check(fabsf(c[24][0] - 0.0012f) < 1e-6f && fabsf(c[23][0] - fogColor[0] * 0.25f) < 1e-5f, "fog density and ambient colour from the ini / game");
+			// Sky occlusion: the ini's strength (the sun is high: all of it) and the cover height scale,
+			// sun height / atlas units per metre.
+			const float coverScale = sun.z / -nearFar[0];
+			Check(fabsf(c[31][2] - 0.8f) < 1e-6f && fabsf(c[31][3] - coverScale) < 1e-3f * coverScale,
+				"sky occlusion: the ini's strength for a high sun, cover height scale from the shadow depth mapping");
+			// The mock has no volume textures (no D3DPTEXTURECAPS_VOLUMEMAP): the fog runs without noise.
+			Check(c[30][3] == 0.0f && first.tex[6] == nullptr, "no volume textures: the fog runs without its noise");
 		}
 		// The game's state is back for its next draw.
 		const MockDraw& next = d[placement1 ? post : trans];

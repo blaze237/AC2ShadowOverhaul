@@ -26,6 +26,18 @@
 //    offset folded into P02 / P12, and misses it by the offset without;
 //  - noise: the fog averaged over 16 frames with the per-frame offset the mod sets while TAA runs
 //    (core::Scene_NoiseOffset) is closer to what the march converges to than one frame.
+//
+// Sky occlusion ([VolumetricFog] SkyOcclusion; the CPU reference traces the cover over each sample):
+//  - matches the reference in the street; takes sky light away, never adds it, and leaves the
+//    transmittance alone;
+//  - under a low roof over everything (a hall, a tomb) the sky light drops to what the cover height
+//    says; on an open plain, with no shadow map, at strength 0 or with the sun low it changes nothing
+//    (bit for bit).
+// Density noise ([VolumetricFog] NoiseAmount, the volume from src/vol/noise.h):
+//  - the volume tiles, has mean 0.5 and a full mip chain;
+//  - amount 0 gives bit for bit the fog without it; with noise the fog keeps its average level but
+//    varies; it drifts smoothly (a frame's drift changes little, 20 s much more); far away, where the
+//    steps are long, the mip level filters away detail the steps can't resolve.
 #include <windows.h>
 #include <d3d11.h>
 #include <d3d11shader.h>
@@ -37,6 +49,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include "vol/noise.h"
 
 static const UINT W = 960, H = 540, DIV = 2, LW = (W + DIV - 1) / DIV, LH = (H + DIV - 1) / DIV, SDIV = 4, SW = (W + SDIV - 1) / SDIV,
 				  SH = (H + SDIV - 1) / SDIV;
@@ -88,7 +101,7 @@ static void BuildTown()
 	g_boxes.push_back({ { 2.0f, -2.0f, 0.0f }, { 3.0f, -1.0f, 3.0f } }); // a post in the street
 }
 
-static bool RayBox(V3 o, V3 d, const Box& b, float& t)
+static bool RayBox(V3 o, V3 d, const Box& b, float& t, float* tExit = nullptr)
 {
 	float t0 = 0.0f, t1 = 1e30f;
 	const float* po = &o.x;
@@ -116,6 +129,8 @@ static bool RayBox(V3 o, V3 d, const Box& b, float& t)
 			return false;
 	}
 	t = t0;
+	if (tExit)
+		*tExit = t1;
 	return true;
 }
 
@@ -362,18 +377,20 @@ static ID3DBlob* CompileEntry(const char* entry, const char* profile, const std:
 	return code;
 }
 
-// The constant registers c0..c29 by name, as in the HLSL.
-static const char* const kRegNames[30] = { "c_Full", "c_Low", "c_Proj", "c_Proj2", "c_Eye", "c_Right", "c_Up", "c_Fwd", "c_Light0",
+// The constant registers c0..c31 by name, as in the HLSL.
+static const char* const kRegNames[32] = { "c_Full", "c_Low", "c_Proj", "c_Proj2", "c_Eye", "c_Right", "c_Up", "c_Fwd", "c_Light0",
 	"c_Light1", "c_Light2", "c_ShadowZ", "c_RangeMin", "c_RangeMax", "c_ScaleX", "c_ScaleY", "c_OffsetX", "c_OffsetY", "c_Bias", "c_Fade",
-	"c_Cloud", "c_SunDir", "c_SunCol", "c_Ambient", "c_Medium", "c_Blur", "c_Shafts", "c_Shafts2", "c_ShaftCol", "c_ShRes" };
+	"c_Cloud", "c_SunDir", "c_SunCol", "c_Ambient", "c_Medium", "c_Blur", "c_Shafts", "c_Shafts2", "c_ShaftCol", "c_ShRes", "c_Noise",
+	"c_Noise2" };
 
 struct Pass
 {
 	ID3D11PixelShader* ps = nullptr;
 	ID3D11Buffer* cb = nullptr;
 	std::vector<std::pair<int, UINT>> regOffsets; // register -> byte offset in $Globals
-	std::vector<std::pair<int, UINT>> texSlots;   // our sampler register (s0..s5) -> SM4 texture slot (packed in compatibility mode)
+	std::vector<std::pair<int, UINT>> texSlots;   // our sampler register (s0..s6) -> SM4 texture slot (packed in compatibility mode)
 	UINT cbSize = 0;
+	int noiseSampler = -1; // SM4 sampler slot of s_Noise (the others keep the slots they always had)
 };
 
 static Pass MakePass(const char* entry, const std::string* src = nullptr)
@@ -385,16 +402,18 @@ static Pass MakePass(const char* entry, const std::string* src = nullptr)
 	g_dev->CreatePixelShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &p.ps);
 	ID3D11ShaderReflection* refl = nullptr;
 	g_reflect(code->GetBufferPointer(), code->GetBufferSize(), kIID_Reflection, (void**)&refl);
-	static const char* const kSamplers[6] = { "s_Depth", "s_Shadow", "s_Cloud", "s_Fog", "s_Scene", "s_Shafts" };
+	static const char* const kSamplers[7] = { "s_Depth", "s_Shadow", "s_Cloud", "s_Fog", "s_Scene", "s_Shafts", "s_Noise" };
 	D3D11_SHADER_DESC sdesc = {};
 	if (refl && SUCCEEDED(refl->GetDesc(&sdesc)))
 		for (UINT i = 0; i < sdesc.BoundResources; i++)
 		{
 			D3D11_SHADER_INPUT_BIND_DESC b;
 			refl->GetResourceBindingDesc(i, &b);
-			for (int k = 0; k < 6; k++)
+			for (int k = 0; k < 7; k++)
 				if (b.Type == D3D_SIT_TEXTURE && !strcmp(b.Name, kSamplers[k]))
 					p.texSlots.push_back({ k, b.BindPoint });
+			if (b.Type == D3D_SIT_SAMPLER && !strcmp(b.Name, "s_Noise"))
+				p.noiseSampler = (int)b.BindPoint;
 		}
 	ID3D11ShaderReflectionConstantBuffer* cb = refl ? refl->GetConstantBufferByName("$Globals") : nullptr;
 	D3D11_SHADER_BUFFER_DESC bd = {};
@@ -405,7 +424,7 @@ static Pass MakePass(const char* entry, const std::string* src = nullptr)
 		{
 			D3D11_SHADER_VARIABLE_DESC vd;
 			cb->GetVariableByIndex(i)->GetDesc(&vd);
-			for (int r = 0; r < 30; r++)
+			for (int r = 0; r < 32; r++)
 				if (!strcmp(vd.Name, kRegNames[r]))
 					p.regOffsets.push_back({ r, vd.StartOffset });
 		}
@@ -536,9 +555,10 @@ static std::vector<float> ReadBack32(const Tex& t)
 
 static ID3D11VertexShader* g_vs;
 static ID3D11SamplerState* g_samplers[6];
+static ID3D11SamplerState* g_noiseSampler; // linear, mip linear, wrap (the plugin's s6)
 static ID3D11BlendState *g_blendComposite, *g_blendOff;
 
-static void Run(Pass& p, const float c[30][4], const Tex& target, ID3D11ShaderResourceView* const srvs[6], bool composite = false)
+static void Run(Pass& p, const float c[32][4], const Tex& target, ID3D11ShaderResourceView* const srvs[7], bool composite = false)
 {
 	std::vector<uint8_t> buf(p.cbSize, 0);
 	for (auto& ro : p.regOffsets)
@@ -546,19 +566,21 @@ static void Run(Pass& p, const float c[30][4], const Tex& target, ID3D11ShaderRe
 			memcpy(&buf[ro.second], c[ro.first], 16);
 	if (p.cb)
 		g_ctx->UpdateSubresource(p.cb, 0, nullptr, buf.data(), 0, 0);
-	ID3D11ShaderResourceView* none[6] = {};
-	g_ctx->PSSetShaderResources(0, 6, none);
+	ID3D11ShaderResourceView* none[7] = {};
+	g_ctx->PSSetShaderResources(0, 7, none);
 	g_ctx->OMSetRenderTargets(1, &target.rtv, nullptr);
 	D3D11_VIEWPORT vp = { 0, 0, (float)target.w, (float)target.h, 0, 1 };
 	g_ctx->RSSetViewports(1, &vp);
 	g_ctx->VSSetShader(g_vs, nullptr, 0);
 	g_ctx->PSSetShader(p.ps, nullptr, 0);
 	g_ctx->PSSetConstantBuffers(0, 1, &p.cb);
-	ID3D11ShaderResourceView* packed[6] = {};
+	ID3D11ShaderResourceView* packed[7] = {};
 	for (auto& ts : p.texSlots)
 		packed[ts.second] = srvs[ts.first];
-	g_ctx->PSSetShaderResources(0, 6, packed);
+	g_ctx->PSSetShaderResources(0, 7, packed);
 	g_ctx->PSSetSamplers(0, 6, g_samplers);
+	if (p.noiseSampler >= 0)
+		g_ctx->PSSetSamplers((UINT)p.noiseSampler, 1, &g_noiseSampler);
 	float bf[4] = {};
 	g_ctx->OMSetBlendState(composite ? g_blendComposite : g_blendOff, bf, 0xFFFFFFFF);
 	g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -586,6 +608,10 @@ struct Settings
 	float view = 0;
 	float noise = 0;        // c_Medium.w: the per-frame noise offset (0 without TAA)
 	bool narrowBlur = false; // a narrower fog blur (sigma 1), measured against the mod's with TAA (not used by the mod)
+	float skyOcc = 0;        // [VolumetricFog] SkyOcclusion (0 here, so the checks above see the fog as it was)
+	float noiseAmount = 0, noiseSize = 15.0f, windSpeed = 1.5f, windDir = 30.0f; // [VolumetricFog] Noise*, Wind*
+	double time = 0;         // seconds on the plugin's clock
+	float noiseLodBias = 0.5f; // the plugin's extra half mip level (-20: always the finest level)
 };
 
 struct Outputs
@@ -596,6 +622,7 @@ struct Outputs
 
 static Pass g_march, g_blur, g_blurNarrow, g_mask, g_radial, g_comp;
 static Tex g_depthTex, g_atlasTex, g_cloudTex, g_fogT[2], g_shaftT[2], g_sceneTex, g_outTex;
+static ID3D11ShaderResourceView* g_noiseSrv;
 
 // reuseScene: the scene (depth, colour) of the last call, for repeated runs of one view.
 static Outputs RunView(const Settings& s, bool reuseScene = false)
@@ -610,7 +637,7 @@ static Outputs RunView(const Settings& s, bool reuseScene = false)
 	g_sceneTex = MakeTex(W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, false, o.scene.data(), W * 16);
 	g_outTex = MakeTex(W, H, DXGI_FORMAT_R16G16B16A16_FLOAT, true);
 
-	float c[30][4] = {};
+	float c[32][4] = {};
 	auto set4 = [&](int r, float x, float y, float z, float w) {
 		c[r][0] = x;
 		c[r][1] = y;
@@ -643,6 +670,26 @@ static Outputs RunView(const Settings& s, bool reuseScene = false)
 	set4(24, s.density, s.falloff, s.base, s.noise);
 	set4(27, s.shaftThreshold, 12.0f, 0, 0);
 	set4(29, (float)SW, (float)SH, 1.0f / SW, 1.0f / SH);
+	// Sky occlusion and noise, as vol::Apply sets them.
+	if (s.shadows && g_sun.z > 0)
+	{
+		c[31][2] = s.skyOcc * fminf(fmaxf((g_sun.z - 0.1f) / 0.25f, 0.0f), 1.0f);
+		c[31][3] = g_sun.z / fabsf(kNearFar[0]);
+	}
+	if (s.noiseAmount > 0)
+	{
+		const double tile = 8.0 * s.noiseSize, dir = s.windDir * (3.14159265358979 / 180.0);
+		const double wind[3] = { cos(dir) * s.windSpeed, sin(dir) * s.windSpeed, 0.25 * s.windSpeed };
+		const float* eye = &g_eye.x;
+		for (int k = 0; k < 3; k++)
+		{
+			const double u = (eye[k] - wind[k] * s.time) / tile;
+			c[30][k] = (float)(u - floor(u));
+		}
+		c[30][3] = s.noiseAmount;
+		c[31][0] = (float)(1.0 / tile);
+		c[31][1] = (float)(log2(64.0 / tile) + s.noiseLodBias);
+	}
 
 	// Sun on screen (as the plugin computes it).
 	float sx = Dot(g_right, g_sun), sy = Dot(g_up, g_sun), sz = Dot(g_fwd, g_sun);
@@ -659,7 +706,7 @@ static Outputs RunView(const Settings& s, bool reuseScene = false)
 	if (shafts)
 		set4(28, kSunCol.x * s.shaftIntensity * fade, kSunCol.y * s.shaftIntensity * fade, kSunCol.z * s.shaftIntensity * fade, 1);
 
-	ID3D11ShaderResourceView* srv[6] = { g_depthTex.srv, g_atlasTex.srv, g_cloudTex.srv, nullptr, nullptr, nullptr };
+	ID3D11ShaderResourceView* srv[7] = { g_depthTex.srv, g_atlasTex.srv, g_cloudTex.srv, nullptr, nullptr, nullptr, g_noiseSrv };
 	Run(g_march, c, g_fogT[0], srv);
 	o.march = ReadBack(g_fogT[0]);
 	o.hashMarch = HashTex(g_fogT[0], 8);
@@ -753,7 +800,20 @@ static void Reference(UINT lx, UINT ly, const Settings& s, float out[4])
 		float tt;
 		V3 nn;
 		float vis = !s.shadows ? 1.0f : Trace(P, g_sun, tt, nn) ? 0.0f : 1.0f;
-		V3 L = kSunCol * (s.sun * phase * vis) + kFogCol * s.ambient;
+		// Sky occlusion: the cover the sun sees over the sample (its sun-most surface: the farthest
+		// exit along the ray) and its height above it, against 20 m (under a metre: open, see SunAndSky).
+		float sky = 1.0f;
+		if (vis == 0.0f && s.skyOcc > 0)
+		{
+			float far_ = 0, te;
+			for (const Box& b : g_boxes)
+				if (RayBox(P, g_sun, b, tt, &te))
+					far_ = fmaxf(far_, te);
+			const float cover = far_ * g_sun.z;
+			float open = fmaxf(fminf(cover / 20.0f, 1.0f), fminf(fmaxf(2.0f - cover, 0.0f), 1.0f));
+			sky = 1.0f - s.skyOcc * fminf(fmaxf((g_sun.z - 0.1f) / 0.25f, 0.0f), 1.0f) * (1.0f - open);
+		}
+		V3 L = kSunCol * (s.sun * phase * vis) + kFogCol * (s.ambient * sky);
 		float st = expf(-density * (t1 - t0));
 		S = S + L * (T * (1 - st));
 		T *= st;
@@ -859,6 +919,37 @@ int main(int argc, char** argv)
 		d.MaxLOD = 0;
 		d.ComparisonFunc = D3D11_COMPARISON_NEVER;
 		g_dev->CreateSamplerState(&d, &g_samplers[i]);
+	}
+	{
+		D3D11_SAMPLER_DESC d = {};
+		d.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+		d.AddressU = d.AddressV = d.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+		d.MaxLOD = D3D11_FLOAT32_MAX;
+		d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		g_dev->CreateSamplerState(&d, &g_noiseSampler);
+	}
+	// The noise volume the plugin uploads (src/vol/noise.h, 64^3 L8 with mips -> R8_UNORM).
+	std::vector<std::vector<uint8_t>> noiseLevels;
+	vol::MakeNoiseVolume(64, noiseLevels);
+	{
+		D3D11_TEXTURE3D_DESC d = {};
+		d.Width = d.Height = d.Depth = 64;
+		d.MipLevels = (UINT)noiseLevels.size();
+		d.Format = DXGI_FORMAT_R8_UNORM;
+		d.Usage = D3D11_USAGE_DEFAULT;
+		d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+		std::vector<D3D11_SUBRESOURCE_DATA> init(noiseLevels.size());
+		for (size_t l = 0; l < noiseLevels.size(); l++)
+		{
+			const UINT n = 64u >> l;
+			init[l] = { noiseLevels[l].data(), n, n * n };
+		}
+		ID3D11Texture3D* t = nullptr;
+		if (FAILED(g_dev->CreateTexture3D(&d, init.data(), &t)) || FAILED(g_dev->CreateShaderResourceView(t, nullptr, &g_noiseSrv)))
+		{
+			printf("could not create the noise volume\n");
+			return 1;
+		}
 	}
 	D3D11_BLEND_DESC bd = {};
 	bd.RenderTarget[0].BlendEnable = TRUE;
@@ -1069,7 +1160,7 @@ int main(int argc, char** argv)
 		Tex out = MakeTex(W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, true);
 		double expected = 0; // what misses the jittered pixel by the offset does: the unjittered pixel's direction
 		auto rayError = [&](bool fold) {
-			float c[30][4] = {};
+			float c[32][4] = {};
 			c[0][0] = (float)W, c[0][1] = (float)H, c[0][2] = 1.0f / W, c[0][3] = 1.0f / H;
 			c[2][0] = A, c[2][1] = B, c[2][2] = P00, c[2][3] = P11;
 			c[3][0] = fold ? 2.0f * g_jitterPx[0] / W : 0.0f;
@@ -1077,7 +1168,7 @@ int main(int argc, char** argv)
 			memcpy(c[5], &g_right, 12);
 			memcpy(c[6], &g_up, 12);
 			memcpy(c[7], &g_fwd, 12);
-			ID3D11ShaderResourceView* none[6] = {};
+			ID3D11ShaderResourceView* none[7] = {};
 			Run(ray, c, out, none);
 			std::vector<float> d = ReadBack32(out);
 			double sum = 0, sumExpected = 0;
@@ -1165,6 +1256,216 @@ int main(int argc, char** argv)
 		Check(eAvg < 0.9 * e1 && eRaw < 0.5 * eRaw1,
 			"noise: the fog averaged over frames with the per-frame offsets is closer to it than one frame (blurred, unblurred)", eAvg / e1,
 			eRaw / eRaw1);
+	}
+
+	auto rebuildAtlas = [&]() {
+		BuildShadowSpace();
+		g_atlasTex.srv->Release();
+		g_atlasTex.t->Release();
+		g_atlasTex = MakeTex(4 * TILE, TILE, DXGI_FORMAT_R32_FLOAT, false, g_atlas.data(), 4 * TILE * 4);
+	};
+	// Sums of the in-scatter (green) and the transmittance over a fog-res image.
+	auto sums = [](const std::vector<float>& v, double& light, double& T) {
+		light = T = 0;
+		for (size_t i = 0; i < v.size(); i += 4)
+		{
+			light += v[i + 1];
+			T += v[i + 3];
+		}
+	};
+
+	// ---- Sky occlusion -----------------------------------------------------------------------------
+	{
+		g_eye = { 0.0f, 0.0f, 1.7f };
+		rebuildAtlas();
+		SetCamera(0.0f, 4.0f);
+		Settings so = s;
+		so.skyOcc = 0.8f;
+		Outputs occ = RunView(so);
+		CheckAgainstReference(occ, so, "street, sky occlusion 0.8");
+		WritePngRgb("warp_street_fog_skyocclusion.png", FogRgb(occ.fog, false), LW, LH, 2.0f);
+		// Sky light only: occlusion takes it away, never adds it; the transmittance stays.
+		Settings amb = s;
+		amb.sun = 0;
+		Outputs a0 = RunView(amb, true);
+		amb.skyOcc = 0.8f;
+		Outputs a1 = RunView(amb, true);
+		int above = 0, tDiff = 0;
+		for (size_t i = 0; i < a0.march.size(); i += 4)
+		{
+			above += a1.march[i + 1] > a0.march[i + 1] * 1.0001f + 1e-7f;
+			tDiff += a1.march[i + 3] != a0.march[i + 3];
+		}
+		double l0, t0, l1, t1;
+		sums(a0.march, l0, t0);
+		sums(a1.march, l1, t1);
+		Check(above == 0 && tDiff == 0, "street, sky light only: occlusion never adds light, transmittance bit for bit the same", above, tDiff);
+		Check(l1 < 0.97 * l0 && l1 > 0.3 * l0, "street, sky light only: the shaded street loses some of its sky light, not all", l1 / l0, 0);
+
+		// Strength 0 / no shadow map: bit for bit the fog without the occlusion.
+		Settings z = s;
+		z.skyOcc = 0;
+		Outputs base = RunView(z, true);
+		Check(base.hashMarch == lit.hashMarch && base.hashComposite == lit.hashComposite, "sky occlusion 0: bit for bit the fog before it");
+		Settings ns0 = s, ns1 = s;
+		ns0.shadows = ns1.shadows = false;
+		ns1.skyOcc = 1.0f;
+		Outputs u0 = RunView(ns0, true), u1 = RunView(ns1, true);
+		Check(u0.hashMarch == u1.hashMarch && u0.hashComposite == u1.hashComposite, "no shadow map: sky occlusion changes nothing");
+
+		// A low roof over everything (a hall or a tomb): the cover's top is 5.5 m up, so at eye height
+		// it is 3.8 m over the air: open = 3.8 / 20, sky light x (1 - 0.8 x 0.81) = 0.35 near the
+		// camera, a little more along the rays going up to the roof.
+		std::vector<Box> town = g_boxes;
+		g_boxes.assign(1, Box{ { -400.0f, -400.0f, 5.0f }, { 400.0f, 400.0f, 5.5f } });
+		rebuildAtlas();
+		Settings h = s;
+		h.sun = 0;
+		Outputs h0 = RunView(h);
+		h.skyOcc = 0.8f;
+		Outputs h1 = RunView(h, true);
+		CheckAgainstReference(h1, h, "under a roof, sky light only");
+		sums(h0.march, l0, t0);
+		sums(h1.march, l1, t1);
+		Check(l1 > 0.3 * l0 && l1 < 0.5 * l0, "under a roof: the sky light drops to what the cover height says (about 0.35-0.45)", l1 / l0, 0);
+		WritePngRgb("warp_roof_fog.png", FogRgb(h0.fog, false), LW, LH, 8.0f);
+		WritePngRgb("warp_roof_fog_skyocclusion.png", FogRgb(h1.fog, false), LW, LH, 8.0f);
+		// The sun low (4 degrees): the occlusion is faded out, the fog as without it.
+		const V3 sunWas = g_sun;
+		g_sun = Norm(V3{ cosf(az) * cosf(0.07f), sinf(az) * cosf(0.07f), sinf(0.07f) });
+		rebuildAtlas();
+		h.skyOcc = 0;
+		Outputs lowA = RunView(h, true);
+		h.skyOcc = 0.8f;
+		Outputs lowB = RunView(h, true);
+		Check(lowA.hashMarch == lowB.hashMarch, "sun at 4 degrees: sky occlusion faded out (bit for bit without it)");
+		g_sun = sunWas;
+		// An open plain: everything sunlit, nothing changes.
+		g_boxes.clear();
+		rebuildAtlas();
+		h.sun = s.sun;
+		h.skyOcc = 0;
+		Outputs p0 = RunView(h);
+		h.skyOcc = 1.0f;
+		Outputs p1 = RunView(h, true);
+		Check(p0.hashMarch == p1.hashMarch && p0.hashComposite == p1.hashComposite, "open plain: sky occlusion changes nothing (bit for bit)");
+		g_boxes = town;
+		rebuildAtlas();
+	}
+
+	// ---- Density noise ------------------------------------------------------------------------------
+	{
+		// The volume: 7 levels (64^3 .. 1^3), mean 0.5, tiles (the step across the wrap is like any other).
+		bool levelsOk = noiseLevels.size() == 7;
+		for (size_t l = 0; l < noiseLevels.size(); l++)
+			levelsOk &= noiseLevels[l].size() == (size_t)(64 >> l) * (64 >> l) * (64 >> l);
+		const std::vector<uint8_t>& v0 = noiseLevels[0];
+		double mean = 0, sd = 0, stepIn = 0, stepWrap = 0;
+		for (uint8_t b : v0)
+			mean += b / 255.0;
+		mean /= v0.size();
+		for (uint8_t b : v0)
+			sd += (b / 255.0 - mean) * (b / 255.0 - mean);
+		sd = sqrt(sd / v0.size());
+		for (int z = 0; z < 64; z++)
+			for (int y = 0; y < 64; y++)
+			{
+				const uint8_t* row = &v0[((size_t)z * 64 + y) * 64];
+				stepWrap += fabs(row[0] - row[63]) / 255.0;
+				for (int x = 0; x < 63; x++)
+					stepIn += fabs(row[x + 1] - row[x]) / 255.0 / 63.0;
+			}
+		Check(levelsOk && noiseLevels.back().size() == 1, "noise volume: 64^3 with a full mip chain down to 1^3");
+		Check(fabs(mean - 0.5) < 0.01 && sd > 0.12 && sd < 0.2, "noise volume: mean 0.5, standard deviation about 1/6", mean, sd);
+		Check(stepWrap < 1.3 * stepIn && stepWrap > 0.7 * stepIn, "noise volume: tiles (the step across the wrap like the others)", stepWrap, stepIn);
+		Check(fabs(noiseLevels.back()[0] / 255.0 - 0.5) < 0.02, "noise volume: the last mip is the mean", noiseLevels.back()[0] / 255.0, 0.5);
+
+		g_eye = { 0.0f, 0.0f, 1.7f };
+		SetCamera(0.0f, 4.0f);
+		Settings n = s;
+		Outputs smooth = RunView(n);
+		// Amount 0: bit for bit the fog without noise, whatever the other noise settings.
+		n.noiseSize = 7.0f;
+		n.time = 1234.5;
+		Outputs zero = RunView(n, true);
+		Check(zero.hashMarch == lit.hashMarch && zero.hashFog == lit.hashFog && zero.hashComposite == lit.hashComposite,
+			"noise amount 0: bit for bit the fog without noise");
+		// With noise: the same fog on average, but varying.
+		n = s;
+		n.noiseAmount = 0.5f;
+		n.time = 100.0;
+		Outputs wisp = RunView(n, true);
+		WritePngRgb("warp_street_fog_noise.png", FogRgb(wisp.fog, false), LW, LH, 2.0f);
+		WritePngRgb("warp_street_composite_noise.png", wisp.composite, W, H);
+		Check(!AnyNan(wisp.march) && !AnyNan(wisp.fog) && !AnyNan(wisp.composite), "noise: no NaN / Inf");
+		double ls, ts, lw, tw;
+		sums(smooth.fog, ls, ts);
+		sums(wisp.fog, lw, tw);
+		double diff = 0;
+		for (size_t i = 0; i < smooth.fog.size(); i += 4)
+			diff += fabs(wisp.fog[i + 1] - smooth.fog[i + 1]);
+		Check(fabs(lw / ls - 1) < 0.1 && fabs(tw / ts - 1) < 0.05, "noise 0.5: the fog's average in-scatter and transmittance stay", lw / ls, tw / ts);
+		Check(diff / ls > 0.03, "noise 0.5: the fog varies (mean |change| / level)", diff / ls, 0.03);
+		// Drift: one frame (60 fps) changes little, 20 s much more.
+		auto change = [&](const Outputs& a, const Outputs& b) {
+			double d = 0, level = 0;
+			for (size_t i = 0; i < a.fog.size(); i += 4)
+			{
+				d += fabs(a.fog[i + 1] - b.fog[i + 1]);
+				level += a.fog[i + 1];
+			}
+			return d / level;
+		};
+		n.time = 100.0 + 1.0 / 60.0;
+		Outputs nextFrame = RunView(n, true);
+		n.time = 120.0;
+		Outputs later = RunView(n, true);
+		const double cFrame = change(wisp, nextFrame), cLater = change(wisp, later);
+		Check(cFrame < 0.01 && cLater > 10 * cFrame, "noise drift: a frame's worth changes the fog little, 20 s much more", cFrame, cLater);
+		// After 10 days on the clock the noise still drifts smoothly (time and position wrapped in double).
+		n.time = 864000.0;
+		Outputs days = RunView(n, true);
+		n.time = 864000.0 + 1.0 / 60.0;
+		Outputs daysNext = RunView(n, true);
+		Check(change(days, daysNext) < 0.01 && !AnyNan(days.fog), "noise drift after 10 days: still smooth", change(days, daysNext), 0.01);
+		// Mip level by step length: one frame's march (unblurred, one jitter pattern) against what it
+		// converges to over 8 step offsets. Noise detail finer than the steps (here 1 m wisps against
+		// steps up to 15 m) turns into per-pixel error that changes as the noise drifts (shimmer); the
+		// mip level filters it away. Sky light only, no shadows, so the noise is what varies.
+		auto estimateError = [&](Settings e) {
+			e.noise = 0;
+			Outputs one = RunView(e, true);
+			std::vector<double> conv(one.march.size(), 0.0);
+			const int R = 8;
+			for (int i = 0; i < R; i++)
+			{
+				e.noise = (i + 0.5f) / R;
+				Outputs o = RunView(e, true);
+				for (size_t k = 0; k < conv.size(); k++)
+					conv[k] += o.march[k] / R;
+			}
+			double err = 0, level = 0;
+			for (size_t k = 0; k < conv.size(); k += 4)
+			{
+				err += fabs(one.march[k + 1] - conv[k + 1]);
+				level += conv[k + 1];
+			}
+			return err / level;
+		};
+		n.time = 100.0;
+		n.sun = 0;
+		n.shadows = false;
+		n.noiseAmount = 0;
+		const double eFlat = estimateError(n);
+		n.noiseAmount = 1.0f;
+		n.noiseSize = 4.0f;
+		const double eMip = estimateError(n);
+		n.noiseLodBias = -20.0f;
+		const double eFine = estimateError(n);
+		printf("one frame's march against its converged value (mean |error| / level): no noise %.4f, noise with mips %.4f, finest level "
+			   "only %.4f\n",
+			eFlat, eMip, eFine);
+		Check(eMip < 0.75 * eFine, "noise: the mip level by step length filters detail the steps can't resolve", eMip, eFine);
 	}
 
 	printf("%s: %d failure(s)\n", g_fails ? "FAILED" : "ALL PASSED", g_fails);

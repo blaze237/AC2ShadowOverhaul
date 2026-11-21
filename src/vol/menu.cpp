@@ -5,6 +5,7 @@
 #include "volumetrics.h"
 #include "core/menu.h"
 #include <d3d9.h>
+#include <math.h>
 #include <stdio.h>
 
 namespace vol
@@ -22,6 +23,11 @@ enum
 	ITEM_SUN,
 	ITEM_ANISO,
 	ITEM_AMBIENT,
+	ITEM_SKY_OCCLUSION,
+	ITEM_NOISE,
+	ITEM_NOISE_SIZE,
+	ITEM_WIND_SPEED,
+	ITEM_WIND_DIR,
 	ITEM_DISTANCE,
 	ITEM_STEPS,
 	ITEM_SHAFTS,
@@ -39,6 +45,11 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "Sun scattering (god rays)", "VolumetricFog", "SunIntensity", true },
 	{ "Sun focus", "VolumetricFog", "Anisotropy", true },
 	{ "Sky light scattering", "VolumetricFog", "AmbientIntensity", true },
+	{ "Sky light blocked by cover", "VolumetricFog", "SkyOcclusion", true },
+	{ "Fog noise (wisps)", "VolumetricFog", "NoiseAmount", true },
+	{ "Noise size", "VolumetricFog", "NoiseSize", true },
+	{ "Wind speed", "VolumetricFog", "WindSpeed", true },
+	{ "Wind direction", "VolumetricFog", "WindDirection", true },
 	{ "Fog distance", "VolumetricFog", "MaxDistance", true },
 	{ "Ray march steps", "VolumetricFog", "Steps", true },
 	{ "Sun shafts", "SunShafts", "StartEnabled", true }, // [VolumetricFog] DebugView too
@@ -99,6 +110,11 @@ protected:
 		case ITEM_SUN: snprintf(buf, n, "%.2f", g_set.sunIntensity); break;
 		case ITEM_ANISO: snprintf(buf, n, "%.2f", g_set.anisotropy); break;
 		case ITEM_AMBIENT: snprintf(buf, n, "%.2f", g_set.ambientIntensity); break;
+		case ITEM_SKY_OCCLUSION: snprintf(buf, n, "%.2f", g_set.skyOcclusion); break;
+		case ITEM_NOISE: snprintf(buf, n, "%.2f", g_set.noiseAmount); break;
+		case ITEM_NOISE_SIZE: snprintf(buf, n, "%.1f", g_set.noiseSize); break;
+		case ITEM_WIND_SPEED: snprintf(buf, n, "%.1f", g_set.windSpeed); break;
+		case ITEM_WIND_DIR: snprintf(buf, n, "%.0f", g_set.windDirection); break;
 		case ITEM_DISTANCE: snprintf(buf, n, "%.0f", g_set.maxDistance); break;
 		case ITEM_STEPS: snprintf(buf, n, "%d", g_set.steps); break;
 		case ITEM_SHAFTS: snprintf(buf, n, "%d", g_set.shaftsOn ? 1 : 0); break;
@@ -131,6 +147,11 @@ protected:
 		case ITEM_SUN: snprintf(buf, n, "%.2f", g_set.sunIntensity); break;
 		case ITEM_ANISO: snprintf(buf, n, "%.2f", g_set.anisotropy); break;
 		case ITEM_AMBIENT: snprintf(buf, n, "%.2f", g_set.ambientIntensity); break;
+		case ITEM_SKY_OCCLUSION: snprintf(buf, n, g_set.skyOcclusion > 0 ? "%.0f%%" : "OFF", g_set.skyOcclusion * 100.0f); break;
+		case ITEM_NOISE: snprintf(buf, n, g_set.noiseAmount > 0 ? "%.2f" : "OFF (smooth)", g_set.noiseAmount); break;
+		case ITEM_NOISE_SIZE: snprintf(buf, n, "%.1f m", g_set.noiseSize); break;
+		case ITEM_WIND_SPEED: snprintf(buf, n, "%.1f m/s", g_set.windSpeed); break;
+		case ITEM_WIND_DIR: snprintf(buf, n, "%.0f deg", g_set.windDirection); break;
 		case ITEM_DISTANCE: snprintf(buf, n, "%.0f m", g_set.maxDistance); break;
 		case ITEM_STEPS: snprintf(buf, n, "%d", g_set.steps); break;
 		case ITEM_SHAFTS: snprintf(buf, n, "%s", !g_set.shaftsConfigured ? "n/a (Enabled=0)" : kShaftModes[ShaftMode()]); break;
@@ -164,6 +185,11 @@ protected:
 		case ITEM_SUN: g_set.sunIntensity = g_set.sunIntensity + 0.1f * dir; break;
 		case ITEM_ANISO: g_set.anisotropy = g_set.anisotropy + 0.05f * dir; break;
 		case ITEM_AMBIENT: g_set.ambientIntensity = g_set.ambientIntensity + 0.05f * dir; break;
+		case ITEM_SKY_OCCLUSION: g_set.skyOcclusion = roundf((g_set.skyOcclusion + 0.1f * dir) * 10.0f) / 10.0f; break;
+		case ITEM_NOISE: g_set.noiseAmount = roundf((g_set.noiseAmount + 0.1f * dir) * 10.0f) / 10.0f; break; // exactly 0 at the bottom
+		case ITEM_NOISE_SIZE: g_set.noiseSize = dir > 0 ? g_set.noiseSize * 1.25f : g_set.noiseSize / 1.25f; break;
+		case ITEM_WIND_SPEED: g_set.windSpeed = g_set.windSpeed + 0.5f * dir; break;
+		case ITEM_WIND_DIR: g_set.windDirection = g_set.windDirection + 15.0f * dir; break; // wraps at 360
 		case ITEM_DISTANCE: // 25 m steps up to 500 m, 100 m above
 			g_set.maxDistance = g_set.maxDistance + ((dir > 0 ? g_set.maxDistance < 499.0f : g_set.maxDistance < 501.0f) ? 25.0f : 100.0f) * dir;
 			break;
