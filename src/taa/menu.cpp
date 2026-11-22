@@ -38,7 +38,7 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "Jitter size", "TAA", "JitterScale", true },
 	{ "Clip box", "TAA", "ClipBox", true },
 	{ "Depth tolerance", "TAA", "DepthTolerance", true },
-	{ "Average other effects' noise", "TAA", "AssistEffects", true },
+	{ "Average the fog's noise", "TAA", "AssistEffects", true },
 	{ "Debug view", "TAA", "DebugView", true },
 };
 // Saves aren't logged (each change is).

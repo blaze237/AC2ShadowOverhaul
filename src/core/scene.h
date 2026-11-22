@@ -19,7 +19,7 @@
 // What the other effects need to know about that is here too (SceneState::taa, rasterCamera),
 // reported by TAA through Scene_TaaJitter / Scene_TaaFrame: the effects never ask TAA itself. They
 // work without it; with it they reconstruct positions from the jittered z/w target with the jittered
-// projection, and (Scene_NoiseOffsets) vary their noise per frame for TAA to average.
+// projection, and the fog (Scene_NoiseOffset) varies its noise per frame for TAA to average.
 #pragma once
 
 #include <windows.h>
@@ -129,16 +129,13 @@ const SceneState& Scene();
 bool Scene_MsaaRecently(); // MSAA seen on the main pass in the last 120 frames
 bool Scene_CameraCut();    // this frame's camera jumped from the last frame's (see IsCameraCut)
 
-// The effects may lean on TAA this frame: it runs and [TAA] AssistEffects is on. Their noise then
-// varies per frame (Scene_NoiseOffsets) and their spatial filters may be lighter, since TAA's history
-// averages successive frames.
+// The fog may lean on TAA this frame: it runs and [TAA] AssistEffects is on. Only the fog does: TAA
+// has no motion vectors, so on characters it rejects its history, and per-frame noise in AO, contact
+// shadows or SSGI showed through there as noise and swimming (see ao.cpp's top).
 bool Scene_TaaAssist();
-// Offsets (0..1) to add to an effect's per-pixel noise before frac(): a 2D low-discrepancy sequence
-// (R2, Roberts 2018) over TAA's frames while Scene_TaaAssist(), so successive frames sample other
-// directions and steps and every pixel's samples over time are evenly spread; (0, 0) otherwise, the
-// same pattern every frame as without TAA (frac(n + 0) = n: the output doesn't change at all).
-void Scene_NoiseOffsets(float out[2]);
-// The same for one-dimensional noise: the golden ratio sequence (the best spread in 1D), else 0.
+// An offset (0..1) to add to per-pixel noise before frac(): the golden ratio sequence over TAA's
+// frames while Scene_TaaAssist(), so successive frames sample other steps; 0 otherwise, the same
+// pattern every frame as without TAA (frac(n + 0) = n: the output doesn't change at all).
 float Scene_NoiseOffset();
 
 // ---- Hooks (framedump.cpp calls these first, before the effects) -------------------------------

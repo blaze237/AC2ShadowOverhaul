@@ -19,9 +19,9 @@
 //            anything, and the game's draws never get TAA's jitter (c255 stays 0)
 //   taa      the effects with TAA (core/scene.h): every frame, the projection terms AO, SSGI and the
 //            volumetrics get (c3.xy of their passes) are the unjittered ones plus exactly the c255
-//            the game's draws got that frame; the noise offsets (AO c3.zw, fog c24.w) step through
-//            their low-discrepancy sequences only while TAA runs; AO uses its narrow blur and SSGI
-//            its doubled blend then; every effect pass runs with c255 = 0, no mip bias, and its own
+//            the game's draws got that frame; the fog's noise offset (c24.w) steps through the
+//            golden ratio sequence only while TAA runs, AO's (c3.zw) stays 0 and AO's blur and SSGI's
+//            blend stay as without TAA; every effect pass runs with c255 = 0, no mip bias, and its own
 //            vertex shader. Switched off in the F1 menu: no jitter, offsets 0, everything as without
 //            TAA; switched back on: it all comes back
 //   taaoff   [TAA] Enabled=0: no jitter, offsets 0, the passes as without TAA
@@ -633,7 +633,7 @@ static bool NextInSequence(float a, float b, double step)
 	return d < 1e-4 || d > 1 - 1e-4;
 }
 
-static const double kR2a = 0.7548776662466927, kR2b = 0.5698402909980532, kGolden = 0.6180339887498949;
+static const double kGolden = 0.6180339887498949;
 
 // The frames f (indices into `fr`, f > 0) with everything as with TAA running and assisting.
 static void CheckAssisted(const std::vector<TaaFrame>& fr, size_t from, const char* what)
@@ -651,10 +651,10 @@ static void CheckAssisted(const std::vector<TaaFrame>& fr, size_t from, const ch
 		for (const MockDraw* d : { a.gtao, a.march, a.trace })
 			for (int k = 0; k < 2; k++)
 				worst = fmaxf(worst, fabsf(d->psConst[3][k] - a.c255[k]));
-		aoSeq &= NextInSequence(p.gtao->psConst[3][2], a.gtao->psConst[3][2], kR2a) && NextInSequence(p.gtao->psConst[3][3], a.gtao->psConst[3][3], kR2b);
+		aoSeq &= a.gtao->psConst[3][2] == 0.0f && a.gtao->psConst[3][3] == 0.0f;
 		fogSeq &= NextInSequence(p.march->psConst[24][3], a.march->psConst[24][3], kGolden);
-		blur &= !strcmp(a.aoBlur, "ao-blur-narrow");
-		blend &= fabsf(a.temporal->psConst[9][0] - 0.2f) < 1e-6f && fabsf(a.temporal->psConst[9][3] - 5.0f) < 1e-5f;
+		blur &= !strcmp(a.aoBlur, "ao-blur");
+		blend &= a.temporal->psConst[9][0] == 0.1f && a.temporal->psConst[9][3] == 1.0f / 0.1f;
 		clean &= a.passesClean;
 		bias &= a.gameBias == -0.5f;
 	}
@@ -664,10 +664,10 @@ static void CheckAssisted(const std::vector<TaaFrame>& fr, size_t from, const ch
 	Check(folded, "%s: AO, SSGI and the volumetrics get P02 / P12 = the unjittered ones + the c255 the game's draws got that frame "
 				  "(worst difference %.2g)",
 		what, worst);
-	Check(aoSeq, "%s: AO's noise offsets (c3.zw) step through R2 frame by frame", what);
+	Check(aoSeq, "%s: AO's noise offsets (c3.zw) stay 0 (TAA can't follow moving characters)", what);
 	Check(fogSeq, "%s: the fog's noise offset (c24.w) steps through the golden ratio sequence frame by frame", what);
-	Check(blur, "%s: AO uses its narrow blur", what);
-	Check(blend, "%s: SSGI's minimum temporal blend is doubled (0.2)", what);
+	Check(blur, "%s: AO keeps its normal blur", what);
+	Check(blend, "%s: SSGI's minimum temporal blend stays the ini's (0.1)", what);
 	Check(bias, "%s: the game's scene draws get TAA's mip bias (-0.5)", what);
 	Check(clean, "%s: every effect pass draws with c255 = 0, no mip bias on sampler 0, and its own vertex shader", what);
 }

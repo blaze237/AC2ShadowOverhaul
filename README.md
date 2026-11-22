@@ -71,11 +71,12 @@ lighting effects the 2009 renderer never had.
 - **Temporal anti-aliasing (TAA).** Smooths jagged edges and shimmer by blending each frame with
   the previous ones, at engine level: the game's geometry is jittered by a fraction of a pixel each
   frame and the result is resolved before bloom and tone mapping, so the HUD stays sharp.
-- **The other effects lean on it, but don't need it.** While TAA runs, ambient occlusion, contact
-  shadows and the fog vary their sampling noise every frame and TAA averages it out, so they come
-  out cleaner with a lighter blur; every effect also accounts for the jitter when it reconstructs
-  positions from depth. With TAA off (or `[TAA] AssistEffects=0`) each effect behaves exactly as it
-  does on its own.
+- **The other effects work with it, but don't need it.** Every effect accounts for TAA's jitter when
+  it reconstructs positions from depth, and while TAA runs the volumetric fog varies its sampling
+  noise every frame for TAA to average out (`[TAA] AssistEffects`). Ambient occlusion, contact
+  shadows and SSGI keep the same noise as without TAA: TAA can't follow moving characters (the game
+  has no motion vectors), so per-frame noise on them would show through as noise and swimming. With
+  TAA off each effect behaves exactly as it does on its own.
 
 ### Everything
 

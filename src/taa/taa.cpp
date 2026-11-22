@@ -29,8 +29,8 @@ static float g_mipBias = -0.5f;
 static float g_jitterScale = 1.0f;
 static int g_debugView = 0;
 // [TAA] AssistEffects: while TAA runs, the other effects lean on its averaging (core/scene.h
-// Scene_TaaAssist): AO, contact shadows and fog vary their noise per frame, AO and contact shadows
-// blur less, SSGI keeps a shorter history. Their jitter-correct reconstruction doesn't depend on it:
+// Scene_TaaAssist): the fog varies its ray-march noise per frame. (AO, contact shadows and SSGI used to
+// as well, and blurred less: dropped, see ao.cpp's top.) The jitter-correct reconstruction doesn't depend on it:
 // that is a matter of correctness, not taste.
 static bool g_assist = true;
 // Strength k of the reversible c / (1 + k luma) the history is kept in (taa.hlsl Compress): damps
@@ -99,7 +99,7 @@ bool Taa_Init()
 	LogInfo("TAA: feedback %.2f (moving %.2f), sharpness %.2f, mip bias %.2f, jitter %.2f, clip box %.2f, depth tolerance %.3f%s%s%s.",
 		(double)g_feedback, (double)g_motionFeedback, (double)g_sharpness, (double)g_mipBias, (double)g_jitterScale, (double)g_clipGamma,
 		(double)g_depthTolerance, g_on ? "" : " (starting off)", g_debugView ? ", debug view on" : "",
-		g_assist ? ", assisting the other effects" : ", other effects as without TAA");
+		g_assist ? ", averaging the fog" : ", fog as without TAA");
 	return true;
 }
 
@@ -491,7 +491,7 @@ const char* Taa_Status()
 	if (!g_on)
 		return "off";
 	if (g_historyValid)
-		return g_assist ? "working (also averaging AO, fog, SSGI)" : "working";
+		return g_assist ? "working (also averaging the fog)" : "working";
 	return "waiting for a 3D scene";
 }
 

@@ -46,19 +46,6 @@ void Scene_TaaFrame(bool historyValid, unsigned frame, bool assist)
 
 bool Scene_TaaAssist() { return S.taa.running && S.taa.assist; }
 
-void Scene_NoiseOffsets(float out[2])
-{
-	out[0] = out[1] = 0.0f;
-	if (!Scene_TaaAssist())
-		return;
-	// R2: n / g and n / g^2 modulo 1, g the plastic number (the 2D analogue of the golden ratio). In
-	// double, so the offsets stay exact for any frame count; the first frame gets (0, 0).
-	const double a1 = 0.7548776662466927, a2 = 0.5698402909980532;
-	const double n = (double)S.taa.frame;
-	out[0] = (float)(n * a1 - floor(n * a1));
-	out[1] = (float)(n * a2 - floor(n * a2));
-}
-
 float Scene_NoiseOffset()
 {
 	if (!Scene_TaaAssist())

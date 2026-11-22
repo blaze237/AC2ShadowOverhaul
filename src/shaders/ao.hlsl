@@ -149,9 +149,8 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 	float3 N = tex2Dlod(s_Geo, float4((vpos + 0.5) * c_Half.zw, 0, 0)).xyz;
 
 	// Per-pixel rotation and step offset (interleaved gradient noise; the blur removes the pattern).
-	// c_Proj2.zw is added to them: 0 without TAA (the same pattern every frame, as the blur expects;
-	// frac(n + 0) = n, so nothing changes), an R2 sequence over the frames while TAA averages them
-	// (core::Scene_NoiseOffsets), so every pixel's slices and steps over time are evenly spread.
+	// c_Proj2.zw is added to them: always 0 now (the same pattern every frame, as the blur expects;
+	// frac(n + 0) = n). It was a per-frame R2 sequence while TAA ran: ao.cpp's top says why it isn't.
 	float noiseA = frac(frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715)))) + c_Proj2.z);
 	float noiseB = frac(frac(52.9829189 * frac(dot(vpos + float2(17.0, 31.0), float2(0.06711056, 0.00583715)))) + c_Proj2.w);
 
@@ -241,8 +240,8 @@ float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
 	return Blur(PIXEL(vposIn), kGauss2, 4);
 }
 
-// The narrow blur, used while TAA averages the frames (core::Scene_TaaAssist; the noise pattern then
-// changes every frame). On tests/ao_warp_test's scene, one frame of it is as close to what GTAO
+// The narrow blur, for a noise pattern that changes every frame. Not used any more (ao.cpp's top says
+// why); kept so shaders_gen.h matches this file. On tests/ao_warp_test's scene, one frame of it is as close to what GTAO
 // converges to as one frame of the sigma 2 blur (it leaves more noise but less spread), and 16
 // frames averaged are 30 % closer; the contact shadows' error is mostly the wide blur's spread of
 // their edge, which no averaging removes.
