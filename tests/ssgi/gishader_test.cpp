@@ -4,7 +4,9 @@
 //  2. with the GI texture black, every output is bit-identical to the original's;
 //  3. with the GI texture = g, every output equals the original's with albedo x g added to the lit
 //     colour at the combine (the interpreter injects it there), so fog etc. apply to it unchanged;
-//  4. the GI texture is read once, at (Q . c216, Q . c217) / (Q . c218) with Q = (oC1.x, vPos, 1).
+//  4. the GI texture is read once, at (Q . c216, Q . c217) / (Q . c218) with Q = (oC1.x, vPos, 1);
+//     with the z/w copy, with coord.z = (Q . c219) / (Q . c218) (1 / the view z the texel should
+//     hold), and its last level is read too and used instead when the texel's alpha isn't that z.
 // Built with WITH_OVERHAUL (tests/run_tests.sh does, with src/softshadows.cpp and src/litshader.cpp):
 //  - the same checks on the soft shadow + AO rewritten shaders (the AO outputs and the bounce light
 //    as two separate rewrites, one on top of the other);
@@ -122,7 +124,7 @@ static Result Check(const std::vector<DWORD>& code, std::vector<DWORD>* outCode 
 		R.text = "DISASSEMBLY FAILED";
 		return R;
 	}
-	int trials = 0, blackBad = 0, giBad = 0, uvBad = 0, readsBad = 0;
+	int trials = 0, blackBad = 0, giBad = 0, uvBad = 0, readsBad = 0, fallbackBad = 0;
 	float worst = 0;
 	std::string err;
 	for (int n = 0; n < 400 && trials < 150; n++)
@@ -151,7 +153,7 @@ static Result Check(const std::vector<DWORD>& code, std::vector<DWORD>* outCode 
 		}
 		if (!Same(a, b, true, worst))
 			blackBad++;
-		if (b.giReads != 1)
+		if (b.giReads != 1 || b.giCoarseReads != (L.depthExact ? 1 : 0))
 			readsBad++;
 		// 4. where the GI texture was read
 		float q[4] = { L.depthExact ? a.oC[1][0] : 1.0f, in.misc[0][0], in.misc[0][1], 1.0f };
@@ -165,11 +167,22 @@ static Result Check(const std::vector<DWORD>& code, std::vector<DWORD>* outCode 
 				if (!(fabsf(expect - got) <= 1e-4f * (1.0f + fabsf(expect))))
 					uvBad++;
 			}
+		if (L.depthExact && fabsf(h[2]) > 1e-2f)
+		{
+			const float* zr = in.c[GI_CONST + 3];
+			float expect = (q[0] * zr[0] + q[1] * zr[1] + q[2] * zr[2] + q[3] * zr[3]) / h[2];
+			if (!(fabsf(expect - b.giZ) <= 1e-4f * (1.0f + fabsf(expect))))
+				uvBad++;
+		}
 		// 3. GI = g: the original with albedo x g added at the combine.
 		Inputs g = in;
 		for (int k = 0; k < 3; k++)
+		{
 			g.gi[k] = Rand() * 2;
+			g.giCoarse[k] = Rand() * 2;
+		}
 		g.gi[3] = 1;
+		g.giDepth = 1;
 		Outputs gotG, expG;
 		Inputs inj = g;
 		inj.injectAt = L.combineAt;
@@ -183,14 +196,26 @@ static Result Check(const std::vector<DWORD>& code, std::vector<DWORD>* outCode 
 		}
 		if (!Same(expG, gotG, false, worst))
 			giBad++;
+		// 5. the texel shows another surface: the last level's light instead (with the z/w copy).
+		g.giDepth = 2;
+		if (L.depthExact)
+			memcpy(inj.gi, g.giCoarse, sizeof(inj.gi));
+		if (!Run(out, g, gotG, err) || !Run(code, inj, expG, err))
+		{
+			R.failed = true;
+			R.text = "interpreter (GI fallback): " + err;
+			return R;
+		}
+		if (!Same(expG, gotG, false, worst))
+			fallbackBad++;
 	}
 	char buf[256];
 	static const char* forms[] = { "sun*albedo + indirect", "ambient*albedo + sun", "sun + indirect" };
-	if (blackBad || giBad || uvBad || readsBad || !trials)
+	if (blackBad || giBad || uvBad || readsBad || fallbackBad || !trials)
 	{
 		R.failed = true;
-		snprintf(buf, sizeof(buf), "FAILED (%d trials: %d changed with black GI, %d wrong with GI (worst %g), %d wrong uv, %d bad read counts)",
-			trials, blackBad, giBad, worst, uvBad, readsBad);
+		snprintf(buf, sizeof(buf), "FAILED (%d trials: %d changed with black GI, %d wrong with GI (worst %g), %d wrong with the fallback, %d wrong uv, %d bad read counts)",
+			trials, blackBad, giBad, worst, fallbackBad, uvBad, readsBad);
 	}
 	else
 		snprintf(buf, sizeof(buf), "bounce light added (%s, albedo r%d%s, z/w %s), %d trials ok", forms[L.form], RegNum(L.albedo),
@@ -242,6 +267,7 @@ static std::string CheckReverse(const std::vector<DWORD>& giCode, bool expectAo,
 		Inputs ig = in;
 		for (int k = 0; k < 3; k++)
 			ig.gi[k] = Rand() * 2;
+		ig.giDepth = 1;
 		if (!Run(ao, ig, g, err))
 		{
 			failed = true;
@@ -333,6 +359,7 @@ static std::string CheckMerged(const std::vector<DWORD>& code, bool expectAo, bo
 		for (int k = 0; k < 3; k++)
 			g.gi[k] = Rand() * 2;
 		g.gi[3] = 1;
+		g.giDepth = 1;
 		Inputs inj = g;
 		inj.injectAt = LG.combineAt;
 		inj.injectAlb = LG.albedo;

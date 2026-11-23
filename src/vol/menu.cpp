@@ -24,6 +24,7 @@ enum
 	ITEM_ANISO,
 	ITEM_AMBIENT,
 	ITEM_SKY_OCCLUSION,
+	ITEM_SKY_FOG,
 	ITEM_NOISE,
 	ITEM_NOISE_SIZE,
 	ITEM_WIND_SPEED,
@@ -46,6 +47,7 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "Sun focus", "VolumetricFog", "Anisotropy", true },
 	{ "Sky light scattering", "VolumetricFog", "AmbientIntensity", true },
 	{ "Sky light blocked by cover", "VolumetricFog", "SkyOcclusion", true },
+	{ "Fog over the sky (horizon blend)", "VolumetricFog", "SkyFog", true },
 	{ "Fog noise (wisps)", "VolumetricFog", "NoiseAmount", true },
 	{ "Noise size", "VolumetricFog", "NoiseSize", true },
 	{ "Wind speed", "VolumetricFog", "WindSpeed", true },
@@ -111,6 +113,7 @@ protected:
 		case ITEM_ANISO: snprintf(buf, n, "%.2f", g_set.anisotropy); break;
 		case ITEM_AMBIENT: snprintf(buf, n, "%.2f", g_set.ambientIntensity); break;
 		case ITEM_SKY_OCCLUSION: snprintf(buf, n, "%.2f", g_set.skyOcclusion); break;
+		case ITEM_SKY_FOG: snprintf(buf, n, "%.2f", g_set.skyFog); break;
 		case ITEM_NOISE: snprintf(buf, n, "%.2f", g_set.noiseAmount); break;
 		case ITEM_NOISE_SIZE: snprintf(buf, n, "%.1f", g_set.noiseSize); break;
 		case ITEM_WIND_SPEED: snprintf(buf, n, "%.1f", g_set.windSpeed); break;
@@ -148,6 +151,7 @@ protected:
 		case ITEM_ANISO: snprintf(buf, n, "%.2f", g_set.anisotropy); break;
 		case ITEM_AMBIENT: snprintf(buf, n, "%.2f", g_set.ambientIntensity); break;
 		case ITEM_SKY_OCCLUSION: snprintf(buf, n, g_set.skyOcclusion > 0 ? "%.0f%%" : "OFF", g_set.skyOcclusion * 100.0f); break;
+		case ITEM_SKY_FOG: snprintf(buf, n, g_set.skyFog > 0 ? "%.0f%%" : "OFF (light only)", g_set.skyFog * 100.0f); break;
 		case ITEM_NOISE: snprintf(buf, n, g_set.noiseAmount > 0 ? "%.2f" : "OFF (smooth)", g_set.noiseAmount); break;
 		case ITEM_NOISE_SIZE: snprintf(buf, n, "%.1f m", g_set.noiseSize); break;
 		case ITEM_WIND_SPEED: snprintf(buf, n, "%.1f m/s", g_set.windSpeed); break;
@@ -186,6 +190,7 @@ protected:
 		case ITEM_ANISO: g_set.anisotropy = g_set.anisotropy + 0.05f * dir; break;
 		case ITEM_AMBIENT: g_set.ambientIntensity = g_set.ambientIntensity + 0.05f * dir; break;
 		case ITEM_SKY_OCCLUSION: g_set.skyOcclusion = roundf((g_set.skyOcclusion + 0.1f * dir) * 10.0f) / 10.0f; break;
+		case ITEM_SKY_FOG: g_set.skyFog = roundf((g_set.skyFog + 0.1f * dir) * 10.0f) / 10.0f; break;
 		case ITEM_NOISE: g_set.noiseAmount = roundf((g_set.noiseAmount + 0.1f * dir) * 10.0f) / 10.0f; break; // exactly 0 at the bottom
 		case ITEM_NOISE_SIZE: g_set.noiseSize = dir > 0 ? g_set.noiseSize * 1.25f : g_set.noiseSize / 1.25f; break;
 		case ITEM_WIND_SPEED: g_set.windSpeed = g_set.windSpeed + 0.5f * dir; break;

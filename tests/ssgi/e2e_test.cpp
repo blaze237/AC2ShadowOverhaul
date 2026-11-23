@@ -85,10 +85,11 @@ static std::vector<std::vector<DWORD>> LoadDump(const char* dir)
 // ---- Camera ------------------------------------------------------------------------------------
 
 static const UINT W = 1280, H = 720;
+static const double kA = 1779.0 / (1779.0 - 0.1), kB = -0.1 * 1779.0 / (1779.0 - 0.1); // z/w = A + B / z
 static Mat4 ViewProj(double ex, double ey, double ez)
 {
 	// Looking along +y (world z up), like the game's coordinate system. Rows: right, up, forward.
-	const double A = 1779.0 / (1779.0 - 0.1), B = -0.1 * 1779.0 / (1779.0 - 0.1), p00 = 1.317, p11 = 1.317 * W / H;
+	const double A = kA, B = kB, p00 = 1.317, p11 = 1.317 * W / H;
 	Mat4 V = { { { 1, 0, 0, -ex }, { 0, 0, 1, -ez }, { 0, 1, 0, -ey }, { 0, 0, 0, 1 } } };
 	Mat4 P = { { { p00, 0, 0, 0 }, { 0, p11, 0, 0 }, { 0, 0, A, B }, { 0, 0, 1, 0 } } };
 	return Mul(P, V);
@@ -194,7 +195,7 @@ int main(int argc, char** argv)
 		int up;                         // every fullscreen pass (ours and the other effects')
 		E2EPassCount fx;                // the passes per effect
 		UINT opaqueS13;                 // width of the texture at s13 during the opaque pass (1 = black)
-		float rows[3][4];
+		float rows[4][4];
 		IDirect3DSurface9 *skyRt0, *skyRt1;
 		UINT skyFreq1;
 		UINT postS13;
@@ -262,7 +263,7 @@ int main(int argc, char** argv)
 		r.sharedFirst = !r.fx.n[FX_SHARED] || (shared < firstAo && shared < firstOurs);
 		return r;
 	};
-	const int ours = 5;              // radiance, trace, temporal, blur x2
+	const int ours = 6;              // radiance, trace, temporal, blur x2, the GI texture's last level
 	const int ao = all ? 4 : 0;      // GTAO, blur x2, composite
 	// Our passes, and everything else: alone, nothing else draws; with every effect on, the AO
 	// passes run too, before ours. Either way the geometry prep shared with AO runs once, first
@@ -303,6 +304,14 @@ int main(int argc, char** argv)
 	CHECK(f1.opaqueS13 == (W + 1) / 2, "frame 2: s13 should be the GI texture, is %u wide", f1.opaqueS13);
 	CHECK(f1.shadingNormals, "frame 2: the geometry prep didn't use the opaque pass's shading normals%s", all ? "" : " (SSGI alone)");
 	CHECK(worst < 1e-3f, "frame 2: c216-c218 don't hold the reprojection rows");
+	{
+		// c219: (z/w, x, y, 1) -> 1 / view z, for the shaders' depth check.
+		const float zRow[4] = { (float)(1.0 / kB), 0, 0, (float)(-kA / kB) };
+		float zWorst = 0;
+		for (int c = 0; c < 4; c++)
+			zWorst = fmaxf(zWorst, fabsf(f1.rows[3][c] - zRow[c]) / (1e-3f + fabsf(zRow[c])));
+		CHECK(zWorst < 1e-4f, "frame 2: c219 doesn't hold 1 / view z (off by %.2g)", zWorst);
+	}
 	CHECK(f1.postS13 != (W + 1) / 2, "frame 2: the GI texture stays bound outside the scene colour");
 	CHECK(f1.skyRt0 == colour && f1.skyRt1 == nullptr && f1.skyFreq1 == (D3DSTREAMSOURCE_INSTANCEDATA | 1), "frame 2: state not restored");
 

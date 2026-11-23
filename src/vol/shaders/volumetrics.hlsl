@@ -46,7 +46,8 @@ float4 c_Medium   : register(c24); // density at and below the base height (1/m;
                                    //   noise offset (added to the step noise: 0 without TAA, see PS_FogMarch)
 float4 c_Blur     : register(c25); // blur direction (fog-res pixels)
 float4 c_Shafts   : register(c26); // sun position (screen uv), step (share of the way to the sun), decay per step
-float4 c_Shafts2  : register(c27); // sky brightness threshold, sun falloff exponent
+float4 c_Shafts2  : register(c27); // sky brightness threshold, sun falloff exponent, sky fog (0..1: how much the fog
+                                   //   dims the sky like the scene; 0 = never, the sky only gains the fog's light)
 float4 c_ShaftCol : register(c28); // shaft colour (sun colour x strength x fade), w = 1: shafts on
 float4 c_ShRes    : register(c29); // shafts-res width, height, 1/width, 1/height
 float4 c_Noise    : register(c30); // noise volume uvw at the camera (wrapped, the wind's drift included), amount (0 = no noise)
@@ -305,11 +306,21 @@ float4 PS_Composite(VPOS_T vposIn : VPOS) : COLOR
 			wsum += w;
 		}
 		fog = sum / wsum;
-		// The sky keeps its full brightness: the game's sky already has its haze, and dimming it would
-		// dim the HDR sun too - and with it the game's bloom, which is a plain blur of the scene.
-		// The air in front of it still adds its light.
+		// The sky. Seen through the fog like the scene (scene x T + light), the sky low over the horizon
+		// fades to the fog's colour just as the hills and rooftops in front of it do, so they meet
+		// without a seam; rays further up leave the fog within metres and barely change. With the
+		// sky only gaining the fog's light (c_Shafts2.z = 0), a low ray through thick fog brightens
+		// the sky while the distant scene next to it is pulled towards the fog colour - a band
+		// brighter or darker than the sky along every skyline.
+		// The sun and the sky right around it keep their full brightness: dimming the HDR sun would
+		// dim the game's bloom with it (a plain blur of the scene) - the fog's forward scattering
+		// already brightens the air towards it. Fully kept within 2 degrees, fading out by 8.
 		if (FetchD(p) >= c_Proj2.w)
-			fog.a = 1.0;
+		{
+			float towardsSun = dot(WorldDir(ViewRay(p)), c_SunDir.xyz);
+			float keep = smoothstep(0.99027, 0.99939, towardsSun); // cos 8, cos 2 degrees
+			fog.a = lerp(1.0, fog.a, c_Shafts2.z * (1.0 - keep));
+		}
 	}
 	float3 shafts = 0;
 	if (c_ShaftCol.w > 0.0)

@@ -609,6 +609,7 @@ struct Settings
 	float noise = 0;        // c_Medium.w: the per-frame noise offset (0 without TAA)
 	bool narrowBlur = false; // a narrower fog blur (sigma 1), measured against the mod's with TAA (not used by the mod)
 	float skyOcc = 0;        // [VolumetricFog] SkyOcclusion (0 here, so the checks above see the fog as it was)
+	float skyFog = 0;        // [VolumetricFog] SkyFog (0 here: the sky only gains the fog's light, as the checks above expect)
 	float noiseAmount = 0, noiseSize = 15.0f, windSpeed = 1.5f, windDir = 30.0f; // [VolumetricFog] Noise*, Wind*
 	double time = 0;         // seconds on the plugin's clock
 	float noiseLodBias = 0.5f; // the plugin's extra half mip level (-20: always the finest level)
@@ -668,7 +669,7 @@ static Outputs RunView(const Settings& s, bool reuseScene = false)
 	set4(22, kSunCol.x * s.sun, kSunCol.y * s.sun, kSunCol.z * s.sun, 0);
 	set4(23, kFogCol.x * s.ambient, kFogCol.y * s.ambient, kFogCol.z * s.ambient, 0);
 	set4(24, s.density, s.falloff, s.base, s.noise);
-	set4(27, s.shaftThreshold, 12.0f, 0, 0);
+	set4(27, s.shaftThreshold, 12.0f, s.skyFog, 0);
 	set4(29, (float)SW, (float)SH, 1.0f / SW, 1.0f / SH);
 	// Sky occlusion and noise, as vol::Apply sets them.
 	if (s.shadows && g_sun.z > 0)
@@ -1100,6 +1101,48 @@ int main(int argc, char** argv)
 						dimmed++;
 			}
 		Check(skyPx > 0 && dimmed == 0, "sun: sky and sun keep their full brightness", dimmed, skyPx);
+
+		// SkyFog 1: the sky is seen through the fog like the scene (scene x T + light), except the sun
+		// and the sky within 2 degrees of it, which keep their full brightness.
+		Settings sf = s;
+		sf.skyFog = 1.0f;
+		sf.shafts = false; // the checks below leave the shafts out
+		Outputs skyFog = RunView(sf, true);
+		WritePngRgb("warp_sun_composite_skyfog.png", skyFog.composite, W, H);
+		Check(!AnyNan(skyFog.composite), "sky fog: no NaN / Inf");
+		int nearDimmed = 0, nearPx = 0, bad = 0, checked = 0, brighter = 0;
+		for (UINT y = 0; y < H; y++)
+			for (UINT x = 0; x < W; x++)
+			{
+				size_t p = (size_t)y * W + x;
+				if (skyFog.depth[p] < 1.0f)
+					continue;
+				float towardsSun = Dot(PixelDir((float)x, (float)y), g_sun);
+				for (int k = 0; k < 3; k++)
+				{
+					float out = skyFog.composite[p * 4 + k], in = skyFog.scene[p * 4 + k], old = sun.composite[p * 4 + k];
+					if (out > old * 1.0001f + 1e-4f)
+						brighter++; // only ever darker than (or as bright as) without SkyFog
+					if (towardsSun > 0.99939f)
+					{
+						nearPx++;
+						if (out < in * 0.9999f)
+							nearDimmed++;
+					}
+				}
+				// Away from the sun (past 8 degrees), on flat sky: scene x T + light, from the nearest fog-res pixel.
+				if (towardsSun < 0.99f && x % 5 == 0 && y % 5 == 0)
+				{
+					size_t li = ((size_t)(y / DIV) * LW + x / DIV) * 4;
+					float expect = skyFog.scene[p * 4 + 1] * skyFog.fog[li + 3] + skyFog.fog[li + 1];
+					checked++;
+					if (fabsf(skyFog.composite[p * 4 + 1] - expect) > 0.03f)
+						bad++;
+				}
+			}
+		Check(nearPx > 0 && nearDimmed == 0, "sky fog: the sun and the sky within 2 degrees keep their full brightness", nearDimmed, nearPx);
+		Check(brighter == 0, "sky fog: the sky only ever loses light to it", brighter, 0);
+		Check(checked > 0 && bad < checked / 20 + 1, "sky fog: sky away from the sun = scene x transmittance + scattered light", bad, checked);
 	}
 
 	// ---- Street view again with the cascades stretched as the shipped ini does (distance and splits

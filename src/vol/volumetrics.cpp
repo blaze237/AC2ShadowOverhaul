@@ -28,6 +28,7 @@
 #include "core/scene.h"
 #include "core/fxpass.h"
 #include "core/shaderinfo.h"
+#include "core/gputimer.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -52,6 +53,7 @@ void Vol_ClampSettings()
 	g_set.anisotropy = Clampf(g_set.anisotropy, 0.0f, 0.9f);
 	g_set.ambientIntensity = Clampf(g_set.ambientIntensity, 0.0f, 10.0f);
 	g_set.skyOcclusion = Clampf(g_set.skyOcclusion, 0.0f, 1.0f);
+	g_set.skyFog = Clampf(g_set.skyFog, 0.0f, 1.0f);
 	g_set.noiseAmount = Clampf(g_set.noiseAmount, 0.0f, 1.0f);
 	g_set.noiseSize = Clampf(g_set.noiseSize, 2.0f, 200.0f);
 	g_set.windSpeed = Clampf(g_set.windSpeed, 0.0f, 20.0f);
@@ -80,6 +82,7 @@ void Vol_LoadSettings()
 	g_set.anisotropy = IniFloat(F, "Anisotropy", g_set.anisotropy);
 	g_set.ambientIntensity = IniFloat(F, "AmbientIntensity", g_set.ambientIntensity);
 	g_set.skyOcclusion = IniFloat(F, "SkyOcclusion", g_set.skyOcclusion);
+	g_set.skyFog = IniFloat(F, "SkyFog", g_set.skyFog);
 	g_set.noiseAmount = IniFloat(F, "NoiseAmount", g_set.noiseAmount);
 	g_set.noiseSize = IniFloat(F, "NoiseSize", g_set.noiseSize);
 	g_set.windSpeed = IniFloat(F, "WindSpeed", g_set.windSpeed);
@@ -114,10 +117,10 @@ bool Vol_Init()
 		return false;
 	}
 	LogInfo("Volumetric fog: %s (density %.4f/m, height falloff %.3f/m above %.1f m, sun %.2f, g %.2f, ambient %.2f, sky occlusion %.2f, "
-			"%.0f m, %d steps at 1/%d resolution, %s; noise %.2f, %.0f m, wind %.1f m/s towards %.0f deg).",
+			"sky fog %.2f, %.0f m, %d steps at 1/%d resolution, %s; noise %.2f, %.0f m, wind %.1f m/s towards %.0f deg).",
 		!g_set.fogConfigured ? "disabled" : g_set.fogOn ? "on" : "starting off", (double)g_set.density, (double)g_set.heightFalloff,
 		(double)g_set.baseHeight, (double)g_set.sunIntensity, (double)g_set.anisotropy, (double)g_set.ambientIntensity,
-		(double)g_set.skyOcclusion, (double)g_set.maxDistance, g_set.steps, g_set.resolution,
+		(double)g_set.skyOcclusion, (double)g_set.skyFog, (double)g_set.maxDistance, g_set.steps, g_set.resolution,
 		g_set.placement ? "after transparents" : "before transparents", (double)g_set.noiseAmount, (double)g_set.noiseSize,
 		(double)g_set.windSpeed, (double)g_set.windDirection);
 	LogInfo("Sun shafts: %s (intensity %.2f, length %.2f, threshold %.2f, sun falloff %.1f, decay %.3f).",
@@ -746,6 +749,7 @@ static void Apply(IDirect3DDevice9* dev)
 	const bool shafts = (g_set.shaftsOn || g_set.view == 3) && shaftFade > 0.0f && sceneTex;
 
 	g_state.Save(dev);
+	core::GpuTimer_Begin(dev, core::GT_VOL);
 	g_state.BeginPasses(dev, g_decl, g_vs);
 	dev->SetRenderState(D3DRS_MULTISAMPLEANTIALIAS, FALSE);
 	Sampler(dev, 0, D3DTEXF_POINT, D3DTADDRESS_CLAMP);  // depth
@@ -833,7 +837,7 @@ static void Apply(IDirect3DDevice9* dev)
 	// w: added to the step noise (0 unless TAA averages frames)
 	set4(24, fog ? fmaxf(g_set.density, 1e-7f) : 0.0f, g_set.heightFalloff, g_set.baseHeight, core::Scene_NoiseOffset());
 	set4(26, sunUv[0], sunUv[1], 0, 0);
-	set4(27, g_set.shaftsThreshold, g_set.shaftsFalloff, 0, 0);
+	set4(27, g_set.shaftsThreshold, g_set.shaftsFalloff, g_set.skyFog, 0);
 	const float shaftI = g_set.shaftsIntensity * shaftFade;
 	if (shafts)
 		set4(28, F.sunCol[0] * shaftI, F.sunCol[1] * shaftI, F.sunCol[2] * shaftI, 1);
@@ -903,6 +907,7 @@ static void Apply(IDirect3DDevice9* dev)
 	D.SetPixelShader(dev, g_psComposite);
 	core::DrawFullscreen(dev);
 
+	core::GpuTimer_End(core::GT_VOL);
 	g_state.Restore(dev);
 	depthTex->Release();
 	Rel(sceneTex);

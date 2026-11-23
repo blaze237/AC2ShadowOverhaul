@@ -1,5 +1,5 @@
-// The in-game menus: one engine for the four (shadows & AO F9, SSGI F3, TAA F1, volumetrics F11),
-// each an item table plus callbacks.
+// The in-game menus: one engine for the five (shadows & AO F9, SSGI F3, TAA F1, volumetrics F11,
+// motion blur F6), each an item table plus callbacks.
 //
 // A menu's key ([Menu] ...MenuKey) shows / hides it in the top-right corner of the screen. While
 // shown: Up / Down or the number keys 1-9, 0 select an item (drawn in red), Left / Right change it
@@ -29,6 +29,7 @@ enum MenuId
 	MENU_SSGI,
 	MENU_TAA,
 	MENU_VOLUMETRICS,
+	MENU_MOTIONBLUR,
 };
 // A key is held and the game window has focus (the test hooks apply). Used by the all-effects key.
 bool MenuKeyHeld(int vk);
@@ -146,7 +147,7 @@ private:
 	DWORD m_heldSince = 0, m_lastRepeat = 0;
 };
 
-// The menus' font (all four share it) across a device reset.
+// The menus' font (all of them share it) across a device reset.
 void Menu_OnLostDevice();
 void Menu_OnResetDevice();
 

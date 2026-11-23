@@ -21,7 +21,10 @@
 //                          the pixel
 //  PS_Blur     (half res)  depth- and normal-aware blur, one direction per pass, wider where fewer
 //                          frames are accumulated; the second pass applies the intensity and writes
-//                          the texture the game's shaders read
+//                          the texture the game's shaders read (alpha: the view z of each texel, so
+//                          they can check that the texel shows the surface they shade)
+//  PS_Coarse   (1/8 of half res)  that texture's last mip level: the mean light of each 8x8 block,
+//                          sky left out, nearer texels counting less; read where the depth check fails
 //  PS_Debug    (full res)  debug views drawn over the scene colour
 //
 // Result: irradiance-like light colour E such that a surface of albedo a gets a * E added. A surface
@@ -44,7 +47,8 @@ float4 c_Blur     : register(c10); // direction (half-res texels per tap), 1 = l
 float4 c_GiRow0   : register(c11); // (z/w, x, y, 1) of a full-res pixel -> u * w in the GI texture the game's shaders read this frame
 float4 c_GiRow1   : register(c12); //                                     -> v * w
 float4 c_GiRow2   : register(c13); //                                     -> w
-float4 c_Feedback : register(c14); // share of that bounce taken out of the radiance, history clip (sigmas, 0 = off), 0, 0
+float4 c_Feedback : register(c14); // share of that bounce taken out of the radiance, history clip (sigmas, 0 = off),
+                                   // depth tolerance of the GI texture (relative), its last mip level
 
 sampler2D s_Colour  : register(s1); // Radiance: game scene colour (linear)
 sampler2D s_Geo     : register(s0); // Trace/Temporal/Blur: the shared geometry prep (normal, z; z = 0: sky) (point)
@@ -53,7 +57,7 @@ sampler2D s_Raw     : register(s1); // Temporal: trace output (point)
 sampler2D s_Hist    : register(s2); // Temporal: last frame's history (point)
 sampler2D s_Gi      : register(s2); // Radiance: the GI texture the game's shaders read this frame (linear)
 sampler2D s_PrevGeo : register(s3); // Temporal: last frame's geometry prep (point)
-sampler2D s_Src     : register(s1); // Blur: input (point)
+sampler2D s_Src     : register(s1); // Blur, Coarse: input (point)
 sampler2D s_Out     : register(s1); // Debug: a half-res result (linear)
 sampler2D s_Normals : register(s2); // Debug: the geometry prep (point)
 
@@ -119,7 +123,17 @@ float4 PS_Radiance(VPOS_T vposIn : VPOS) : COLOR
 	{
 		float4 q = float4(c_Proj.x + c_Proj.y / z, px + 0.5, 1.0);
 		float3 h = float3(dot(q, c_GiRow0), dot(q, c_GiRow1), dot(q, c_GiRow2));
-		float3 g = h.z > 0 ? max(tex2Dlod(s_Gi, float4(h.xy / h.z, 0, 0)).rgb, 0) : 0;
+		float3 g = 0;
+		if (h.z > 0)
+		{
+			// What the game's shader read here: the texel, or the last level where the texel's view z
+			// isn't this surface's (the same check as theirs, src/litshader.cpp).
+			float2 guv = h.xy / h.z;
+			float4 t = tex2Dlod(s_Gi, float4(guv, 0, 0));
+			if (abs(t.a / (h.z * z) - 1.0) >= c_Feedback.z)
+				t = tex2Dlod(s_Gi, float4(guv, 0, c_Feedback.w));
+			g = max(t.rgb, 0);
+		}
 		rad -= c_Feedback.x * min(rad, g);
 	}
 	return float4(min(rad, c_Proj2.w), 1);
@@ -394,8 +408,29 @@ float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
 	}
 	float3 r = sum / wsum;
 	if (c_Blur.z > 0.5)
-		return float4(r * c_Trace2.z, 1);
+		return float4(r * c_Trace2.z, geo.w);
 	return float4(r, centre.a);
+}
+
+// ---- The GI texture's last mip level (1/8 of half res) -----------------------------------------
+// The game's shaders read it where the reprojected texel shows another surface: a surface just
+// uncovered (what was behind the player a frame ago, when the camera turns around him), or one that
+// moves with the camera. Mean of the 8x8 texels it covers, without the sky, each weighted by its view
+// z: an uncovered surface is always the farther one, so the near object that hid it counts less.
+
+float4 PS_Coarse(VPOS_T vposIn : VPOS) : COLOR
+{
+	float2 base = PIXEL(vposIn) * 8.0;
+	float4 sum = 0;
+	[loop] for (float y = 0; y < 8; y++)
+	{
+		[unroll] for (int x = 0; x < 8; x++)
+		{
+			float4 t = tex2Dlod(s_Src, float4(HalfUv(base + float2(x, y)), 0, 0));
+			sum += float4(t.rgb, 1) * t.a;
+		}
+	}
+	return sum.a > 0 ? float4(sum.rgb / sum.a, 0) : 0;
 }
 
 // ---- Debug views (full res, over the scene colour) ---------------------------------------------

@@ -152,10 +152,10 @@ void SetSamplerClamp(IDirect3DDevice9* dev, DWORD s, D3DTEXTUREFILTERTYPE filter
 
 // ---- RenderTarget --------------------------------------------------------------------------------
 
-HRESULT RenderTarget::Create(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt)
+HRESULT RenderTarget::Create(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt, UINT levels)
 {
 	Release();
-	HRESULT hr = g_fns.CreateTexture(dev, w, h, 1, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &tex, NULL);
+	HRESULT hr = g_fns.CreateTexture(dev, w, h, levels, D3DUSAGE_RENDERTARGET, fmt, D3DPOOL_DEFAULT, &tex, NULL);
 	if (SUCCEEDED(hr) && !tex)
 		hr = E_FAIL;
 	if (SUCCEEDED(hr))

@@ -3,7 +3,7 @@
 // scripts\AC2ShadowOverhaul.asi, built by the top-level build.sh, with an ini written here.
 //
 //  - E2E_WriteIni: the shipped AC2ShadowOverhaul.ini with logging on, every menu hidden at start, the
-//    frame dump off, and each effect group switched on or off ([...] Enabled).
+//    frame dump off, and each effect group switched on or off ([...] Enabled; motion blur too).
 //  - E2E_LoadPlugin: loads the .asi like Ultimate ASI Loader and fakes its keyboard and focus (the
 //    menus poll GetAsyncKeyState at Present; set g_keys) and hides D3DXCreateFontA from it (the mock
 //    device can't back a D3DX font, so the menus and the MSAA warning draw nothing but still log).
@@ -22,6 +22,7 @@
 #include "ssgi/shaders_gen.h"
 #include "vol/shaders_gen.h"
 #include "taa/shaders_gen.h"
+#include "mb/shaders_gen.h"
 
 // ---- The ini -------------------------------------------------------------------------------------
 
@@ -35,10 +36,11 @@ struct E2EEffects
 	bool ssgi = false; // [SSGI]
 	bool vol = false;  // [VolumetricFog] and [SunShafts]
 	bool taa = false;  // [TAA]
+	bool mb = false;   // [MotionBlur]
 	static E2EEffects All()
 	{
 		E2EEffects e;
-		e.ao = e.ssgi = e.vol = e.taa = true;
+		e.ao = e.ssgi = e.vol = e.taa = e.mb = true;
 		return e;
 	}
 };
@@ -70,6 +72,10 @@ static bool E2E_WriteIni(const E2EEffects& on)
 	set("VolumetricFog", "Enabled", onOff(on.vol));
 	set("SunShafts", "Enabled", onOff(on.vol));
 	set("TAA", "Enabled", onOff(on.taa));
+	set("MotionBlur", "Enabled", onOff(on.mb));
+	// The cameras move in the tests, and the other effects' frame checks don't expect blur passes;
+	// tests/mb switches it back on.
+	set("MotionBlur", "StartEnabled", "0");
 	set("Debug", "EnableLogging", "1");
 	set("Debug", "FrameDump", "0");
 	set("Debug", "FrameDumpKey", "0");
@@ -183,9 +189,10 @@ enum E2EEffect
 	FX_SSGI,
 	FX_VOL,
 	FX_TAA,
+	FX_MB,
 	FX_COUNT
 };
-static const char* const kE2EEffectNames[FX_COUNT] = { "game", "shared", "AO", "SSGI", "volumetrics", "TAA" };
+static const char* const kE2EEffectNames[FX_COUNT] = { "game", "shared", "AO", "SSGI", "volumetrics", "TAA", "motion blur" };
 
 struct E2EShader
 {
@@ -205,6 +212,7 @@ static const E2EShader kE2EShaders[] = {
 	{ ssgi::kGiTracePs, sizeof(ssgi::kGiTracePs), FX_SSGI, "gi-trace" },
 	{ ssgi::kGiTemporalPs, sizeof(ssgi::kGiTemporalPs), FX_SSGI, "gi-temporal" },
 	{ ssgi::kGiBlurPs, sizeof(ssgi::kGiBlurPs), FX_SSGI, "gi-blur" },
+	{ ssgi::kGiCoarsePs, sizeof(ssgi::kGiCoarsePs), FX_SSGI, "gi-coarse" },
 	{ ssgi::kGiDebugPs, sizeof(ssgi::kGiDebugPs), FX_SSGI, "gi-debug" },
 	{ vol::kVolFogMarchPs, sizeof(vol::kVolFogMarchPs), FX_VOL, "march" },
 	{ vol::kVolFogBlurPs, sizeof(vol::kVolFogBlurPs), FX_VOL, "blur" },
@@ -213,6 +221,10 @@ static const E2EShader kE2EShaders[] = {
 	{ vol::kVolCompositePs, sizeof(vol::kVolCompositePs), FX_VOL, "composite" },
 	{ taa::kTaaResolvePs, sizeof(taa::kTaaResolvePs), FX_TAA, "taa-resolve" },
 	{ taa::kTaaOutputPs, sizeof(taa::kTaaOutputPs), FX_TAA, "taa-output" },
+	{ mb::kMbPrepPs, sizeof(mb::kMbPrepPs), FX_MB, "mb-prep" },
+	{ mb::kMbTileMaxPs, sizeof(mb::kMbTileMaxPs), FX_MB, "mb-tilemax" },
+	{ mb::kMbNeighborMaxPs, sizeof(mb::kMbNeighborMaxPs), FX_MB, "mb-neighbormax" },
+	{ mb::kMbReconstructPs, sizeof(mb::kMbReconstructPs), FX_MB, "mb-reconstruct" },
 };
 
 static const E2EShader* E2E_Shader(const MockDraw& d)
@@ -239,7 +251,7 @@ static const char* E2E_PassName(const MockDraw& d)
 struct E2EPassCount
 {
 	int n[FX_COUNT] = {};
-	int Effects() const { return n[FX_SHARED] + n[FX_AO] + n[FX_SSGI] + n[FX_VOL] + n[FX_TAA]; }
+	int Effects() const { return n[FX_SHARED] + n[FX_AO] + n[FX_SSGI] + n[FX_VOL] + n[FX_TAA] + n[FX_MB]; }
 };
 static E2EPassCount E2E_CountPasses(const MockLog* log, size_t from, size_t to)
 {

@@ -419,9 +419,9 @@ int main(int argc, char** argv)
 			"the geometry prep AO and SSGI share runs once, before both");
 		Check(others[FX_AO].size() == 4 && within(others[FX_AO], lastOpaque, sky),
 			"ambient occlusion (4 passes) runs after the opaque pass and before the sky");
-		Check(others[FX_SSGI].size() == 5 && within(others[FX_SSGI], lastOpaque, sky) && !others[FX_AO].empty() &&
+		Check(others[FX_SSGI].size() == 6 && within(others[FX_SSGI], lastOpaque, sky) && !others[FX_AO].empty() &&
 				others[FX_SSGI].front() > others[FX_AO].back(),
-			"SSGI (5 passes) runs after the ambient occlusion and before the sky");
+			"SSGI (6 passes) runs after the ambient occlusion and before the sky");
 		Check(!ours.empty() && within(others[FX_TAA], ours.back(), post),
 			"the TAA resolve runs after ours, before the post-processing reads the scene");
 	}

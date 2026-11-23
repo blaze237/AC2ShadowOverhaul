@@ -8,6 +8,7 @@
 #include "softshadows.h"
 #include "ao.h"
 #include "core/menu.h"
+#include "core/gputimer.h"
 #include <d3d9.h>
 #include <stdio.h>
 
@@ -32,6 +33,7 @@ enum
 	ITEM_CH_MIN,
 	ITEM_CH_MAX,
 	ITEM_ALL_ON,     // master switch for every effect; not saved
+	ITEM_FRAME_TIMES, // the GPU frame times list of every effect (core/gputimer.h)
 	ITEM_FRAME_DUMP, // writes a frame dump ([Debug] FrameDump=1 only); not a setting
 	ITEM_COUNT
 };
@@ -52,6 +54,7 @@ const core::MenuItem kItems[ITEM_COUNT] = {
 	{ "Hardening min width", "SoftShadows", "MinWidth", true },
 	{ "Hardening max width", "SoftShadows", "MaxWidth", true },
 	{ "All shadow effects", nullptr, nullptr, true },
+	{ "Frame times", "Debug", "ShowFrameTimes", true },
 	{ "Frame dump", nullptr, nullptr, false },
 };
 const core::MenuDef kDef = { core::MENU_SHADOWS, "AC2 Shadow Overhaul - Shadows & AO", "Shadow menu", "MenuKey", VK_F9, kItems, ITEM_COUNT,
@@ -158,6 +161,9 @@ protected:
 		case ITEM_CH_MAX:
 			snprintf(buf, n, "%.2f", SoftShadows_Pcss().maxWidth);
 			break;
+		case ITEM_FRAME_TIMES:
+			snprintf(buf, n, "%d", core::GpuTimer_On() ? 1 : 0);
+			break;
 		default:
 			buf[0] = 0;
 			break;
@@ -224,6 +230,9 @@ protected:
 			break;
 		case ITEM_ALL_ON:
 			snprintf(buf, n, "%s", g_allOn ? "ON" : "OFF (vanilla)");
+			break;
+		case ITEM_FRAME_TIMES:
+			snprintf(buf, n, "%s", core::GpuTimer_On() ? "SHOWN (top left)" : "hidden");
 			break;
 		default:
 			snprintf(buf, n, "%s", FrameDump_Busy() ? "writing..." : "Right writes one");
@@ -304,6 +313,9 @@ protected:
 		}
 		case ITEM_ALL_ON:
 			SetAllOn(dir > 0);
+			return true;
+		case ITEM_FRAME_TIMES:
+			core::GpuTimer_SetOn(dir > 0);
 			return true;
 		default: // frame dump: Right writes one (not a setting, nothing to log or save)
 			if (dir > 0)

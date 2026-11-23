@@ -1,6 +1,6 @@
 // In-game menu: live tuning of the SSGI settings ([Menu] SSGIMenuKey, default F3). A status line
-// shows whether the passes are running and what they cost on the GPU (measured only while the menu
-// is shown). The keys, drawing and saving are the shared menu engine's (core/menu.h).
+// shows whether the passes are running (their GPU cost is in the F9 menu's "Frame times" list). The
+// keys, drawing and saving are the shared menu engine's (core/menu.h).
 
 #include "common.h"
 #include "gi.h"
@@ -97,7 +97,7 @@ protected:
 		return true;
 	}
 
-	// "tracing 960x540, GPU 0.42 ms" / why not.
+	// "tracing 960x540" / why not.
 	bool Status(char* buf, size_t n) override
 	{
 		static unsigned lastFrames = 0;
@@ -116,15 +116,10 @@ protected:
 			snprintf(buf, n, "FAILED: could not create its textures (see AC2ShadowOverhaul.log)");
 		else if (!running)
 			snprintf(buf, n, "not running: no opaque pass seen (in-game anti-aliasing on? menus?)");
-		else if (st.gpuMs >= 0)
-			snprintf(buf, n, "tracing %ux%u, GPU %.2f ms", st.traceW, st.traceH, (double)st.gpuMs);
 		else
 			snprintf(buf, n, "tracing %ux%u", st.traceW, st.traceH);
 		return true;
 	}
-
-	// The GPU time is measured only while the menu is shown.
-	void OnVisibleChanged(bool visible) override { GI_SetTiming(visible); }
 };
 
 SsgiMenu g_menu;
@@ -135,12 +130,6 @@ void Menu_OnPresent(IDirect3DDevice9* dev) { g_menu.OnPresent(dev); }
 
 void Menu_Flush() { g_menu.Flush(); }
 
-bool Menu_Init()
-{
-	if (!g_menu.Init())
-		return false;
-	GI_SetTiming(false);
-	return true;
-}
+bool Menu_Init() { return g_menu.Init(); }
 
 } // namespace ssgi

@@ -24,6 +24,9 @@
 #   - the vertex shader jitter rewrite (synthetic shaders, and the game's own (*)); the TAA shaders on
 #     WARP; the menu's keys and ini saving
 #   - end to end: TAA alone, then with every effect on
+#  Motion blur (tests/mb/)
+#   - the passes on WARP (a still camera, a sideways move, near and far, the length limit)
+#   - end to end: alone, with TAA, and switched off; a still camera, a cut, a Reset, the F12 key
 #  Everything at once (combined_test.cpp, combined/)
 #   - the frame order of all effects, one menu open at a time, MSAA, refusal next to an old plugin
 #   - the effects with TAA: the jitter they get is the game's c255, their noise offsets move only while
@@ -51,7 +54,7 @@ FLAGS="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEA
 SUB="-O2 -std=c++17 -Wall -Wno-unused-function -DNOMINMAX -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS -fms-extensions -fasm-blocks -I.. -I../../src -fuse-ld=lld -static"
 TESTS="$(pwd)"
 # The shared core, for tests that link an effect's code (paths from a suite's folder).
-CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp ../../src/core/menu.cpp ../../src/core/fxpass.cpp ../../src/core/geoprep.cpp"
+CORE="../../src/core/shaderinfo.cpp ../../src/core/camera.cpp ../../src/core/scene.cpp ../../src/core/menu.cpp ../../src/core/fxpass.cpp ../../src/core/geoprep.cpp ../../src/core/gputimer.cpp"
 OUT="$TESTS/run_tests.out"
 
 # A Windows path for a folder (the tests are Windows programs), or "" if it doesn't exist.
@@ -214,6 +217,20 @@ if build "TAA end to end" $CXX $SUB -o e2e_test.exe e2e_test.cpp -ld3d9; then
 	mv e2e_test.exe e2e/AssassinsCreedIIGame.exe
 	run "TAA: end to end, alone" e2e -- ./AssassinsCreedIIGame.exe
 	run "TAA: end to end, every effect on" e2e -- ./AssassinsCreedIIGame.exe all
+fi
+cd ..
+
+# ---- Motion blur -----------------------------------------------------------------------------------
+
+cd mb
+build "motion blur WARP test" $CXX $SUB -o warp_test.exe warp_test.cpp ../../src/core/camera.cpp -ld3d11 &&
+	run "motion blur: shaders on WARP" . -- ./warp_test.exe
+if build "motion blur end to end" $CXX $SUB -o e2e_test.exe e2e_test.cpp -ld3d9; then
+	(cd .. && e2e_dir mb/e2e)
+	mv e2e_test.exe e2e/AssassinsCreedIIGame.exe
+	run "motion blur: end to end, alone" e2e -- ./AssassinsCreedIIGame.exe
+	run "motion blur: end to end, with TAA" e2e -- ./AssassinsCreedIIGame.exe taa
+	run "motion blur: end to end, switched off" e2e -- ./AssassinsCreedIIGame.exe off
 fi
 cd ..
 

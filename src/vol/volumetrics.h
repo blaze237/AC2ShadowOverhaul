@@ -34,6 +34,7 @@ struct VolSettings
 	volatile float anisotropy = 0.45f;     // Henyey-Greenstein g: 0 = even, towards 1 = mostly towards the sun
 	volatile float ambientIntensity = 0.25f; // sky light scattered (the game's fog colour)
 	volatile float skyOcclusion = 0.8f;    // 0..1: how much cover overhead (from the shadow map) takes the sky light away
+	volatile float skyFog = 1.0f;          // 0..1: how much the fog dims the sky like the scene (0 = the sky only gains its light)
 	volatile float noiseAmount = 0.5f;     // 0..1: density x (1 +- amount) from drifting 3D noise; 0 = smooth fog
 	volatile float noiseSize = 15.0f;      // metres: size of the noise's largest blobs
 	volatile float windSpeed = 1.5f;       // m/s the noise drifts at

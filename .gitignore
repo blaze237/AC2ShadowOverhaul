@@ -34,6 +34,7 @@ __pycache__/
 /tests/ssgi/e2e/
 /tests/vol/e2e/
 /tests/taa/e2e/
+/tests/mb/e2e/
 /tests/combined/
 /tests/run_tests.out
 /tests/taa/menu_test.ini

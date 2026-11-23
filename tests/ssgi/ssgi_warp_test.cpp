@@ -1210,6 +1210,49 @@ int main()
 		Project(pNear, eye0, px, py);
 		const float* d = At(dbg, W, (int)px, (int)py);
 		CHECK(fabsf(d[0] - b[0]) < 0.25f * b[0] + 0.02f, "debug view shows %.3f, the GI texture holds %.3f", d[0], b[0]);
+		// The GI texture's alpha is the view z of each texel (the game's shaders check it), and its last
+		// level is the 8x8 mean without the sky, weighted by view z.
+		{
+			int zBad = 0;
+			for (size_t i = 0; i < (size_t)HW * HH; i++)
+				zBad += fin[i * 4 + 3] != geo[i * 4 + 3];
+			CHECK(zBad == 0, "the GI texture's alpha isn't the view z at %d texels", zBad);
+			Shader coarse;
+			const UINT CW = (HW + 7) / 8, CH = (HH + 7) / 8;
+			Target tCoarse = MakeTarget(CW, CH, F);
+			if (!Load(coarse, "PS_Coarse"))
+				CHECK(false, "PS_Coarse didn't compile");
+			else
+			{
+				Pass(coarse, kd, { &tCoarse }, { { "s_Src", &tOut } });
+				std::vector<float> cs = ReadBack(tCoarse);
+				float worst = 0;
+				int sky = 0;
+				for (UINT cy = 0; cy < CH; cy++)
+					for (UINT cx = 0; cx < CW; cx++)
+					{
+						double sum[3] = {}, w = 0;
+						for (UINT y = cy * 8; y < cy * 8 + 8; y++)
+							for (UINT x = cx * 8; x < cx * 8 + 8; x++)
+							{
+								const float* t = At(fin, HW, (int)(x < HW ? x : HW - 1), (int)(y < HH ? y : HH - 1));
+								for (int c = 0; c < 3; c++)
+									sum[c] += t[c] * t[3];
+								w += t[3];
+							}
+						const float* got = At(cs, CW, cx, cy);
+						sky += w == 0;
+						for (int c = 0; c < 3; c++)
+						{
+							float want = w > 0 ? (float)(sum[c] / w) : 0.0f;
+							worst = fmaxf(worst, fabsf(got[c] - want) / (0.01f + want));
+						}
+					}
+				printf("GI texture's last level: %ux%u, %d all-sky texels, worst relative difference from the CPU %.2g\n", CW, CH, sky, worst);
+				CHECK(worst < 1e-3f, "the last level isn't the z-weighted mean without the sky (worst %.2g)", worst);
+			}
+			Free(tCoarse);
+		}
 		std::vector<uint8_t> png((size_t)HW * HH * 3);
 		for (size_t i = 0; i < (size_t)HW * HH; i++)
 			for (int c = 0; c < 3; c++)

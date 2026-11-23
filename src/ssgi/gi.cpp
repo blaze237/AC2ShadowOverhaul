@@ -14,7 +14,9 @@
 #include "core/scene.h"
 #include "core/fxpass.h"
 #include "core/geoprep.h"
+#include "core/gputimer.h"
 #include <math.h>
+#include <string.h>
 #include <stdio.h>
 
 namespace ssgi
@@ -133,11 +135,16 @@ static const core::Camera& Cam() { return core::Scene().rasterCamera; }
 static const core::DeviceFns& D = core::Orig();
 
 static core::RenderTarget g_rad, g_raw, g_hist[2], g_tmp, g_out[2], g_black, g_colourCopy;
+// g_out has GI_LEVELS mip levels; only the first and the last are written and read (see gi.h). The
+// last is drawn into g_coarse and copied into g_outLast (drawing into it while reading the first
+// level of the same texture isn't defined in D3D9).
+static core::RenderTarget g_coarse;
+static IDirect3DSurface9* g_outLast[2];
 static D3DFORMAT g_colourCopyFmt = D3DFMT_UNKNOWN;
 static UINT g_w, g_h, g_hw, g_hh;
 static core::PassState g_state;
 static IDirect3DVertexShader9* g_vsFull;
-static IDirect3DPixelShader9 *g_psRadiance, *g_psTrace, *g_psTemporal, *g_psBlur, *g_psDebug;
+static IDirect3DPixelShader9 *g_psRadiance, *g_psTrace, *g_psTemporal, *g_psBlur, *g_psCoarse, *g_psDebug;
 static IDirect3DVertexDeclaration9* g_decl;
 static bool g_failed = false;
 static bool g_capsChecked = false;
@@ -150,95 +157,17 @@ static bool g_histValid = false;  // g_hist[1 - g_cur] holds last frame's (its g
 static bool g_wroteThisFrame = false;
 static unsigned g_frame = 0;
 
-// GPU time of our passes (debug menu): timestamp queries, read back a few frames later without
-// waiting. -1 = not measured.
-struct GpuTiming
-{
-	IDirect3DQuery9 *disjoint = nullptr, *freq = nullptr, *begin = nullptr, *end = nullptr;
-	bool issued = false;
-	void Release()
-	{
-		for (IDirect3DQuery9** q : { &disjoint, &freq, &begin, &end })
-			if (*q)
-			{
-				(*q)->Release();
-				*q = nullptr;
-			}
-		issued = false;
-	}
-};
-static GpuTiming g_timing[4];
-static int g_timingNext = 0;
-static volatile bool g_timingOn = false;
-static bool g_timingFailed = false;
-static volatile float g_gpuMs = -1.0f;
-
-static void PollTiming()
-{
-	for (GpuTiming& t : g_timing)
-	{
-		if (!t.issued)
-			continue;
-		BOOL disjoint = TRUE;
-		UINT64 freq = 0, b = 0, e = 0;
-		if (t.disjoint->GetData(&disjoint, sizeof(disjoint), 0) != S_OK || t.freq->GetData(&freq, sizeof(freq), 0) != S_OK ||
-			t.begin->GetData(&b, sizeof(b), 0) != S_OK || t.end->GetData(&e, sizeof(e), 0) != S_OK)
-			continue;
-		t.issued = false;
-		if (!disjoint && freq && e >= b)
-		{
-			float ms = (float)((double)(e - b) * 1000.0 / (double)freq);
-			g_gpuMs = g_gpuMs < 0 ? ms : g_gpuMs + (ms - g_gpuMs) * 0.1f; // smoothed
-		}
-	}
-}
-
-// Returns the slot to issue into this frame (null: not measuring, or all slots still in flight).
-static GpuTiming* BeginTiming(IDirect3DDevice9* dev)
-{
-	if (!g_timingOn || g_timingFailed)
-		return nullptr;
-	PollTiming();
-	GpuTiming& t = g_timing[g_timingNext];
-	if (t.issued)
-		return nullptr;
-	if (!t.disjoint)
-	{
-		if (FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &t.disjoint)) || FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &t.freq)) ||
-			FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &t.begin)) || FAILED(dev->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &t.end)) ||
-			!t.disjoint || !t.freq || !t.begin || !t.end)
-		{
-			t.Release();
-			g_timingFailed = true;
-			LogInfo("SSGI: GPU timestamp queries not available; the debug menu can't show the cost.");
-			return nullptr;
-		}
-	}
-	g_timingNext = (g_timingNext + 1) % 4;
-	t.disjoint->Issue(D3DISSUE_BEGIN);
-	t.begin->Issue(D3DISSUE_END);
-	return &t;
-}
-
-static void EndTiming(GpuTiming* t)
-{
-	if (!t)
-		return;
-	t->end->Issue(D3DISSUE_END);
-	t->freq->Issue(D3DISSUE_END);
-	t->disjoint->Issue(D3DISSUE_END);
-	t->issued = true;
-}
-
 static void ReleaseTargets()
 {
-	for (GpuTiming& t : g_timing)
-		t.Release();
 	for (int i = 0; i < 2; i++)
 	{
 		g_hist[i].Release();
+		if (g_outLast[i])
+			g_outLast[i]->Release();
+		g_outLast[i] = nullptr;
 		g_out[i].Release();
 	}
+	g_coarse.Release();
 	g_rad.Release();
 	g_raw.Release();
 	g_tmp.Release();
@@ -278,7 +207,8 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 		if (FAILED(hr = D.CreateVertexShader(dev, kGiFullscreenVs, &g_vsFull)) || FAILED(hr = D.CreatePixelShader(dev, kGiRadiancePs, &g_psRadiance)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kGiTracePs, &g_psTrace)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kGiTemporalPs, &g_psTemporal)) ||
-			FAILED(hr = D.CreatePixelShader(dev, kGiBlurPs, &g_psBlur)) || FAILED(hr = D.CreatePixelShader(dev, kGiDebugPs, &g_psDebug)) ||
+			FAILED(hr = D.CreatePixelShader(dev, kGiBlurPs, &g_psBlur)) || FAILED(hr = D.CreatePixelShader(dev, kGiCoarsePs, &g_psCoarse)) ||
+			FAILED(hr = D.CreatePixelShader(dev, kGiDebugPs, &g_psDebug)) ||
 			!(g_decl = core::FullscreenDecl(dev)))
 		{
 			Fail("could not create its shaders", hr);
@@ -293,7 +223,14 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 	bool ok = SUCCEEDED(g_rad.Create(dev, hw, hh, F)) && SUCCEEDED(g_raw.Create(dev, hw, hh, F)) && SUCCEEDED(g_tmp.Create(dev, hw, hh, F)) &&
 		SUCCEEDED(g_black.Create(dev, 1, 1, F));
 	for (int i = 0; i < 2 && ok; i++)
-		ok = SUCCEEDED(g_hist[i].Create(dev, hw, hh, F)) && SUCCEEDED(g_out[i].Create(dev, hw, hh, F));
+		ok = SUCCEEDED(g_hist[i].Create(dev, hw, hh, F)) && SUCCEEDED(g_out[i].Create(dev, hw, hh, F, GI_LEVELS)) &&
+			SUCCEEDED(g_out[i].tex->GetSurfaceLevel(GI_LEVELS - 1, &g_outLast[i])) && g_outLast[i];
+	if (ok)
+	{
+		// The last level's size, as D3D9 makes it.
+		D3DSURFACE_DESC d = {};
+		ok = SUCCEEDED(g_outLast[0]->GetDesc(&d)) && SUCCEEDED(g_coarse.Create(dev, d.Width, d.Height, F));
+	}
 	HRESULT hr = ok ? g_state.Create(dev) : E_FAIL;
 	if (!ok || FAILED(hr))
 	{
@@ -378,6 +315,7 @@ static void BindGi(IDirect3DDevice9* dev, bool frameKnown)
 		return;
 	D.SetTexture(dev, GI_SAMPLER, frameKnown ? GiTexture() : g_black.tex);
 	core::SetSamplerClamp(dev, GI_SAMPLER, D3DTEXF_LINEAR);
+	D.SetSamplerState(dev, GI_SAMPLER, D3DSAMP_MIPFILTER, D3DTEXF_POINT); // the shaders pick the level (gi.h)
 	g_giBound = true;
 }
 
@@ -460,9 +398,14 @@ static void GiRows(float rows[3][4])
 
 static void SetFrameConstants(IDirect3DDevice9* dev)
 {
-	float rows[3][4];
+	float rows[GI_CONSTS][4];
 	GiRows(rows);
-	dev->SetPixelShaderConstantF(GI_CONST, &rows[0][0], 3);
+	// c219: (z/w, x, y, 1) -> 1 / (view z now), from z/w = A + B / z.
+	const core::CameraFloats& cam = Cam().f;
+	const float invB = cam.B != 0 ? 1.0f / cam.B : 0.0f;
+	const float zRow[4] = { invB, 0, 0, -cam.A * invB };
+	memcpy(rows[3], zRow, sizeof(zRow));
+	dev->SetPixelShaderConstantF(GI_CONST, &rows[0][0], GI_CONSTS);
 }
 
 static void CheckCut()
@@ -605,6 +548,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 		return;
 
 	g_state.Save(dev);
+	core::GpuTimer_Begin(dev, core::GT_SSGI); // the colour copy and the shared normals (if made here) count too
 	IDirect3DTexture9* colourTex = ColourTexture(dev);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
 	const core::CameraFloats& cam = Cam().f;
@@ -644,12 +588,11 @@ static void RunPasses(IDirect3DDevice9* dev)
 		{ giRows[0][0], giRows[0][1], giRows[0][2], giRows[0][3] },
 		{ giRows[1][0], giRows[1][1], giRows[1][2], giRows[1][3] },
 		{ giRows[2][0], giRows[2][1], giRows[2][2], giRows[2][3] },
-		{ feedback, g_historyClip, 0, 0 },
+		{ feedback, g_historyClip, kGiDepthTolerance, (float)(GI_LEVELS - 1) },
 	};
 	dev->SetPixelShaderConstantF(0, &c[0][0], 15);
 	g_frame++;
 
-	GpuTiming* timing = geo ? BeginTiming(dev) : nullptr;
 	if (geo)
 	{
 		// The lit colour at half res: the scene colour now, after the ambient occlusion and contact
@@ -660,6 +603,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 		D.SetTexture(dev, 2, giRead);
 		core::SetSamplerClamp(dev, 1, D3DTEXF_LINEAR);
 		core::SetSamplerClamp(dev, 2, D3DTEXF_LINEAR);
+		D.SetSamplerState(dev, 2, D3DSAMP_MIPFILTER, D3DTEXF_POINT); // read like the game's shaders read it
 		D.SetPixelShader(dev, g_psRadiance);
 		core::DrawFullscreen(dev);
 		core::SetSamplerClamp(dev, 1, D3DTEXF_POINT);
@@ -694,6 +638,25 @@ static void RunPasses(IDirect3DDevice9* dev)
 		core::SetTarget(dev, g_out[next].surf, g_hw, g_hh);
 		D.SetTexture(dev, 1, g_tmp.tex);
 		core::DrawFullscreen(dev);
+
+		// Its last level, for the texels that show another surface (gi.h).
+		D3DSURFACE_DESC cd = {};
+		g_coarse.surf->GetDesc(&cd);
+		core::SetTarget(dev, g_coarse.surf, cd.Width, cd.Height);
+		D.SetTexture(dev, 1, g_out[next].tex);
+		D.SetPixelShader(dev, g_psCoarse);
+		core::DrawFullscreen(dev);
+		D.SetTexture(dev, 1, nullptr);
+		HRESULT chr = D.StretchRect(dev, g_coarse.surf, NULL, g_outLast[next], NULL, D3DTEXF_NONE);
+		if (FAILED(chr))
+		{
+			static bool warned = false;
+			if (!warned)
+			{
+				warned = true;
+				LogWarn("SSGI: could not copy the GI texture's last level (0x%08lX).", chr);
+			}
+		}
 		g_wroteThisFrame = true;
 
 		if (g_view)
@@ -707,7 +670,7 @@ static void RunPasses(IDirect3DDevice9* dev)
 		}
 	}
 
-	EndTiming(timing);
+	core::GpuTimer_End(core::GT_SSGI);
 
 	g_state.Restore(dev);
 	depthTex->Release();
@@ -729,15 +692,7 @@ GiStatus GI_GetStatus()
 	st.failed = g_failed;
 	st.traceW = g_hw;
 	st.traceH = g_hh;
-	st.gpuMs = g_gpuMs;
 	return st;
-}
-
-void GI_SetTiming(bool on)
-{
-	g_timingOn = on;
-	if (!on)
-		g_gpuMs = -1.0f;
 }
 
 } // namespace ssgi

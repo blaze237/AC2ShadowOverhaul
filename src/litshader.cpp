@@ -42,8 +42,13 @@
 //     Q.x  = z / w            (a copy of the instructions that compute oC1.x; 1 if they can't be copied)
 //     Q.yz = vPos.xy, Q.w = 1
 //     G.xyw = Q . c216, Q . c217, Q . c218     (reprojection into the GI texture of the last frame)
-//     G     = tex2D(s13, G.xy / G.w)
+//     Q.y   = Q . c219                         (1 / view z now)
+//     G.xy  = G.xy / G.w ; G.z = Q.y / G.w     (G.z: 1 / the view z the texel should hold)
+//     Q     = tex2Dlod(s13, G.xy, 0)           (light, view z there)
+//     Q.w   = |Q.w * G.z - 1| - tolerance      (>= 0: the texel shows another surface)
+//     G     = Q.w >= 0 ? tex2Dlod(s13, G.xy, last level) : Q
 //     indirect' = albedo * G + indirect
+//   (Kg = (1, 0, tolerance, last level).) Without the z/w copy, the plain tex2D(s13, G.xy / G.w).
 //   and the combine reads indirect' instead. Everything after it (other light, fog) is unchanged, so
 //   the bounce light is fogged exactly like the game's ambient light. A shader with no GI texture
 //   bound samples black and renders exactly as before.
@@ -743,11 +748,11 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 	bool constUsed[256];
 	if (!RegisterUsage(code, insts, vars, maxTemp, constUsed))
 		return failBoth("relative constant addressing", "relative constant addressing");
-	for (int c = GI_CONST; c < GI_CONST + 3 && gi; c++)
+	for (int c = GI_CONST; c < GI_CONST + ssgi::GI_CONSTS && gi; c++)
 		if (constUsed[c])
 		{
 			gi = false;
-			r.giWhy = "constants c216-c218 already used";
+			r.giWhy = "constants c216-c219 already used";
 		}
 
 	Lighting L;
@@ -762,8 +767,8 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 		r.giWhy = !found ? why : L.albedoWhy;
 	}
 
-	// Constants: AO's highest free one at or below c223 (clear of SSGI's c216-c218), SSGI's below c216.
-	const int Ka = ao ? FreeConst(constUsed, 223, gi ? GI_CONST : -1, gi ? GI_CONST + 2 : -1) : -1;
+	// Constants: AO's highest free one at or below c223 (clear of SSGI's c216-c219), SSGI's below c216.
+	const int Ka = ao ? FreeConst(constUsed, 223, gi ? GI_CONST : -1, gi ? GI_CONST + ssgi::GI_CONSTS - 1 : -1) : -1;
 	if (ao && Ka < 0)
 	{
 		ao = aoMatched = false;
@@ -846,7 +851,8 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 		if (!hasVPos)
 			e.I(OP_DCL, { 0x80000000u, Dst(REG_MISC, 0, X | Y) });
 		e.I(OP_DCL, { 0x90000000u, Dst(REG_SAMPLER, GI_SAMPLER, 0xF) });
-		e.I(OP_DEF, { Dst(REG_CONST, Kg, 0xF), FloatBits(1.0f), FloatBits(0.0f), FloatBits(0.0f), FloatBits(0.0f) });
+		e.I(OP_DEF, { Dst(REG_CONST, Kg, 0xF), FloatBits(1.0f), FloatBits(0.0f), FloatBits(ssgi::kGiDepthTolerance),
+		                 FloatBits((float)(ssgi::GI_LEVELS - 1)) });
 	}
 	if (ao)
 		e.I(OP_DEF, { Dst(REG_CONST, Ka, 0xF), FloatBits(0.0f), FloatBits(1.0f), FloatBits(2.0f), FloatBits(1.0f / 1048576.0f) });
@@ -926,9 +932,25 @@ bool Lit_RewritePS(const DWORD* code, LitParts parts, std::vector<DWORD>& result
 			e.I(OP_DP4, { Dst(REG_TEMP, G, X), Src(REG_TEMP, Q, kIdentity), Src(REG_CONST, GI_CONST + 0, kIdentity) });
 			e.I(OP_DP4, { Dst(REG_TEMP, G, Y), Src(REG_TEMP, Q, kIdentity), Src(REG_CONST, GI_CONST + 1, kIdentity) });
 			e.I(OP_DP4, { Dst(REG_TEMP, G, W), Src(REG_TEMP, Q, kIdentity), Src(REG_CONST, GI_CONST + 2, kIdentity) });
+			if (depthExact)
+				e.I(OP_DP4, { Dst(REG_TEMP, Q, Y), Src(REG_TEMP, Q, kIdentity), Src(REG_CONST, GI_CONST + 3, kIdentity) });
 			e.I(OP_RCP, { Dst(REG_TEMP, G, W), Src(REG_TEMP, G, Rep(3)) });
 			e.I(OP_MUL, { Dst(REG_TEMP, G, X | Y), Src(REG_TEMP, G, kIdentity), Src(REG_TEMP, G, Rep(3)) });
-			e.I(OP_TEXLD, { Dst(REG_TEMP, G, 0xF), Src(REG_TEMP, G, kIdentity), Src(REG_SAMPLER, GI_SAMPLER, kIdentity) });
+			if (depthExact)
+			{
+				// The depth check (see the top): the texel, or the last level where it shows another surface.
+				const DWORD qw = Src(REG_TEMP, Q, Rep(3));
+				e.I(OP_MUL, { Dst(REG_TEMP, G, Z), Src(REG_TEMP, Q, Rep(1)), Src(REG_TEMP, G, Rep(3)) });
+				e.I(OP_MOV, { Dst(REG_TEMP, G, W), Src(REG_CONST, Kg, Rep(1)) });
+				e.I(OP_TEXLDL, { Dst(REG_TEMP, Q, 0xF), Src(REG_TEMP, G, kIdentity), Src(REG_SAMPLER, GI_SAMPLER, kIdentity) });
+				e.I(OP_MAD, { Dst(REG_TEMP, Q, W), qw, Src(REG_TEMP, G, Rep(2)), Src(REG_CONST, Kg, Rep(0), true) });
+				e.I(OP_ADD, { Dst(REG_TEMP, Q, W), (qw & ~0x0F000000u) | (0xBu << 24), Src(REG_CONST, Kg, Rep(2), true) });
+				e.I(OP_MOV, { Dst(REG_TEMP, G, W), Src(REG_CONST, Kg, Rep(3)) });
+				e.I(OP_TEXLDL, { Dst(REG_TEMP, G, 0xF), Src(REG_TEMP, G, kIdentity), Src(REG_SAMPLER, GI_SAMPLER, kIdentity) });
+				e.I(OP_CMP, { Dst(REG_TEMP, G, X | Y | Z), qw, Src(REG_TEMP, G, kIdentity), Src(REG_TEMP, Q, kIdentity) });
+			}
+			else
+				e.I(OP_TEXLD, { Dst(REG_TEMP, G, 0xF), Src(REG_TEMP, G, kIdentity), Src(REG_SAMPLER, GI_SAMPLER, kIdentity) });
 			if (L.form == ssgi::GI_FORM_AMB_PRODUCT)
 			{
 				// lit = a * b + sun  ->  P = a * b ; G = albedo * G + P ; lit = G + sun

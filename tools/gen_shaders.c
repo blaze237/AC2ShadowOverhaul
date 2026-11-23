@@ -5,8 +5,9 @@
        src/ssgi/shaders/ssgi.hlsl          -> src/ssgi/shaders_gen.h  (namespace ssgi)
        src/vol/shaders/volumetrics.hlsl    -> src/vol/shaders_gen.h   (namespace vol)
        src/taa/shaders/taa.hlsl            -> src/taa/shaders_gen.h   (namespace taa)
-   Run from the repo root after editing an HLSL file; name effects (core, ao, ssgi, vol, taa) to do only those:
-       x86_64-w64-mingw32-clang -O1 -o tools/gen_shaders.exe tools/gen_shaders.c && tools/gen_shaders.exe [core ao ssgi vol taa]
+       src/mb/shaders/motionblur.hlsl      -> src/mb/shaders_gen.h    (namespace mb)
+   Run from the repo root after editing an HLSL file; name effects (core, ao, ssgi, vol, taa, mb) to do only those:
+       x86_64-w64-mingw32-clang -O1 -o tools/gen_shaders.exe tools/gen_shaders.c && tools/gen_shaders.exe [core ao ssgi vol taa mb]
    A header whose HLSL doesn't compile is deleted (restore it with git). The same compiler gives the
    same bytecode, so an unchanged HLSL file regenerates the same arrays. */
 #include <windows.h>
@@ -64,6 +65,7 @@ static const Shader kSsgi[] = {
 	{ "PS_Trace", "ps_3_0", "kGiTracePs" },
 	{ "PS_Temporal", "ps_3_0", "kGiTemporalPs" },
 	{ "PS_Blur", "ps_3_0", "kGiBlurPs" },
+	{ "PS_Coarse", "ps_3_0", "kGiCoarsePs" },
 	{ "PS_Debug", "ps_3_0", "kGiDebugPs" },
 };
 static const Shader kVol[] = {
@@ -79,6 +81,13 @@ static const Shader kTaa[] = {
 	{ "PS_Resolve", "ps_3_0", "kTaaResolvePs" },
 	{ "PS_Output", "ps_3_0", "kTaaOutputPs" },
 };
+static const Shader kMb[] = {
+	{ "VS_Fullscreen", "vs_3_0", "kMbFullscreenVs" },
+	{ "PS_Prep", "ps_3_0", "kMbPrepPs" },
+	{ "PS_TileMax", "ps_3_0", "kMbTileMaxPs" },
+	{ "PS_NeighborMax", "ps_3_0", "kMbNeighborMaxPs" },
+	{ "PS_Reconstruct", "ps_3_0", "kMbReconstructPs" },
+};
 #define N(a) (sizeof(a) / sizeof((a)[0]))
 static const Effect kEffects[] = {
 	{ "core", "src/core/shaders/geoprep.hlsl", "src/core/shaders_gen.h", "core", kCore, N(kCore) },
@@ -86,6 +95,7 @@ static const Effect kEffects[] = {
 	{ "ssgi", "src/ssgi/shaders/ssgi.hlsl", "src/ssgi/shaders_gen.h", "ssgi", kSsgi, N(kSsgi) },
 	{ "vol", "src/vol/shaders/volumetrics.hlsl", "src/vol/shaders_gen.h", "vol", kVol, N(kVol) },
 	{ "taa", "src/taa/shaders/taa.hlsl", "src/taa/shaders_gen.h", "taa", kTaa, N(kTaa) },
+	{ "mb", "src/mb/shaders/motionblur.hlsl", "src/mb/shaders_gen.h", "mb", kMb, N(kMb) },
 };
 
 static PFN_Compile g_compile;

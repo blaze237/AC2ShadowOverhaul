@@ -25,7 +25,7 @@ struct MockGiStats
 	int upDraws;                  // DrawPrimitiveUP (mods' fullscreen passes)
 	int psCreated, psWithS13, psWithOC2;
 	IDirect3DBaseTexture9* tex13; // stage 13 at the last game draw
-	float c216[3][4];             // c216-c218 at the last game draw
+	float c216[4][4];             // c216-c219 at the last game draw
 	IDirect3DSurface9* rt[4];     // targets at the last game draw
 	IDirect3DSurface9* upRt0;     // target of the last DrawPrimitiveUP
 	int instancedUpDraws;         // DrawPrimitiveUP with a stream frequency set (invalid)

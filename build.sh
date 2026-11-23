@@ -15,10 +15,11 @@ CC="${TC}i686-w64-mingw32-clang"
 
 SRC="src/main.cpp src/common.cpp src/shadows.cpp src/framedump.cpp src/crashlog.cpp src/softshadows.cpp src/tuning.cpp
 	src/ao.cpp src/litshader.cpp src/features.cpp
-	src/core/shaderinfo.cpp src/core/camera.cpp src/core/scene.cpp src/core/menu.cpp src/core/fxpass.cpp src/core/geoprep.cpp
+	src/core/shaderinfo.cpp src/core/camera.cpp src/core/scene.cpp src/core/menu.cpp src/core/fxpass.cpp src/core/geoprep.cpp src/core/inputblock.cpp src/core/gputimer.cpp
 	src/ssgi/gi.cpp src/ssgi/menu.cpp
 	src/vol/volumetrics.cpp src/vol/menu.cpp
-	src/taa/taa.cpp src/taa/vsjitter.cpp src/taa/menu.cpp"
+	src/taa/taa.cpp src/taa/vsjitter.cpp src/taa/menu.cpp
+	src/mb/motionblur.cpp src/mb/menu.cpp"
 
 mkdir -p dist/scripts
 "$CXX" -shared -O2 -std=c++17 -fms-extensions -fasm-blocks -Wall -Wno-unused-function \

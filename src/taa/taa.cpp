@@ -5,6 +5,7 @@
 #include "shaders_gen.h"
 #include "core/scene.h"
 #include "core/fxpass.h"
+#include "core/gputimer.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -540,6 +541,7 @@ static void Resolve(IDirect3DDevice9* dev)
 		memset(reproj, 0, sizeof(reproj));
 
 	g_state.Save(dev);
+	core::GpuTimer_Begin(dev, core::GT_TAA);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
 	for (DWORD s = 0; s < 4; s++)
 	{
@@ -588,6 +590,7 @@ static void Resolve(IDirect3DDevice9* dev)
 	dev->SetPixelShader(g_psOutput);
 	core::DrawFullscreen(dev);
 
+	core::GpuTimer_End(core::GT_TAA);
 	g_state.Restore(dev);
 	if (depthTex)
 		depthTex->Release();

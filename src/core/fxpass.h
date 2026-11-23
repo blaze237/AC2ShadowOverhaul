@@ -94,7 +94,7 @@ struct RenderTarget
 {
 	IDirect3DTexture9* tex = nullptr;
 	IDirect3DSurface9* surf = nullptr;
-	HRESULT Create(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt);
+	HRESULT Create(IDirect3DDevice9* dev, UINT w, UINT h, D3DFORMAT fmt, UINT levels = 1); // surf: level 0
 	void Release();
 };
 

@@ -27,8 +27,17 @@ namespace ssgi
 enum
 {
 	GI_SAMPLER = 13,
-	GI_CONST = 216, // c216-c218: (z/w, vPos.x, vPos.y, 1) -> (u*w, v*w, w) in last frame's GI texture
+	GI_CONST = 216, // c216-c218: (z/w, vPos.x, vPos.y, 1) -> (u*w, v*w, w) in last frame's GI texture,
+	                // c219: -> 1 / (view z now), for the depth check (see GI_LEVELS)
+	GI_CONSTS = 4,
+	// The GI texture's mip levels. Its alpha holds the view z of each texel (0 = sky), so the game's
+	// shaders can tell whether the reprojected texel shows the surface they shade: where it doesn't
+	// (a surface just uncovered, or one moving with the camera such as the player), they read the
+	// last level instead, a wide average, rather than another surface's light (which left a dark
+	// trail of the player's outline on what was behind him when the camera turned).
+	GI_LEVELS = 4,
 };
+static const float kGiDepthTolerance = 0.1f; // relative: |z there / z expected - 1| below this matches
 
 // ---- Settings ([SSGI] in the ini) --------------------------------------------------------------
 
@@ -58,10 +67,8 @@ struct GiStatus
 	unsigned framesTraced = 0; // counts up while the passes run
 	bool failed = false;       // resources couldn't be created (see the log)
 	unsigned traceW = 0, traceH = 0;
-	float gpuMs = -1;          // smoothed GPU time of the passes (-1 = not measured)
 };
 GiStatus GI_GetStatus();
-void GI_SetTiming(bool on); // measure the GPU time (while the menu is shown)
 bool GI_Enabled();       // shaders get rewritten (restart to change)
 bool GI_Active();        // currently on (toggle key)
 float GI_Intensity();
@@ -94,7 +101,7 @@ struct GiRewriteLayout
 };
 extern GiRewriteLayout g_giLastLayout;
 
-// The camera and the reprojection rows for c216-c218 come from core/camera.h (ReprojectionRows,
+// The camera and the reprojection rows for c216-c219 come from core/camera.h (ReprojectionRows,
 // IdentityRows), the camera of each frame from core/scene.h.
 
 // ---- Device side (called from the hooks, framedump.cpp, through features.cpp) -------------------

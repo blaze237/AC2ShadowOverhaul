@@ -291,7 +291,7 @@ int Main()
 			printf("  the AO composite ran in the main pass too (%d draw)\n", aoComposites);
 		// The same, by the passes' shaders: exactly one resolve then one output, between the glow pass
 		// and the post draw. With every effect on, the geometry prep they share (1), the AO (4) and SSGI
-		// (5) passes run at the end of the main pass (before the transparents), AO first; nothing else draws.
+		// (6) passes run at the end of the main pass (before the transparents), AO first; nothing else draws.
 		E2EPassCount early = E2E_CountPasses(&L, t.prepass, t.glow), late = E2E_CountPasses(&L, t.glow + 1, t.post);
 		CHECK(early.n[FX_TAA] == 0 && late.n[FX_TAA] == 2 && t.post >= 2 && E2E_PassName(L.draws[t.post - 2]) &&
 				!strcmp(E2E_PassName(L.draws[t.post - 2]), "taa-resolve") && E2E_PassName(L.draws[t.post - 1]) &&
@@ -300,7 +300,7 @@ int Main()
 			late.n[FX_TAA]);
 		CHECK(late.Effects() == late.n[FX_TAA] && E2E_CountPasses(&L, t.post, t.hud + 1).Effects() == 0, "%s: other passes after the main pass", what);
 		E2EPassCount main = E2E_CountPasses(&L, t.opaque, t.transparent);
-		int wantAo = g_all ? 4 : 0, wantGi = g_all ? 5 : 0, wantShared = g_all ? 1 : 0;
+		int wantAo = g_all ? 4 : 0, wantGi = g_all ? 6 : 0, wantShared = g_all ? 1 : 0;
 		CHECK(main.n[FX_AO] == wantAo && main.n[FX_SSGI] == wantGi && main.n[FX_SHARED] == wantShared &&
 				early.Effects() == wantAo + wantGi + wantShared,
 			"%s: %d AO, %d SSGI and %d shared geometry prep passes at the end of the main pass (expected %d, %d, %d), %d effect passes "

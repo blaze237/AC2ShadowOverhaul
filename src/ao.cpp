@@ -23,6 +23,7 @@
 #include "core/scene.h"
 #include "core/fxpass.h"
 #include "core/geoprep.h"
+#include "core/gputimer.h"
 #include "ssgi/gi.h"
 #include <math.h>
 #include <stdio.h>
@@ -409,6 +410,7 @@ static void Composite(IDirect3DDevice9* dev)
 		return;
 
 	g_state.Save(dev);
+	core::GpuTimer_Begin(dev, core::GT_AO);
 	g_state.BeginPasses(dev, g_decl, g_vsFull);
 	const core::CameraFloats& cam = core::Scene().rasterCamera.f; // jittered like the z/w target
 	const float noise[2] = { 0.0f, 0.0f }; // the same pattern every frame (see the top)
@@ -416,6 +418,7 @@ static void Composite(IDirect3DDevice9* dev)
 	IDirect3DTexture9* geo = core::Geo_Ensure(dev, depthTex, g_w, g_h, cam);
 	if (!geo)
 	{
+		core::GpuTimer_End(core::GT_AO);
 		g_state.Restore(dev);
 		depthTex->Release();
 		return;
@@ -482,6 +485,7 @@ static void Composite(IDirect3DDevice9* dev)
 	D.SetPixelShader(dev, g_psComposite);
 	core::DrawFullscreen(dev);
 
+	core::GpuTimer_End(core::GT_AO);
 	g_state.Restore(dev);
 	depthTex->Release();
 

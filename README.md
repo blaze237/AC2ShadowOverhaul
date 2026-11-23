@@ -2,9 +2,9 @@
 
 A graphics overhaul for **Assassin's Creed II** (the UPlay / Ubisoft Connect `AssassinsCreedIIGame.exe`):
 longer and softer sun shadows, ambient occlusion and contact shadows, bounce light (SSGI),
-volumetric fog with god rays and sun shafts, and temporal anti-aliasing. All of it is one plugin,
-`AC2ShadowOverhaul.asi`, and every effect works inside the game's own renderer rather than as a
-post-process filter on top of it.
+volumetric fog with god rays and sun shafts, temporal anti-aliasing and camera motion blur. All of
+it is one plugin, `AC2ShadowOverhaul.asi`, and every effect works inside the game's own renderer
+rather than as a post-process filter on top of it.
 
 Assassin's Creed II cuts its shadows off a short distance from the camera. Parts of buildings only
 start casting shadows once you get close, which shows up as a line sweeping across the city as
@@ -78,9 +78,16 @@ lighting effects the 2009 renderer never had.
   has no motion vectors), so per-frame noise on them would show through as noise and swimming. With
   TAA off each effect behaves exactly as it does on its own.
 
+### Motion
+
+- **Camera motion blur.** Turning and running blur the view along its motion, before bloom and tone
+  mapping so the HUD stays sharp. Each pixel's motion comes from the game's depth and the camera's
+  movement since the last frame, so near things streak more than far ones, and a depth-aware filter
+  keeps the edges of things in front correct. Nothing runs while the camera stands still.
+
 ### Everything
 
-- **Live tuning.** Four in-game menus (see below) change every setting on the fly; changes are
+- **Live tuning.** Five in-game menus (see below) change every setting on the fly; changes are
   saved to the ini.
 - **MSAA warning.** The screen-space effects can't work while the game's own anti-aliasing (MSAA) is
   on. If it is, a red warning on screen names the effects that are switched off because of it.
@@ -100,7 +107,7 @@ lighting effects the 2009 renderer never had.
    `AC2Shadows.asi`. While any of them is installed AC2 Shadow Overhaul does nothing at all (to avoid
    patching the game twice) and shows a message box listing them at startup.
 4. In the game's graphics options, **switch anti-aliasing off**: ambient occlusion, contact shadows,
-   SSGI, the volumetrics and TAA all need it off (TAA replaces it).
+   SSGI, the volumetrics, TAA and motion blur all need it off (TAA replaces it).
 5. It works alongside EaglePatch+ but doesn't depend on it. EaglePatch+ is strongly recommended
    for the shadow resolution boost below.
 
@@ -150,12 +157,13 @@ opening one closes the other.
 | Key | Menu | Ini key (`[Menu]`) |
 |---|---|---|
 | F9 | Shadows & AO: shadow distances, soft shadows, ambient occlusion, contact shadows | `MenuKey` |
-| F3 | SSGI (with a status line showing its GPU time) | `SSGIMenuKey` |
+| F3 | SSGI (with a status line saying whether it is working) | `SSGIMenuKey` |
 | F11 | Volumetrics: fog and sun shafts | `VolumetricsMenuKey` |
 | F1 | TAA (with a status line saying whether it is working) | `TAAMenuKey` |
+| F6 | Motion blur (with a status line) | `MotionBlurMenuKey` |
 
 **F12** (`[Menu] AllEffectsKey`) switches every effect off and back on at once, for a quick comparison
-with the vanilla game: shadows, AO, contact shadows, SSGI, the volumetrics and TAA. Turning them back on
+with the vanilla game: shadows, AO, contact shadows, SSGI, the volumetrics, TAA and motion blur. Turning them back on
 restores whatever was on before, and it isn't saved. While everything is off a small note says so in
 the top-left corner. The menu keys and F12 are the only keys the mod uses while every menu is hidden.
 
@@ -166,13 +174,19 @@ the top-left corner. The menu keys and F12 are the only keys the mod uses while 
 | Left / Right | change the selected setting (hold to repeat) |
 | the menu's key | hide the menu |
 
+While a menu is open the arrow keys go to the menu only; the game doesn't see them.
+
 Every change applies at once and is saved to the ini a second later. The exceptions are the two
 comparison switches, which aren't saved: "All shadow effects" in the F9 menu switches the shadow
 tweaks, soft shadows, ambient occlusion and contact shadows off and back on for a quick comparison
 with vanilla, and "All volumetric effects" in the F11 menu does the same for the fog and shafts.
 Soft shadow width 0 is the game's own filter; contact hardening only applies while soft shadows are
 on, and a change to its penumbra or widths rebuilds the shadow shaders a moment after the last key
-press (a short hitch). With `[Debug] FrameDump=1` the last entry of the F9
+press (a short hitch). "Frame times" in the F9 menu (`[Debug] ShowFrameTimes`, off by default)
+shows a list in the top-left corner of the GPU time each running effect takes (AO + contact shadows,
+SSGI, volumetrics, TAA, motion blur), their total, and the whole frame's time for scale. It measures
+the passes the effects add, not the extra work inside the game's own shaders (soft shadow filtering,
+the bigger shadow maps). With `[Debug] FrameDump=1` the last entry of the F9
 menu, "Frame dump", writes a frame dump (diagnostic); `[Debug] FrameDumpKey` can also give it a
 hotkey for debugging (off by default).
 
@@ -192,14 +206,16 @@ This writes `dist/scripts/AC2ShadowOverhaul.asi` (+ ini).
 `tests/run_tests.sh [path-to-llvm-mingw/bin]` builds the mod once and runs all the offline tests,
 which need neither the game nor a GPU, and exits non-zero if any check fails: end-to-end tests that
 load the built .asi into a fake `AssassinsCreedIIGame.exe` over a mock `d3d9.dll` (`tests/mockd3d`)
-for the shadows and AO, SSGI (`tests/ssgi`), the volumetrics (`tests/vol`) and TAA (`tests/taa`),
+for the shadows and AO, SSGI (`tests/ssgi`), the volumetrics (`tests/vol`), TAA (`tests/taa`) and
+motion blur (`tests/mb`),
 each alone and with every effect on, plus a combined test (`tests/combined_test.cpp`: the frame order
 of all effects, one menu at a time, MSAA, refusal next to an old plugin); the effects' shaders run on
 Windows' software renderer (WARP) over synthetic scenes; unit tests of the shared core (`tests/core`:
 camera maths, shader constant tables, the menu engine) and of the vertex shader jitter; and, if you
-have exported shaders (`re/shaders/dump`, `re/shaders/vs`), tests that run the soft shadow, AO, SSGI and
-TAA rewriters over real game shaders. After editing an effect's HLSL (`src/shaders/ao.hlsl`,
-`src/ssgi/shaders/ssgi.hlsl`, `src/vol/shaders/volumetrics.hlsl`, `src/taa/shaders/taa.hlsl`),
+have exported shaders (`re/shaders/dump`, `re/shaders/vs`), tests that run the soft shadow, AO, SSGI,
+and TAA rewriters over real game shaders. After editing an effect's HLSL (`src/shaders/ao.hlsl`,
+`src/ssgi/shaders/ssgi.hlsl`, `src/vol/shaders/volumetrics.hlsl`, `src/taa/shaders/taa.hlsl`,
+`src/mb/shaders/motionblur.hlsl`),
 regenerate its `shaders_gen.h` with `tools/gen_shaders.c` (instructions at its top). See the comments
 at the top of each file in `tests/` for the others.
 
@@ -226,10 +242,11 @@ generate yourself from your own copy of the game; none of the game's code or dat
   SSGI traces the result and before the sky and transparents are drawn.
 - `src/framedump.cpp` hooks D3D9 (through `Direct3DCreate9`, so it works under ReShade) to rewrite
   shaders as they are created and to produce the frame dump. It feeds every device call to the
-  effects through `src/features.cpp` (SSGI in `src/ssgi`, volumetrics in `src/vol`, TAA in `src/taa`).
+  effects through `src/features.cpp` (SSGI in `src/ssgi`, volumetrics in `src/vol`, TAA in `src/taa`,
+  motion blur in `src/mb`).
 - `src/core` is what the effects share: shader constant tables (`shaderinfo`), the camera and its
   reprojection maths (`camera`), the main-pass and per-frame camera tracker (`scene`), the menu
-  engine behind all four menus (`menu`), the fullscreen-pass plumbing (`fxpass`), and the half-res
+  engine behind all five menus (`menu`), the fullscreen-pass plumbing (`fxpass`), and the half-res
   normals and depth that AO and SSGI both read, made once per frame (`geoprep`).
 - Volumetrics (`src/vol`) read the camera, the sun shadow atlas's light-space matrix and cascade
   layout, the sun and the fog colour from the opaque draws' shader constants. After the sky they ray
@@ -240,6 +257,10 @@ generate yourself from your own copy of the game; none of the game's code or dat
   scene against its reprojected history at the game's first read of the scene colour (after every
   other effect), and reports the jitter and history state to `src/core/scene`, which the other
   effects use for jitter-correct reconstruction and per-frame noise.
+- Motion blur (`src/mb`) runs at the first read of the scene colour, after TAA's resolve: every
+  pixel's motion is reprojected from the z/w target with last frame's camera, then a tile-max /
+  neighbour-max reconstruction filter (with jittered tile lookups and split sampling) blurs the
+  scene colour.
 - `src/crashlog.cpp` logs the faulting address, stack and address-space use when the game crashes.
 
 ## Disclaimer

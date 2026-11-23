@@ -1,6 +1,7 @@
 // ps_3_0 interpreter for the shader rewrite tests (adapted from AC2ShadowOverhaul tests/aoshader_test.cpp).
 // Runs straight-line code and if / else; textures return a hash of (sampler, coordinates), except the
-// GI sampler, which returns Inputs::gi and records where it was read.
+// GI sampler, which returns Inputs::gi at level 0 (alpha per giDepth) and Inputs::giCoarse at its last
+// level, and records where level 0 was read.
 #pragma once
 #include "sm3.h"
 #include "ssgi/gi.h"
@@ -21,7 +22,10 @@ struct Inputs
 	bool noLightmapColour = false, noCloud = false;
 	size_t zeroAt = 0;   // before the instruction at this token index, zero the components that
 	DWORD zeroSrc = 0;   // this source token reads for x, y, z (a temp register)
-	float gi[4] = {};    // what the GI sampler returns
+	float gi[4] = {};    // what the GI sampler returns at level 0
+	float giCoarse[4] = {}; // ... and at its last level (texldl with lod > 0)
+	int giDepth = 0;     // level 0's alpha: 0 = gi[3]; 1 = the view z the shader expects there (1 / coord.z,
+	                     // the depth check passes); 2 = three times that (it fails)
 	size_t injectAt = 0; // after the instruction at this token index, add the value of source token
 	DWORD injectAlb = 0; // injectAlb (as read by the instruction at captureAt) x gi to its result
 	size_t captureAt = 0; // (before _sat)
@@ -33,7 +37,9 @@ struct Outputs
 	bool written[4];
 	bool killed;
 	int giReads;
-	float giUv[2]; // coordinates of the last GI read
+	float giUv[2]; // coordinates of the last GI read (level 0)
+	float giZ;     // its coord.z (the depth-checked rewrite: 1 / the view z the texel should hold)
+	int giCoarseReads;
 };
 
 static float TexValue(uint32_t seed, int sampler, float u, float v, int comp)
@@ -221,13 +227,19 @@ static bool Run(const std::vector<DWORD>& code, Inputs in, Outputs& o, std::stri
 		case OP_TEXLD: case OP_TEXLDL: case OP_TEXLDD:
 		{
 			int smp = RegNum(p[2]);
+			const bool coarse = smp == GI_SAMPLER && op == OP_TEXLDL && a[3] > 0.5f;
 			for (int k = 0; k < 4; k++)
-				res[k] = smp == GI_SAMPLER ? in.gi[k] : TexValue(in.texSeed, smp, a[0], a[1], k);
-			if (smp == GI_SAMPLER)
+				res[k] = smp == GI_SAMPLER ? (coarse ? in.giCoarse[k] : in.gi[k]) : TexValue(in.texSeed, smp, a[0], a[1], k);
+			if (smp == GI_SAMPLER && coarse)
+				o.giCoarseReads++;
+			else if (smp == GI_SAMPLER)
 			{
 				o.giReads++;
 				o.giUv[0] = a[0];
 				o.giUv[1] = a[1];
+				o.giZ = a[2];
+				if (in.giDepth)
+					res[3] = (in.giDepth == 1 ? 1.0f : 3.0f) / a[2];
 			}
 			if (smp == in.lmSampler && in.noLightmapColour)
 				res[0] = res[1] = res[2] = 0;
