@@ -42,7 +42,6 @@
 # more before it counts as failed.
 cd "$(dirname "$0")" || exit 1
 TC="${1:-$LLVM_MINGW}"
-[ -z "$TC" ] && [ -d ../../re/tools/llvm-mingw-20261104-msvcrt-x86_64/bin ] && TC=../../re/tools/llvm-mingw-20261104-msvcrt-x86_64/bin
 [ -z "$TC" ] && [ -d ../re/tools/llvm-mingw-20261104-msvcrt-x86_64/bin ] && TC=../re/tools/llvm-mingw-20261104-msvcrt-x86_64/bin
 [ -n "$TC" ] && TC="$(cd "$TC" && pwd)"
 TCARG="$TC"
