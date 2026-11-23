@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <initializer_list>
+#include "core/shaderinfo.h"
 
 enum
 {
@@ -100,61 +101,19 @@ static inline bool WritesTemp(const DWORD* code, const Inst& in, int reg, int ma
 }
 
 // ---- Constant table ----------------------------------------------------------------------------
-
-struct CtabVar
-{
-	std::string name;
-	int set = 0;   // 0 bool, 1 int, 2 float, 3 sampler
-	int index = 0; // first register
-	int count = 0; // registers
-};
-
-static inline bool ReadCtabVars(const DWORD* code, const std::vector<Inst>& insts, std::vector<CtabVar>& vars)
-{
-	for (const Inst& in : insts)
-	{
-		if (in.op != OP_COMMENT || in.len < 8 || code[in.pos + 1] != 0x42415443) // 'CTAB'
-			continue;
-		const uint8_t* base = (const uint8_t*)&code[in.pos + 2];
-		size_t size = (in.len - 1) * 4;
-		auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-		auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-		DWORD count = rd32(12), infoOff = rd32(16);
-		for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-		{
-			size_t e = infoOff + 20 * k;
-			DWORD nameOff = rd32(e);
-			CtabVar v;
-			v.set = rd16(e + 4);
-			v.index = rd16(e + 6);
-			v.count = rd16(e + 8);
-			for (size_t c = 0; c < 64 && nameOff + c < size && base[nameOff + c]; c++)
-				v.name += (char)base[nameOff + c];
-			vars.push_back(v);
-		}
-		return true;
-	}
-	return false;
-}
-
-static inline const CtabVar* FindVar(const std::vector<CtabVar>& vars, const char* name, int set)
-{
-	for (const CtabVar& v : vars)
-		if (v.set == set && v.name == name)
-			return &v;
-	return nullptr;
-}
+// Read with core/shaderinfo.h: core::ConstantTable vars; core::ReadConstantTable(code, vars);
+// vars.Find("g_ShadowSampler", core::RS_SAMPLER) ...
 
 // Highest temp register referenced (-1 if none) and the float constants that are named in the
 // constant table, defined or read. Returns false if constants are addressed relatively.
-static inline bool RegisterUsage(const DWORD* code, const std::vector<Inst>& insts, const std::vector<CtabVar>& vars, int& maxTemp,
+static inline bool RegisterUsage(const DWORD* code, const std::vector<Inst>& insts, const core::ConstantTable& vars, int& maxTemp,
 	bool constUsed[256])
 {
 	maxTemp = -1;
 	memset(constUsed, 0, 256);
-	for (const CtabVar& v : vars)
-		if (v.set == 2)
-			for (int r = v.index; r < v.index + v.count && r < 256; r++)
+	for (const core::ShaderConstant& v : vars.constants)
+		if (v.set == core::RS_FLOAT4)
+			for (int r = v.reg; r < v.reg + v.count && r < 256; r++)
 				constUsed[r] = true;
 	for (const Inst& in : insts)
 	{

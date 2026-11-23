@@ -13,6 +13,17 @@
 // removes exactly (1 - AO) x indirect + (1 - contact) x sun. Writes ao_warp_ao.png,
 // ao_warp_contact.png and ao_warp_composite.png to look at.
 //
+// TAA (default scene only):
+//  - TAA off: GTAO, blur and composite with the noise offsets at 0 give exactly the output of the
+//    shaders before they took offsets (hashes of every target, recorded from those shaders);
+//  - jitter: the scene rendered with one of TAA's sub-pixel offsets; the view positions the
+//    geometry prep and GTAO reconstruct (their own ViewPos, through a test entry point appended to
+//    the real source) match the ray-cast truth with the offset folded into P02 / P12, and are off
+//    by the offset without it; the prep's normals on the floor and the left wall lose their tilt;
+//  - noise: AO and contact shadows averaged over 16 frames with the per-frame offsets the mod sets
+//    while TAA runs (core::Scene_NoiseOffsets) are closer to what GTAO converges to than one frame;
+//    and the narrow blur used then is as good as the wide one on a single frame and better averaged.
+//
 // ao_warp_test pitched            - a second scene: camera looking down onto open ground with a box, a
 //                                   10 cm post and a sunlit wall seen at a glancing angle (false
 //                                   self-shadowing, halos behind thin objects)
@@ -41,19 +52,41 @@ typedef HRESULT(WINAPI* PFN_Compile)(const void*, SIZE_T, const char*, const D3D
 typedef HRESULT(WINAPI* PFN_Reflect)(const void*, SIZE_T, REFIID, void**);
 static PFN_Compile g_compile;
 static PFN_Reflect g_reflect;
-static std::string g_src;
+static std::string g_src, g_geoSrc;
 
 static const GUID kIID_Reflection = { 0x8d536ca1, 0x0cca, 0x4956, { 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84 } };
 
-static ID3DBlob* CompileEntry(const char* entry, const char* profile)
+// From ao.hlsl, or (geo) from the shared geometry prep (src/core/shaders/geoprep.hlsl).
+static ID3DBlob* CompileEntry(const char* entry, const char* profile, bool geo = false)
 {
-	const D3D_SHADER_MACRO defs[] = { { "AO_D3D11", "1" }, { nullptr, nullptr } };
+	const D3D_SHADER_MACRO defs[] = { { "AO_D3D11", "1" }, { "GEO_D3D11", "1" }, { nullptr, nullptr } };
 	ID3DBlob *code = nullptr, *err = nullptr;
-	HRESULT hr = g_compile(g_src.data(), g_src.size(), "ao.hlsl", defs, nullptr, entry, profile,
+	const std::string& src = geo ? g_geoSrc : g_src;
+	HRESULT hr = g_compile(src.data(), src.size(), geo ? "geoprep.hlsl" : "ao.hlsl", defs, nullptr, entry, profile,
 		D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
 	if (FAILED(hr))
 		printf("%s: compile failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
 	return code;
+}
+
+// Any source text (the real HLSL with test entry points appended or its sample counts raised).
+static ID3DBlob* CompileText(const std::string& src, const char* name, const char* entry, const char* profile)
+{
+	const D3D_SHADER_MACRO defs[] = { { "AO_D3D11", "1" }, { "GEO_D3D11", "1" }, { nullptr, nullptr } };
+	ID3DBlob *code = nullptr, *err = nullptr;
+	HRESULT hr = g_compile(src.data(), src.size(), name, defs, nullptr, entry, profile,
+		D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err);
+	if (FAILED(hr))
+		printf("%s: compile failed: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
+	return code;
+}
+
+// Replaces every `from` in `src` with `to`.
+static std::string Replace(std::string src, const char* from, const char* to)
+{
+	for (size_t at = src.find(from); at != std::string::npos; at = src.find(from, at + strlen(to)))
+		src.replace(at, strlen(from), to);
+	return src;
 }
 
 // Constant buffer contents for a shader, filled by variable name ($Globals, offsets from reflection).
@@ -161,38 +194,54 @@ static float PitchedZ(float px, float py, float* hitWorld = nullptr)
 	return best; // d has a forward component of 1, so t is the view z
 }
 
-static float SceneZ(float px, float py) // view z at a pixel, or 0 for sky
+// Which surface of the default scene a pixel shows (SURF_*), for the jitter checks.
+enum
+{
+	SURF_SKY,
+	SURF_FLOOR,
+	SURF_BACK,
+	SURF_LEFT,
+	SURF_BOX,
+	SURF_SPHERE
+};
+static int g_lastSurface = SURF_SKY;
+
+static float SceneZ(float px, float py) // view z at a pixel (fractional: any point on the image plane), or 0 for sky
 {
 	if (g_pitched)
 		return PitchedZ(px, py);
 	float ndcX = 2.0f * px / W - 1.0f, ndcY = 1.0f - 2.0f * py / H;
 	float d[3] = { ndcX / P00, ndcY / P11, 1.0f }, o[3] = { 0, 0, 0 };
 	float best = 1e30f, t;
-	auto consider = [&](float tt, bool ok) {
+	g_lastSurface = SURF_SKY;
+	auto consider = [&](float tt, bool ok, int surface) {
 		if (ok && tt > 0 && tt < best)
+		{
 			best = tt;
+			g_lastSurface = surface;
+		}
 	};
 	if (d[1] < 0)
 	{
 		t = -1.6f / d[1];
-		consider(t, d[0] * t > -3.0f && t < 10.0f);
+		consider(t, d[0] * t > -3.0f && t < 10.0f, SURF_FLOOR);
 	}
 	t = 10.0f;
-	consider(t, d[1] * t >= -1.6f && d[1] * t <= 3.0f && d[0] * t >= -3.0f);
+	consider(t, d[1] * t >= -1.6f && d[1] * t <= 3.0f && d[0] * t >= -3.0f, SURF_BACK);
 	if (d[0] < 0)
 	{
 		t = -3.0f / d[0];
-		consider(t, d[1] * t >= -1.6f && d[1] * t <= 3.0f && t <= 10.0f);
+		consider(t, d[1] * t >= -1.6f && d[1] * t <= 3.0f && t <= 10.0f, SURF_LEFT);
 	}
 	const float lo[3] = { -0.5f, -1.6f, 4.0f }, hi[3] = { 0.7f, -0.6f, 5.2f };
 	if (RayBox(o, d, lo, hi, t))
-		consider(t, true);
+		consider(t, true, SURF_BOX);
 	// sphere centre (-1.9, -0.8, 7.5), r 0.8
 	const float c[3] = { -1.9f, -0.8f, 7.5f }, r = 0.8f;
 	float dd = d[0] * d[0] + d[1] * d[1] + d[2] * d[2], dc = d[0] * c[0] + d[1] * c[1] + d[2] * c[2];
 	float cc = c[0] * c[0] + c[1] * c[1] + c[2] * c[2] - r * r, disc = dc * dc - dd * cc;
 	if (disc >= 0)
-		consider((dc - sqrtf(disc)) / dd, true);
+		consider((dc - sqrtf(disc)) / dd, true, SURF_SPHERE);
 	return best < 1e29f ? best : 0.0f; // d[2] = 1, so t is the view z
 }
 
@@ -309,6 +358,101 @@ static std::vector<float> ReadBack(ID3D11Device* dev, ID3D11DeviceContext* ctx, 
 	return out;
 }
 
+// FNV-1a over a target's texels (its full rows): two renders hash the same only if every bit agrees.
+static uint64_t HashTarget(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Target& t, UINT w, UINT h, UINT bytesPerTexel)
+{
+	D3D11_TEXTURE2D_DESC d;
+	t.tex->GetDesc(&d);
+	d.BindFlags = 0;
+	d.Usage = D3D11_USAGE_STAGING;
+	d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ID3D11Texture2D* st = nullptr;
+	dev->CreateTexture2D(&d, nullptr, &st);
+	ctx->CopyResource(st, t.tex);
+	D3D11_MAPPED_SUBRESOURCE m;
+	ctx->Map(st, 0, D3D11_MAP_READ, 0, &m);
+	uint64_t hsh = 1469598103934665603ull;
+	for (UINT y = 0; y < h; y++)
+	{
+		const uint8_t* row = (const uint8_t*)m.pData + (size_t)y * m.RowPitch;
+		for (size_t i = 0; i < (size_t)w * bytesPerTexel; i++)
+			hsh = (hsh ^ row[i]) * 1099511628211ull;
+	}
+	ctx->Unmap(st, 0);
+	st->Release();
+	return hsh;
+}
+
+// A half-float RGBA target as floats.
+static std::vector<float> ReadHalf(ID3D11Device* dev, ID3D11DeviceContext* ctx, const Target& t, UINT w, UINT h)
+{
+	D3D11_TEXTURE2D_DESC d;
+	t.tex->GetDesc(&d);
+	d.BindFlags = 0;
+	d.Usage = D3D11_USAGE_STAGING;
+	d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ID3D11Texture2D* st = nullptr;
+	dev->CreateTexture2D(&d, nullptr, &st);
+	ctx->CopyResource(st, t.tex);
+	D3D11_MAPPED_SUBRESOURCE m;
+	ctx->Map(st, 0, D3D11_MAP_READ, 0, &m);
+	std::vector<float> out((size_t)w * h * 4);
+	for (UINT y = 0; y < h; y++)
+		for (UINT x = 0; x < w * 4; x++)
+		{
+			uint16_t hbits = ((const uint16_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch))[x];
+			uint32_t sign = (hbits >> 15) & 1, e = (hbits >> 10) & 31, mant = hbits & 1023;
+			float v = e == 0 ? ldexpf((float)mant, -24) : ldexpf((float)(mant | 1024), (int)e - 25);
+			out[(size_t)y * w * 4 + x] = sign ? -v : v;
+		}
+	ctx->Unmap(st, 0);
+	st->Release();
+	return out;
+}
+
+// The per-frame noise offsets the mod sets while TAA runs (core/scene.cpp Scene_NoiseOffsets: R2
+// over TAA's frame counter).
+static void R2(unsigned frame, float out[2])
+{
+	const double a1 = 0.7548776662466927, a2 = 0.5698402909980532, n = (double)frame;
+	out[0] = (float)(n * a1 - floor(n * a1));
+	out[1] = (float)(n * a2 - floor(n * a2));
+}
+
+// Hashes of the targets with the noise offsets at 0, recorded from the shaders before the offsets
+// were added (src/shaders/ao.hlsl and src/core/shaders/geoprep.hlsl of commit 7a64ec5): without TAA
+// nothing may change, not one bit. (Recorded on WARP; a different WARP version could round
+// differently, in which case the shaders of that commit give the new numbers.)
+// Half-float rounding of a value (round to nearest even), as a target stores it.
+static float ToHalf(float v)
+{
+	if (v == 0)
+		return 0;
+	int e;
+	frexpf(fabsf(v), &e); // |v| = m * 2^e, m in [0.5, 1)
+	float q = ldexpf(1.0f, e - 11);
+	return nearbyintf(v / q) * q;
+}
+
+// The lit shader rewrite's octahedral encoding (src/litshader.cpp) of a world normal: the two values
+// it writes to oC2.w and oC3.w (+ 2).
+static void OctEncode(const float n[3], float& a, float& b)
+{
+	float l1 = fabsf(n[0]) + fabsf(n[1]) + fabsf(n[2]);
+	float px = n[0] / l1, py = n[1] / l1;
+	if (n[2] < 0)
+	{
+		float fx = (1 - fabsf(py)) * (px >= 0 ? 1.0f : -1.0f), fy = (1 - fabsf(px)) * (py >= 0 ? 1.0f : -1.0f);
+		px = fx;
+		py = fy;
+	}
+	a = px + 2;
+	b = py + 2;
+}
+
+static const uint64_t kTodayGeo = 0x9F106A3B0750CED6ull, kTodayGtao = 0xA04D21D48D7613D5ull, kTodayAo = 0x8AD77C5CD594AE52ull,
+					  kTodayComposite = 0x2471F8EB7678CC5Aull;
+
 int main(int argc, char** argv)
 {
 	g_pitched = argc > 1 && strcmp(argv[1], "pitched") == 0;
@@ -347,14 +491,17 @@ int main(int argc, char** argv)
 		}
 		printf("replay: %ux%u, sun (%.3f, %.3f, %.3f), contact length %.2f m\n", W, H, rc[6][0], rc[6][1], rc[6][2], rc[6][3]);
 	}
-	FILE* f = fopen("../src/shaders/ao.hlsl", "rb");
-	if (!f)
-		return printf("run from tests/\n"), 1;
-	char buf[4096];
-	size_t n;
-	while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-		g_src.append(buf, n);
-	fclose(f);
+	for (int k = 0; k < 2; k++)
+	{
+		FILE* f = fopen(k ? "../src/core/shaders/geoprep.hlsl" : "../src/shaders/ao.hlsl", "rb");
+		if (!f)
+			return printf("run from tests/\n"), 1;
+		char buf[4096];
+		size_t n;
+		while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
+			(k ? g_geoSrc : g_src).append(buf, n);
+		fclose(f);
+	}
 	HMODULE dc = LoadLibraryA("d3dcompiler_47.dll");
 	g_compile = dc ? (PFN_Compile)GetProcAddress(dc, "D3DCompile") : nullptr;
 	g_reflect = dc ? (PFN_Reflect)GetProcAddress(dc, "D3DReflect") : nullptr;
@@ -371,10 +518,15 @@ int main(int argc, char** argv)
 	ID3DBlob* gtaoCode = CompileEntry("PS_GTAO", "ps_4_0");
 	ID3DBlob* blurCode = CompileEntry("PS_Blur", "ps_4_0");
 	ID3DBlob* compCode = CompileEntry("PS_Composite", "ps_4_0");
-	if (!vsCode || !gtaoCode || !blurCode || !compCode)
+	ID3DBlob* geoCode = CompileEntry("PS_GeoPrep", "ps_4_0", true);
+	ID3DBlob* geoNormalsCode = CompileEntry("PS_GeoPrepNormals", "ps_4_0", true);
+	if (!vsCode || !gtaoCode || !blurCode || !compCode || !geoCode || !geoNormalsCode)
 		return 1;
+	ID3D11PixelShader* geoNormalsPs = nullptr;
+	dev->CreatePixelShader(geoNormalsCode->GetBufferPointer(), geoNormalsCode->GetBufferSize(), nullptr, &geoNormalsPs);
 	ID3D11VertexShader* vs = nullptr;
-	ID3D11PixelShader *gtao = nullptr, *blur = nullptr, *comp = nullptr;
+	ID3D11PixelShader *gtao = nullptr, *blur = nullptr, *comp = nullptr, *geoPs = nullptr;
+	dev->CreatePixelShader(geoCode->GetBufferPointer(), geoCode->GetBufferSize(), nullptr, &geoPs);
 	dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs);
 	dev->CreatePixelShader(gtaoCode->GetBufferPointer(), gtaoCode->GetBufferSize(), nullptr, &gtao);
 	dev->CreatePixelShader(blurCode->GetBufferPointer(), blurCode->GetBufferSize(), nullptr, &blur);
@@ -407,6 +559,7 @@ int main(int argc, char** argv)
 	Target tSun = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, sunLight.data(), W * 16);
 	Target tScene = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, scene.data(), W * 16);
 	Target tAo[2] = { MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT), MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT) };
+	Target tGeo = MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT); // the shared geometry prep, as the mod makes it
 
 	D3D11_SAMPLER_DESC smp = {};
 	smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
@@ -414,7 +567,7 @@ int main(int argc, char** argv)
 	smp.MaxLOD = D3D11_FLOAT32_MAX;
 	ID3D11SamplerState* point = nullptr;
 	dev->CreateSamplerState(&smp, &point);
-	ID3D11SamplerState* samplers[4] = { point, point, point, point };
+	ID3D11SamplerState* samplers[5] = { point, point, point, point, point };
 	D3D11_BLEND_DESC bl = {};
 	bl.RenderTarget[0].BlendEnable = TRUE;
 	bl.RenderTarget[0].SrcBlend = bl.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
@@ -433,6 +586,13 @@ int main(int argc, char** argv)
 	const float sunLen = sqrtf(0.0f + 0.7f * 0.7f + 0.7f * 0.7f);
 	float cSun[4] = { 0.0f, 0.7f / sunLen, 0.7f / sunLen, 0.5f };
 	float cContact[4] = { 0.05f, 0.01f, 1.0f, 0.002f }; // as src/ao.cpp sets them
+	float cTargets[4] = { 1, 1, 0, 0 };                 // the composite reads both light targets
+	// The geometry prep with shading normals: the view axes (world space) and AO's two targets. The
+	// pitched camera's axes (any rotation does: the test turns its view normals into world space
+	// with them, the shader turns them back), so the rotation is exercised.
+	float cViewX[4] = { kRight[0], kRight[1], kRight[2], 0 }, cViewY[4] = { kUp[0], kUp[1], kUp[2], 0 },
+		  cViewZ[4] = { kFwd[0], kFwd[1], kFwd[2], 0 };
+	ID3D11ShaderResourceView* normalSrv[2] = {};
 	if (g_replay)
 	{
 		float* dst[7] = { cFull, cHalf, cProj, cProj2, cParams, nullptr, cSun };
@@ -464,6 +624,10 @@ int main(int argc, char** argv)
 		Set(c, "c_Params2", params2);
 		Set(c, "c_Sun", cSun);
 		Set(c, "c_Contact", cContact);
+		Set(c, "c_Targets", cTargets);
+		Set(c, "c_ViewX", cViewX);
+		Set(c, "c_ViewY", cViewY);
+		Set(c, "c_ViewZ", cViewZ);
 		ID3D11Buffer* cb = nullptr;
 		if (!c.data.empty())
 		{
@@ -471,14 +635,19 @@ int main(int argc, char** argv)
 			D3D11_SUBRESOURCE_DATA cd = { c.data.data(), 0, 0 };
 			dev->CreateBuffer(&cbd, &cd, &cb);
 		}
-		ID3D11ShaderResourceView* none[4] = {};
-		ctx->PSSetShaderResources(0, 4, none);
+		ID3D11ShaderResourceView* none[5] = {};
+		ctx->PSSetShaderResources(0, 5, none);
 		ctx->OMSetRenderTargets(1, &out.rtv, nullptr);
-		static const char* const names[4] = { "s_Depth", "s_AO", "s_Indirect", "s_Sun" };
+		static const char* const names[5] = { "s_Depth", "s_AO", "s_Indirect", "s_Sun", "s_Geo" };
 		for (auto& t : c.textures)
-			for (int k = 0; k < 4; k++)
-				if (t.first == names[k] && t.second < 4)
+		{
+			for (int k = 0; k < 5; k++)
+				if (t.first == names[k] && t.second < 5)
 					ctx->PSSetShaderResources(t.second, 1, &srvs[k]);
+			for (int k = 0; k < 2; k++)
+				if (t.first == (k ? "s_NormalB" : "s_NormalA") && t.second < 5)
+					ctx->PSSetShaderResources(t.second, 1, &normalSrv[k]);
+		}
 		D3D11_VIEWPORT vp = { 0, 0, (float)w, (float)h, 0, 1 };
 		ctx->RSSetViewports(1, &vp);
 		UINT stride = 16, offset = 0;
@@ -488,7 +657,7 @@ int main(int argc, char** argv)
 		ctx->VSSetShader(vs, nullptr, 0);
 		ctx->PSSetShader(ps, nullptr, 0);
 		ctx->PSSetConstantBuffers(0, 1, &cb);
-		ctx->PSSetSamplers(0, 4, samplers);
+		ctx->PSSetSamplers(0, 5, samplers);
 		float zero[4] = {};
 		ctx->OMSetBlendState(blend ? subtract : nullptr, zero, 0xFFFFFFFF);
 		ctx->Draw(3, 0);
@@ -496,8 +665,11 @@ int main(int argc, char** argv)
 			cb->Release();
 	};
 	const float across[4] = { strength, 0, 1, 0 }, down[4] = { strength, 0, 0, 1 };
-	ID3D11ShaderResourceView* s0[4] = { tDepth.srv, nullptr, nullptr, nullptr };
+	ID3D11ShaderResourceView* sGeo[5] = { tDepth.srv, nullptr, nullptr, nullptr, nullptr };
+	pass(geoCode, geoPs, tGeo, HW, HH, sGeo, across, false);
+	ID3D11ShaderResourceView* s0[5] = { tDepth.srv, nullptr, nullptr, nullptr, tGeo.srv };
 	pass(gtaoCode, gtao, tAo[0], HW, HH, s0, across, false);
+	const uint64_t hashGeo = HashTarget(dev, ctx, tGeo, HW, HH, 8), hashGtao = HashTarget(dev, ctx, tAo[0], HW, HH, 8);
 	if (getenv("AO_DEBUG_COLUMN"))
 	{
 		// Raw GTAO (before the blur) down one half-res column: AO and view z.
@@ -525,12 +697,13 @@ int main(int argc, char** argv)
 		ctx->Unmap(st, 0);
 		st->Release();
 	}
-	ID3D11ShaderResourceView* s1[4] = { tDepth.srv, tAo[0].srv, nullptr, nullptr };
+	ID3D11ShaderResourceView* s1[5] = { tDepth.srv, tAo[0].srv, nullptr, nullptr, nullptr };
 	pass(blurCode, blur, tAo[1], HW, HH, s1, across, false);
-	ID3D11ShaderResourceView* s2[4] = { tDepth.srv, tAo[1].srv, nullptr, nullptr };
+	ID3D11ShaderResourceView* s2[5] = { tDepth.srv, tAo[1].srv, nullptr, nullptr, nullptr };
 	pass(blurCode, blur, tAo[0], HW, HH, s2, down, false);
-	ID3D11ShaderResourceView* s3[4] = { tDepth.srv, tAo[0].srv, tInd.srv, tSun.srv };
+	ID3D11ShaderResourceView* s3[5] = { tDepth.srv, tAo[0].srv, tInd.srv, tSun.srv, nullptr };
 	pass(compCode, comp, tScene, W, H, s3, across, true);
+	const uint64_t hashAo = HashTarget(dev, ctx, tAo[0], HW, HH, 8), hashComposite = HashTarget(dev, ctx, tScene, W, H, 16);
 
 	// The blurred AO and contact shadows (R16G16B16A16_FLOAT, read as halves).
 	std::vector<float> ao((size_t)HW * HH), contact((size_t)HW * HH);
@@ -660,6 +833,103 @@ int main(int argc, char** argv)
 			100.0f * frac, 100.0f * wallFrac, ok ? "yes" : "NO");
 		return ok ? 0 : 3;
 	}
+	// The shared geometry prep: every texel against the same rule on the CPU (from the same z/w
+	// values), and at the probe points against the scene's real normals.
+	{
+		std::vector<float> geoHalf(HW * HH * 4);
+		{
+			D3D11_TEXTURE2D_DESC d;
+			tGeo.tex->GetDesc(&d);
+			d.BindFlags = 0;
+			d.Usage = D3D11_USAGE_STAGING;
+			d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			ID3D11Texture2D* st = nullptr;
+			dev->CreateTexture2D(&d, nullptr, &st);
+			ctx->CopyResource(st, tGeo.tex);
+			D3D11_MAPPED_SUBRESOURCE m;
+			ctx->Map(st, 0, D3D11_MAP_READ, 0, &m);
+			auto half = [](uint16_t hbits) {
+				uint32_t sign = (hbits >> 15) & 1, e = (hbits >> 10) & 31, mant = hbits & 1023;
+				float v = e == 0 ? ldexpf((float)mant, -24) : ldexpf((float)(mant | 1024), (int)e - 25);
+				return sign ? -v : v;
+			};
+			for (UINT y = 0; y < HH; y++)
+				for (UINT x = 0; x < HW * 4; x++)
+					geoHalf[(size_t)y * HW * 4 + x] = half(((const uint16_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch))[x]);
+			ctx->Unmap(st, 0);
+			st->Release();
+		}
+		auto zAt = [&](int x, int y) {
+			x = x < 0 ? 0 : x >= (int)W ? W - 1 : x;
+			y = y < 0 ? 0 : y >= (int)H ? H - 1 : y;
+			return B / (depth[(size_t)y * W + x] - A);
+		};
+		auto viewPos = [&](int x, int y, float z, float p[3]) {
+			p[0] = (x * 2.0f / W - 1.0f) / P00 * z;
+			p[1] = (1.0f - y * 2.0f / H) / P11 * z;
+			p[2] = z;
+		};
+		int texels = 0, zBad = 0, nBad = 0;
+		for (UINT j = 0; j < HH; j++)
+			for (UINT i = 0; i < HW; i++)
+			{
+				const float* g = &geoHalf[((size_t)j * HW + i) * 4];
+				int x = 2 * i, y = 2 * j;
+				if (depth[(size_t)y * W + x] >= 1.0f)
+				{
+					zBad += g[3] != 0.0f;
+					continue;
+				}
+				texels++;
+				float z = zAt(x, y), P[3], l[3], r[3], u[3], dn[3], dx[3], dy[3];
+				viewPos(x, y, z, P);
+				viewPos(x - 1, y, zAt(x - 1, y), l);
+				viewPos(x + 1, y, zAt(x + 1, y), r);
+				viewPos(x, y - 1, zAt(x, y - 1), u);
+				viewPos(x, y + 1, zAt(x, y + 1), dn);
+				bool right = fabsf(r[2] - P[2]) < fabsf(P[2] - l[2]), down_ = fabsf(dn[2] - P[2]) < fabsf(P[2] - u[2]);
+				for (int k = 0; k < 3; k++)
+				{
+					dx[k] = right ? r[k] - P[k] : P[k] - l[k];
+					dy[k] = down_ ? dn[k] - P[k] : P[k] - u[k];
+				}
+				float N[3] = { dx[1] * dy[2] - dx[2] * dy[1], dx[2] * dy[0] - dx[0] * dy[2], dx[0] * dy[1] - dx[1] * dy[0] };
+				float len = sqrtf(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+				float flip = N[0] * P[0] + N[1] * P[1] + N[2] * P[2] > 0 ? -1.0f : 1.0f;
+				zBad += !(fabsf(g[3] - z) <= 1e-3f * z);
+				float err = 0;
+				for (int k = 0; k < 3; k++)
+					err = fmaxf(err, fabsf(g[k] - flip * N[k] / len));
+				// Ties between the two sides of an axis can go either way in float: a few silhouette texels.
+				nBad += err > 4e-3f;
+			}
+		float nFrac = texels ? (float)nBad / texels : 1.0f;
+		bool ok = texels > 0 && zBad == 0 && nFrac < 0.002f;
+		fails += !ok;
+		printf("  shared geometry prep: %d texels, %d with z off by more than 1/1000, %.3f%% with the normal off the CPU reconstruction "
+			   "(same rule) by more than 0.004: %s\n",
+			texels, zBad, 100.0f * nFrac, ok ? "yes" : "NO");
+		struct Probe
+		{
+			const char* what;
+			float x, y, z, n[3];
+		} const probes[] = {
+			{ "floor", 2.0f, -1.6f, 4.5f, { 0, 1, 0 } },
+			{ "back wall", 1.5f, 1.0f, 10.0f, { 0, 0, -1 } },
+			{ "left wall", -3.0f, 0.5f, 7.0f, { 1, 0, 0 } },
+			{ "box top", 0.1f, -0.6f, 4.6f, { 0, 1, 0 } },
+		};
+		for (const Probe& pr : probes)
+		{
+			int px, py;
+			Project(pr.x, pr.y, pr.z, px, py);
+			const float* g = &geoHalf[((size_t)(py / 2) * HW + px / 2) * 4];
+			float err = fmaxf(fmaxf(fabsf(g[0] - pr.n[0]), fabsf(g[1] - pr.n[1])), fabsf(g[2] - pr.n[2]));
+			bool pok = err < 0.01f;
+			fails += !pok;
+			printf("  shared geometry prep normal on the %-10s (%.3f, %.3f, %.3f): %s\n", pr.what, g[0], g[1], g[2], pok ? "yes" : "NO");
+		}
+	}
 	printf("ao (WARP): GTAO, contact shadows, blur and composite on a synthetic scene (AO values)\n");
 	check("open floor", aoAt(2.0f, -1.6f, 4.5f), 0.9f, 1.15f);
 	check("open back wall", aoAt(1.5f, 1.0f, 10.0f), 0.9f, 1.15f);
@@ -695,6 +965,417 @@ int main(int argc, char** argv)
 		float sky = result[((size_t)skyY * W + skyX) * 4];
 		fails += sky != 1.0f;
 		printf("  %-44s %.3f: %s\n", "composite leaves the sky alone", sky, sky == 1.0f ? "yes" : "NO");
+	}
+	// Composite with only one light target written this frame (src/ao.cpp binds only what is read):
+	// the other holds anything, NaN here, and must not be read. What each removes adds up to what
+	// both together remove: (1 - a) + (1 - b) = 1 - c for a = 1 - I (1 - AO), b = 1 - S (1 - contact).
+	{
+		std::vector<float> nan((size_t)W * H * 4, NAN);
+		Target tNan = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, nan.data(), W * 16);
+		std::vector<float> one[2];
+		for (int k = 0; k < 2; k++)
+		{
+			Target tS = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, scene.data(), W * 16);
+			cTargets[0] = k == 0 ? 1.0f : 0.0f; // k = 0: AO only, 1: contact shadows only
+			cTargets[1] = k == 1 ? 1.0f : 0.0f;
+			ID3D11ShaderResourceView* sk[5] = { tDepth.srv, tAo[0].srv, k == 0 ? tInd.srv : tNan.srv, k == 1 ? tSun.srv : tNan.srv, nullptr };
+			pass(compCode, comp, tS, W, H, sk, across, true);
+			one[k] = ReadBack(dev, ctx, tS, W, H, 4);
+			tS.tex->Release();
+		}
+		cTargets[0] = cTargets[1] = 1.0f;
+		tNan.tex->Release();
+		int bad = 0;
+		float worstSum = 0;
+		for (size_t p = 0; p < (size_t)W * H; p++)
+			for (int c = 0; c < 3; c++)
+			{
+				float a = one[0][p * 4 + c], b = one[1][p * 4 + c], d = fabsf(a + b - 1.0f - result[p * 4 + c]);
+				if (!(d < 1e-5f))
+					bad++;
+				worstSum = d > worstSum ? d : worstSum;
+			}
+		fails += bad != 0;
+		printf("  composite with one light target unwritten (NaN there): nothing read from it, the two add up to both (worst %g): %s\n",
+			worstSum, bad ? "NO" : "yes");
+	}
+	// ---- Shading normals --------------------------------------------------------------------------
+	// The geometry prep with the lit shaders' normals in AO's targets' alpha (both R16G16B16A16_FLOAT
+	// as in the game, the normals encoded as src/litshader.cpp does). Bands of the image get:
+	//   0   nothing written (cleared target, a shader without the normal)   -> the depth's normal
+	//   1   the depth's normal tilted by about 25 degrees (a normal map)     -> that normal
+	//   2   the depth's normal turned to face away from the camera, still
+	//       within 78 degrees of it                                          -> bent to face the camera
+	//   3   the opposite of the depth's normal (another surface's)           -> the depth's normal
+	//   4   values outside the encoding's range (not ours)                   -> the depth's normal
+	// "The depth's normal" must be PS_GeoPrep's output bit for bit there, and depth z (w) everywhere.
+	if (!g_replay)
+	{
+		printf("ao (WARP), geometry prep with shading normals:\n");
+		pass(geoCode, geoPs, tGeo, HW, HH, sGeo, across, false);
+		std::vector<float> plain = ReadHalf(dev, ctx, tGeo, HW, HH);
+		auto band = [&](UINT y) { return (int)(y * 5 / H); };
+		std::vector<float> na((size_t)W * H * 4, 0.0f), nb((size_t)W * H * 4, 0.0f);
+		// Expected output per half-res texel (view space), for band 1 and 2 texels.
+		std::vector<float> expect((size_t)HW * HH * 3, 0.0f);
+		auto toWorld = [&](const float v[3], float w[3]) {
+			for (int k = 0; k < 3; k++)
+				w[k] = cViewX[k] * v[0] + cViewY[k] * v[1] + cViewZ[k] * v[2];
+		};
+		int counts[5] = {};
+		for (UINT j = 0; j < HH; j++)
+			for (UINT i = 0; i < HW; i++)
+			{
+				const float* g = &plain[((size_t)j * HW + i) * 4];
+				if (g[3] <= 0)
+					continue; // sky
+				const UINT x = 2 * i, y = 2 * j;
+				const int b = band(y);
+				float N[3] = { g[0], g[1], g[2] }, S[3];
+				// The view position and direction to the camera of full-res pixel (x, y).
+				float ndcX = 2.0f * x / W - 1.0f, ndcY = 1.0f - 2.0f * y / H, z = g[3];
+				float P[3] = { ndcX / P00 * z, ndcY / P11 * z, z }, pl = sqrtf(P[0] * P[0] + P[1] * P[1] + P[2] * P[2]);
+				float V[3] = { -P[0] / pl, -P[1] / pl, -P[2] / pl };
+				float nv = N[0] * V[0] + N[1] * V[1] + N[2] * V[2];
+				if (b == 1 || b == 3)
+				{
+					// Tilt: towards a fixed direction perpendicular-ish to the normal.
+					const float t[3] = { 0.37f, -0.21f, 0.29f };
+					float sgn = b == 3 ? -1.0f : 1.0f;
+					for (int k = 0; k < 3; k++)
+						S[k] = sgn * (N[k] + (b == 1 ? 1.0f : 0.0f) * t[k]);
+				}
+				else if (b == 2)
+				{
+					// Facing away by 0.2: S = N - (N.V + 0.2 / ...) V, normalised.
+					for (int k = 0; k < 3; k++)
+						S[k] = N[k] - (nv + 0.25f) * V[k];
+				}
+				else
+					S[0] = S[1] = S[2] = 0;
+				float sl = sqrtf(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+				float enA = 0, enB = 0;
+				if (b == 4)
+					enA = enB = 5.0f;
+				else if (sl > 0)
+				{
+					for (int k = 0; k < 3; k++)
+						S[k] /= sl;
+					float w[3];
+					toWorld(S, w);
+					OctEncode(w, enA, enB);
+				}
+				for (UINT dy = 0; dy < 2 && y + dy < H; dy++)
+					for (UINT dx = 0; dx < 2 && x + dx < W; dx++)
+					{
+						na[((size_t)(y + dy) * W + x + dx) * 4 + 3] = ToHalf(enA);
+						nb[((size_t)(y + dy) * W + x + dx) * 4 + 3] = ToHalf(enB);
+					}
+				float* e = &expect[((size_t)j * HW + i) * 3];
+				if (b == 1 || b == 2)
+				{
+					float agree = S[0] * N[0] + S[1] * N[1] + S[2] * N[2], facing = S[0] * V[0] + S[1] * V[1] + S[2] * V[2];
+					if (fabsf(agree - 0.2f) < 0.03f || fabsf(facing - 0.05f) < 0.03f || agree < 0.2f)
+						continue; // too close to a threshold (or not a case of this band) to say which side the shader takes
+					if (facing < 0.05f)
+					{
+						float l = 0;
+						for (int k = 0; k < 3; k++)
+							l += (S[k] += (0.05f - facing) * V[k]) * S[k];
+						for (int k = 0; k < 3; k++)
+							S[k] /= sqrtf(l);
+					}
+					memcpy(e, S, 12);
+				}
+				counts[b]++;
+			}
+		Target tNa = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, na.data(), W * 16);
+		Target tNb = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT, nb.data(), W * 16);
+		normalSrv[0] = tNa.srv;
+		normalSrv[1] = tNb.srv;
+		Target tGeoN = MakeTarget(dev, HW, HH, DXGI_FORMAT_R16G16B16A16_FLOAT);
+		pass(geoNormalsCode, geoNormalsPs, tGeoN, HW, HH, sGeo, across, false);
+		std::vector<float> got = ReadHalf(dev, ctx, tGeoN, HW, HH);
+		normalSrv[0] = normalSrv[1] = nullptr;
+		int same[5] = {}, total[5] = {}, close[3] = {}, bentOk = 0, bentTotal = 0, zBad = 0;
+		double worst = 0;
+		for (UINT j = 0; j < HH; j++)
+			for (UINT i = 0; i < HW; i++)
+			{
+				const size_t t = (size_t)j * HW + i;
+				const float *g = &plain[t * 4], *o = &got[t * 4];
+				zBad += o[3] != g[3];
+				if (g[3] <= 0)
+					continue;
+				const int b = band(2 * j);
+				total[b]++;
+				same[b] += memcmp(g, o, 16) == 0;
+				const float* e = &expect[t * 3];
+				if ((b == 1 || b == 2) && (e[0] != 0 || e[1] != 0 || e[2] != 0))
+				{
+					double d = 0;
+					for (int k = 0; k < 3; k++)
+						d = fmax(d, fabs(o[k] - e[k]));
+					worst = fmax(worst, d);
+					close[b] += d < 4e-3;
+					close[0]++;
+					if (b == 2)
+					{
+						// Faces the camera after the bend.
+						float ndcX = 2.0f * (2 * i) / W - 1.0f, ndcY = 1.0f - 2.0f * (2 * j) / H, z = g[3];
+						float P[3] = { ndcX / P00 * z, ndcY / P11 * z, z }, pl = sqrtf(P[0] * P[0] + P[1] * P[1] + P[2] * P[2]);
+						float f = -(o[0] * P[0] + o[1] * P[1] + o[2] * P[2]) / pl;
+						bentOk += f > 0.04f;
+						bentTotal++;
+					}
+				}
+			}
+		int expected12 = 0;
+		for (size_t t = 0; t < expect.size(); t += 3)
+			expected12 += expect[t] != 0 || expect[t + 1] != 0 || expect[t + 2] != 0;
+		bool okFallback = same[0] == total[0] && same[3] == total[3] && same[4] == total[4] && total[0] > 1000 && total[3] > 1000 && total[4] > 1000;
+		bool okUsed = expected12 > 1000 && close[1] + close[2] == close[0] && bentTotal > 100 && bentOk == bentTotal;
+		bool okZ = zBad == 0;
+		fails += !okFallback + !okUsed + !okZ;
+		printf("  no normal / the opposite one / not ours: the depth's normal, bit for bit, at %d of %d / %d of %d / %d of %d texels: %s\n",
+			same[0], total[0], same[3], total[3], same[4], total[4], okFallback ? "yes" : "NO");
+		printf("  tilted and facing-away normals: decoded and turned into view space within 4e-3 (worst %.5f) at %d of %d texels, "
+			   "facing the camera after the bend at %d of %d: %s\n",
+			worst, close[1] + close[2], close[0], bentOk, bentTotal, okUsed ? "yes" : "NO");
+		printf("  view z unchanged everywhere: %s\n", okZ ? "yes" : "NO");
+		(void)counts;
+		tNa.tex->Release();
+		tNb.tex->Release();
+		tGeoN.tex->Release();
+		pass(geoCode, geoPs, tGeo, HW, HH, sGeo, across, false); // what the passes below expect
+	}
+
+	// ---- TAA ------------------------------------------------------------------------------------
+	printf("ao (WARP) with TAA:\n");
+	{
+		// TAA off: offsets 0 give exactly the old output.
+		printf("  TAA off, output hashes: geometry prep %016llX, GTAO %016llX, blurred AO %016llX, composite %016llX\n",
+			(unsigned long long)hashGeo, (unsigned long long)hashGtao, (unsigned long long)hashAo, (unsigned long long)hashComposite);
+		bool same = hashGeo == kTodayGeo && hashGtao == kTodayGtao && hashAo == kTodayAo && hashComposite == kTodayComposite;
+		fails += !same;
+		printf("  TAA off (noise offsets 0): every target bit for bit what the shaders gave before the offsets: %s\n", same ? "yes" : "NO");
+	}
+	{
+		// Jitter: TAA's phase 8 offset (-0.4375, 0.3889) pixels. Pixel q of the jittered render shows the
+		// unjittered image at q - o.
+		const float jx = -0.4375f, jy = 0.3888889f, jndc[2] = { 2.0f * jx / W, -2.0f * jy / H };
+		std::vector<float> depthJ((size_t)W * H);
+		std::vector<uint8_t> surfJ((size_t)W * H);
+		for (UINT y = 0; y < H; y++)
+			for (UINT x = 0; x < W; x++)
+			{
+				float z = SceneZ(x - jx, y - jy);
+				depthJ[(size_t)y * W + x] = z > 0 ? A + B / z : 1.0f;
+				surfJ[(size_t)y * W + x] = (uint8_t)g_lastSurface;
+			}
+		Target tDepthJ = MakeTarget(dev, W, H, DXGI_FORMAT_R32_FLOAT, depthJ.data(), W * 4);
+		Target tPos = MakeTarget(dev, W, H, DXGI_FORMAT_R32G32B32A32_FLOAT);
+		// The reconstruction each pass uses, through a test entry point appended to its real source.
+		const char* entry = "\nfloat4 PS_TestViewPos(VPOS_T vposIn : VPOS) : COLOR\n{\n\tfloat2 px = PIXEL(vposIn);\n"
+							"\treturn float4(ViewPos(px, FetchZ(px)), 0);\n}\n";
+		ID3DBlob* posGeo = CompileText(g_geoSrc + entry, "geoprep.hlsl", "PS_TestViewPos", "ps_4_0");
+		ID3DBlob* posAo = CompileText(g_src + entry, "ao.hlsl", "PS_TestViewPos", "ps_4_0");
+		if (!posGeo || !posAo)
+			return 1;
+		ID3D11PixelShader *psPosGeo = nullptr, *psPosAo = nullptr;
+		dev->CreatePixelShader(posGeo->GetBufferPointer(), posGeo->GetBufferSize(), nullptr, &psPosGeo);
+		dev->CreatePixelShader(posAo->GetBufferPointer(), posAo->GetBufferSize(), nullptr, &psPosAo);
+		ID3D11ShaderResourceView* sJ[5] = { tDepthJ.srv, nullptr, nullptr, nullptr, nullptr };
+		const float saved[4] = { cProj2[0], cProj2[1], cProj2[2], cProj2[3] };
+		// Mean distance (in pixels at that depth) of the reconstructed positions from the ray-cast truth.
+		auto posError = [&](ID3DBlob* code, ID3D11PixelShader* ps, bool fold) {
+			cProj2[0] = fold ? jndc[0] : 0.0f;
+			cProj2[1] = fold ? jndc[1] : 0.0f;
+			pass(code, ps, tPos, W, H, sJ, across, false);
+			std::vector<float> pos = ReadBack(dev, ctx, tPos, W, H, 4);
+			double sum = 0;
+			int n = 0;
+			for (UINT y = 0; y < H; y += 3)
+				for (UINT x = 0; x < W; x += 3)
+				{
+					float z = SceneZ(x - jx, y - jy);
+					if (z <= 0)
+						continue;
+					float ndcX = 2.0f * (x - jx) / W - 1.0f, ndcY = 1.0f - 2.0f * (y - jy) / H;
+					const float* p = &pos[((size_t)y * W + x) * 4];
+					double ex = (p[0] - ndcX / P00 * z) * P00 / z * 0.5 * W, ey = (p[1] - ndcY / P11 * z) * P11 / z * 0.5 * H;
+					sum += sqrt(ex * ex + ey * ey);
+					n++;
+				}
+			return n ? sum / n : 1e9;
+		};
+		double gF = posError(posGeo, psPosGeo, true), gU = posError(posGeo, psPosGeo, false);
+		double aF = posError(posAo, psPosAo, true), aU = posError(posAo, psPosAo, false);
+		const double jl = sqrt((double)jx * jx + (double)jy * jy);
+		bool okPos = gF < 0.01 && aF < 0.01 && fabs(gU - jl) < 0.05 && fabs(aU - jl) < 0.05;
+		fails += !okPos;
+		printf("  jittered by (%.4f, %.4f) px: view positions off the truth by %.4f px (geometry prep) / %.4f px (GTAO) with the offset "
+			   "folded in, %.4f / %.4f px without (expected %.4f): %s\n",
+			jx, jy, gF, aF, gU, aU, jl, okPos ? "yes" : "NO");
+
+		// The prep's normals on the floor and the left wall: without the offset, the positions are
+		// sheared (x by -o.x / P00 * z, y by -o.y / P11 * z), which tilts those planes towards z.
+		auto tilt = [&](bool fold, double& floorZ, double& wallZ) {
+			cProj2[0] = fold ? jndc[0] : 0.0f;
+			cProj2[1] = fold ? jndc[1] : 0.0f;
+			pass(geoCode, geoPs, tGeo, HW, HH, sJ, across, false);
+			std::vector<float> g = ReadHalf(dev, ctx, tGeo, HW, HH);
+			double sf = 0, sw = 0;
+			int nf = 0, nw = 0;
+			for (UINT j = 2; j + 2 < HH; j++)
+				for (UINT i = 2; i + 2 < HW; i++)
+				{
+					int x = 2 * i, y = 2 * j, surf = surfJ[(size_t)y * W + x];
+					if (surf != SURF_FLOOR && surf != SURF_LEFT)
+						continue;
+					bool flat = true; // all neighbours the reconstruction uses on the same plane
+					for (int dy = -1; dy <= 1 && flat; dy++)
+						for (int dx = -1; dx <= 1 && flat; dx++)
+							flat = surfJ[(size_t)(y + dy) * W + x + dx] == surf;
+					if (!flat)
+						continue;
+					double nz = g[((size_t)j * HW + i) * 4 + 2];
+					if (surf == SURF_FLOOR)
+						sf += nz, nf++;
+					else
+						sw += nz, nw++;
+				}
+			floorZ = nf ? sf / nf : 1;
+			wallZ = nw ? sw / nw : 1;
+		};
+		double fF, wF, fU, wU;
+		tilt(true, fF, wF);
+		tilt(false, fU, wU);
+		// Expected without: the floor's normal (0, 1, 0) gets z = -o.y / P11 (o in NDC), the left wall's
+		// (1, 0, 0) z = -o.x / P00.
+		const double expF = -jndc[1] / P11, expW = -jndc[0] / P00;
+		bool okN = fabs(fF) < 0.1 * fabs(expF) && fabs(wF) < 0.1 * fabs(expW) && fabs(fU - expF) < 0.2 * fabs(expF) &&
+			fabs(wU - expW) < 0.2 * fabs(expW);
+		fails += !okN;
+		printf("  normal tilt (mean z of the prep's normals) on the floor %.6f, left wall %.6f with the offset folded in; %.6f, %.6f "
+			   "without (expected %.6f, %.6f): %s\n",
+			fF, wF, fU, wU, expF, expW, okN ? "yes" : "NO");
+		memcpy(cProj2, saved, sizeof(saved));
+		tDepthJ.tex->Release();
+		tPos.tex->Release();
+	}
+	{
+		// Noise: one frame against 16 frames averaged with the offsets the mod sets while TAA runs.
+		// The reference is what the same GTAO converges to over many frames: the mean of 64 frames
+		// with offsets on an 8 x 8 grid, unblurred. (Not GTAO with more slices and steps: its horizons
+		// are maxima over the steps, so 3 x 6 samples stay a little below 24 x 48 however many frames
+		// are averaged; that difference is the method's, and TAA can't change it. What TAA removes is
+		// the noise around this mean.)
+		const float saved[4] = { cProj2[0], cProj2[1], cProj2[2], cProj2[3] };
+		pass(geoCode, geoPs, tGeo, HW, HH, sGeo, across, false);
+		// The narrow blur the mod uses while TAA averages the frames (sigma 1 instead of 2).
+		ID3DBlob* lightCode = CompileEntry("PS_BlurNarrow", "ps_4_0");
+		if (!lightCode)
+			return 1;
+		ID3D11PixelShader* lightPs = nullptr;
+		dev->CreatePixelShader(lightCode->GetBufferPointer(), lightCode->GetBufferSize(), nullptr, &lightPs);
+		// One frame of the mod's chain (GTAO, blur across, blur down) with offsets `o`; blur 0 stops
+		// after GTAO, 1 = the blur without TAA, 2 = the narrow one. Returns AO (r) and contact (b).
+		auto frame = [&](const float o[2], int blurred) {
+			cProj2[2] = o[0];
+			cProj2[3] = o[1];
+			pass(gtaoCode, gtao, tAo[0], HW, HH, s0, across, false);
+			if (blurred)
+			{
+				pass(blurred == 2 ? lightCode : blurCode, blurred == 2 ? lightPs : blur, tAo[1], HW, HH, s1, across, false);
+				pass(blurred == 2 ? lightCode : blurCode, blurred == 2 ? lightPs : blur, tAo[0], HW, HH, s2, down, false);
+			}
+			return ReadHalf(dev, ctx, tAo[0], HW, HH);
+		};
+		const size_t texels = (size_t)HW * HH * 4;
+		std::vector<float> ref(texels, 0.0f);
+		for (int i = 0; i < 64; i++)
+		{
+			const float o[2] = { (i % 8 + 0.5f) / 8, (i / 8 + 0.5f) / 8 };
+			std::vector<float> r = frame(o, 0);
+			for (size_t k = 0; k < texels; k++)
+				ref[k] += r[k] / 64;
+		}
+		const int N = 16;
+		const float zero[2] = { 0, 0 };
+		std::vector<float> single = frame(zero, 1), singleRaw = frame(zero, 0), singleLight = frame(zero, 2);
+		std::vector<float> avgBlur(texels, 0.0f), avgRaw(texels, 0.0f), avgLight(texels, 0.0f), prevBlur, prevRaw, prevLight;
+		double flickerBlur = 0, flickerRaw = 0, flickerLight = 0;
+		for (int f = 0; f < N; f++)
+		{
+			float o[2];
+			R2((unsigned)f + 1, o);
+			std::vector<float> b = frame(o, 1), raw = frame(o, 0), light = frame(o, 2);
+			for (size_t k = 0; k < texels; k++)
+			{
+				avgBlur[k] += b[k] / N;
+				avgRaw[k] += raw[k] / N;
+				avgLight[k] += light[k] / N;
+			}
+			for (size_t k = 0; f > 0 && k < texels; k += 4)
+			{
+				flickerBlur += fabs(b[k] - prevBlur[k]);
+				flickerRaw += fabs(raw[k] - prevRaw[k]);
+				flickerLight += fabs(light[k] - prevLight[k]);
+			}
+			prevBlur = b;
+			prevRaw = raw;
+			prevLight = light;
+		}
+		// Mean |error| over the texels that aren't sky (AO clamped as the composite does); contact
+		// shadows only where the reference or the one-frame result is shadowed (most texels are lit
+		// and exact either way).
+		auto err = [&](const std::vector<float>& v, int ch) {
+			double sum = 0;
+			int n = 0;
+			for (size_t k = 0; k < texels; k += 4)
+			{
+				size_t t = k / 4;
+				if (depth[(t / HW * 2) * W + (t % HW) * 2] >= 1.0f)
+					continue;
+				if (ch == 2 && ref[k + 2] > 0.99f && singleRaw[k + 2] > 0.99f)
+					continue;
+				float a = v[k + ch], b = ref[k + ch];
+				if (ch == 0)
+				{
+					a = fminf(fmaxf(a, 0), 1);
+					b = fminf(fmaxf(b, 0), 1);
+				}
+				sum += fabs(a - b);
+				n++;
+			}
+			return n ? sum / n : 1e9;
+		};
+		double e1 = err(single, 0), eAvg = err(avgBlur, 0), e1Raw = err(singleRaw, 0), eRaw = err(avgRaw, 0);
+		double e1Light = err(singleLight, 0), eLight = err(avgLight, 0);
+		double c1 = err(single, 2), cAvg = err(avgBlur, 2), c1Raw = err(singleRaw, 2), cRaw = err(avgRaw, 2);
+		double c1Light = err(singleLight, 2), cLight = err(avgLight, 2);
+		const double changes = (double)HW * HH * (N - 1);
+		printf("  AO against what GTAO converges to (mean |error|), one frame -> %d frames averaged: blur without TAA (sigma 2) %.4f -> "
+			   "%.4f (%.0f%%); narrow blur with TAA (sigma 1) %.4f -> %.4f; no blur %.4f -> %.4f\n",
+			N, e1, eAvg, 100.0 * eAvg / e1, e1Light, eLight, e1Raw, eRaw);
+		printf("  contact shadows (shadowed texels): blur without TAA %.4f -> %.4f; narrow blur %.4f -> %.4f; no blur %.4f -> %.4f\n", c1,
+			cAvg, c1Light, cLight, c1Raw, cRaw);
+		printf("  AO frame-to-frame change with the offsets (what TAA has to absorb): blur without TAA %.4f, narrow %.4f, none %.4f\n",
+			flickerBlur / changes, flickerLight / changes, flickerRaw / changes);
+		// The contact shadow noise is checked before the blur: blurred, its error is the blur's
+		// spread of the shadow edge, which no averaging changes.
+		bool okNoise = eAvg < 0.8 * e1 && cRaw < 0.8 * c1Raw;
+		fails += !okNoise;
+		printf("  averaging frames with the per-frame offsets gets closer to it than one frame: %s\n", okNoise ? "yes" : "NO");
+		// The narrow blur pays only if a single frame (just after a disocclusion, or in fast motion,
+		// where TAA keeps little history) is no worse than with the wide blur, and the average is better.
+		bool okNarrow = e1Light < 1.15 * e1 && eLight < 0.85 * eAvg && c1Light < c1 && cLight < cAvg;
+		fails += !okNarrow;
+		printf("  narrow blur with TAA: one frame no worse than the wide blur (AO %.4f vs %.4f, contact %.4f vs %.4f), averaged better "
+			   "(AO %.4f vs %.4f, contact %.4f vs %.4f): %s\n",
+			e1Light, e1, c1Light, c1, eLight, eAvg, cLight, cAvg, okNarrow ? "yes" : "NO");
+		memcpy(cProj2, saved, sizeof(saved));
 	}
 	printf("ao (WARP): %s (pictures: tests/ao_warp_ao.png, ao_warp_contact.png, ao_warp_composite.png)\n", fails ? "FAILED" : "all ok");
 	return fails ? 3 : 0;

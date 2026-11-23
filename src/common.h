@@ -50,14 +50,14 @@ bool Shadows_TweaksOn();
 void Shadows_SetTweaksOn(bool on);
 float Shadows_GetSetting(int which);
 void Shadows_SetSetting(int which, float value);
-// In-game menu ([Menu] MenuKey shows it top right; Up/Down or 1-0 select, Left/Right change).
+// In-game shadow menu (tuning.cpp; [Menu] MenuKey, default F9; see core/menu.h for the keys).
 bool Tuning_Init();
 void Tuning_Flush(); // writes unsaved menu changes to the ini
 bool Tuning_Enabled();
+void Tuning_SetAllOn(bool on); // the "All shadow effects" switch (the all-effects key; not saved)
+bool Tuning_AllOn();
 struct IDirect3DDevice9;
-void Tuning_OnPresent(IDirect3DDevice9* dev, unsigned backBufferWidth, unsigned backBufferHeight);
-void Tuning_OnLostDevice();
-void Tuning_OnResetDevice();
+void Tuning_OnPresent(IDirect3DDevice9* dev);
 void FrameDump_Init(bool deviceHooksNeeded);
 bool FrameDump_Available(); // [Debug] FrameDump=1 and the hooks are in
 bool FrameDump_Busy();      // a dump is requested or being written

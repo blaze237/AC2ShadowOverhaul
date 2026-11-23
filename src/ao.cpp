@@ -1,18 +1,30 @@
 // Ambient occlusion and contact shadows: settings, the opaque-pass tracking and the passes. See
-// ao.h for the overview and aoshader.cpp for the shader rewrite.
+// ao.h for the overview and litshader.cpp for the shader rewrite.
 //
 // The frame (from F8 dumps): ... main opaque pass with RT0 = scene colour (FP16) and RT1 = z/w
 // (R32F), toggled off and on between batches; then RT1 is unbound and the sky is drawn, then
 // transparents. We bind our indirect-light target as RT2 and our sun-light target as RT3 whenever
-// the game binds a z/w target as RT1, and run our passes at the first thing after the pass.
+// the game binds a z/w target as RT1 (each only in frames where something reads it, see
+// FrameTargets), and run our passes at the first thing after the pass.
 //
-// Camera: the opaque shaders' g_WorldViewProj and g_World give ViewProj = WVP * World^-1, which
-// for a D3D perspective projection is P * V with P = [P00 0 P02 0; 0 P11 P12 0; 0 0 A B; 0 0 1 0].
-// From the rows: row3 = (forward, ...), so A, B, P00, P11, P02, P12 come out directly; z/w = A + B / z.
+// Camera: this frame's, from the shared scene tracker (core/scene.h, maths in core/camera.h), taken
+// once AO's own pass has started: the raster camera, with TAA's jitter folded in, because GTAO and
+// the contact shadows turn pixels of the (jittered) z/w target into view-space positions and back.
+//
+// TAA: the noise pattern and the blur are the same with and without it. Shifting the GTAO / contact
+// shadow noise every frame for TAA to average (with a narrower blur) was tried and dropped: TAA only
+// reprojects for the camera (the game has no motion vectors), so on anything that moves relative to
+// the world - Ezio above all - its history is rejected and the per-frame noise showed through raw,
+// as extra noise and swimming contact shadows on faces (in game, 2026-11-22).
 
 #include "ao.h"
 #include "common.h"
 #include "shaders_gen.h"
+#include "core/scene.h"
+#include "core/fxpass.h"
+#include "core/geoprep.h"
+#include "core/gputimer.h"
+#include "ssgi/gi.h"
 #include <math.h>
 #include <stdio.h>
 #include <unordered_map>
@@ -22,11 +34,16 @@
 static bool g_enabled = false;     // the shared machinery (shader outputs, passes) is set up
 static bool g_aoConfigured = false; // [AmbientOcclusion] Enabled
 static bool g_csConfigured = false; // [ContactShadows] Enabled
-static volatile bool g_on = true, g_csOn = true;
+static bool g_ssgiConfigured = false; // [SSGI] Enabled: the shaders get the outputs for the normals
+static volatile bool g_on = true, g_csOn = true, g_normalsOn = true;
 static volatile float g_radius = 1.5f, g_strength = 0.5f, g_csLength = 0.5f;
 static volatile int g_view = 0;
 
 bool AO_Enabled() { return g_enabled; }
+bool AO_Outputs() { return g_enabled || g_ssgiConfigured; }
+void AO_NoteSsgi(bool configured) { g_ssgiConfigured = configured; }
+bool AO_ShadingNormals() { return g_normalsOn; }
+void AO_SetShadingNormals(bool on) { g_normalsOn = on; }
 bool AO_Active() { return g_aoConfigured && g_on; }
 bool CS_Active() { return g_csConfigured && g_csOn; }
 void CS_SetOn(bool on) { g_csOn = on; }
@@ -45,6 +62,8 @@ bool AO_Init()
 	const char* S = "AmbientOcclusion";
 	g_aoConfigured = IniInt(S, "Enabled", 1) != 0;
 	g_enabled = g_aoConfigured || g_csConfigured;
+	// Read even with AO off: contact shadows and SSGI use the normals too.
+	g_normalsOn = IniInt(S, "ShadingNormals", 1) != 0;
 	if (!g_aoConfigured)
 	{
 		LogInfo("Ambient occlusion: off ([AmbientOcclusion] Enabled=0).");
@@ -74,277 +93,18 @@ bool CS_Init()
 	return true;
 }
 
-// ---- Vertex shaders: where the camera matrices are --------------------------------------------
-
-struct VsInfo
-{
-	int wvp = -1, world = -1;
-};
-static CRITICAL_SECTION g_vsLock;
-static std::unordered_map<void*, VsInfo> g_vsInfo;
-static bool g_vsLockReady = false;
-
-static void InitLock()
-{
-	if (!g_vsLockReady)
-	{
-		InitializeCriticalSection(&g_vsLock);
-		g_vsLockReady = true;
-	}
-}
-
-// Minimal vs_3_0 constant table reader (the shared one in sm3.h is for ps_3_0 code).
-static bool FindVsMatrices(const DWORD* code, VsInfo& info)
-{
-	if (!code || (code[0] & 0xFFFF0000) != 0xFFFE0000)
-		return false;
-	for (size_t i = 1; i < 4096 && code[i] != 0x0000FFFF;)
-	{
-		DWORD tok = code[i];
-		if ((tok & 0xFFFF) != 0xFFFE) // CTAB comes first, before any instruction
-			return false;
-		size_t len = (tok >> 16) & 0x7FFF;
-		if (len >= 8 && code[i + 1] == 0x42415443)
-		{
-			const uint8_t* base = (const uint8_t*)&code[i + 2];
-			size_t size = (len - 1) * 4;
-			auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-			auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-			DWORD count = rd32(12), infoOff = rd32(16);
-			for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-			{
-				size_t e = infoOff + 20 * k;
-				DWORD nameOff = rd32(e);
-				WORD set = rd16(e + 4), index = rd16(e + 6), regs = rd16(e + 8);
-				char name[32] = {};
-				for (size_t c = 0; c < sizeof(name) - 1 && nameOff + c < size && base[nameOff + c]; c++)
-					name[c] = (char)base[nameOff + c];
-				if (set == 2 && regs == 4 && strcmp(name, "g_WorldViewProj") == 0)
-					info.wvp = index;
-				if (set == 2 && regs == 4 && strcmp(name, "g_World") == 0)
-					info.world = index;
-			}
-			return info.wvp >= 0 && info.world >= 0;
-		}
-		i += 1 + len;
-	}
-	return false;
-}
-
-void AO_OnCreateVertexShader(IDirect3DVertexShader9* vs, const DWORD* code)
-{
-	if (!g_enabled || !vs)
-		return;
-	InitLock();
-	VsInfo info;
-	bool found = FindVsMatrices(code, info);
-	EnterCriticalSection(&g_vsLock);
-	if (found)
-		g_vsInfo[vs] = info;
-	else
-		g_vsInfo.erase(vs); // the address may have belonged to a released shader
-	LeaveCriticalSection(&g_vsLock);
-}
-
-// ---- Pixel shaders: where the sun direction is -------------------------------------------------
-
-static std::unordered_map<void*, int> g_psSun; // game pixel shader -> register of g_ShadowedDirect (guarded by g_vsLock)
-
-void AO_OnCreatePixelShader(IDirect3DPixelShader9* ps, const DWORD* code)
-{
-	if (!g_enabled || !ps)
-		return;
-	InitLock();
-	int reg = AO_SunRegister(code);
-	EnterCriticalSection(&g_vsLock);
-	if (reg >= 0)
-		g_psSun[ps] = reg;
-	else
-		g_psSun.erase(ps);
-	LeaveCriticalSection(&g_vsLock);
-}
-
-static float g_sunWorld[3];   // direction towards the sun, world space (last seen)
-static bool g_sunKnown = false, g_sunThisFrame = false;
-
-static void CaptureSun(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
-{
-	if (!ps || !g_vsLockReady)
-		return;
-	int reg = -1;
-	EnterCriticalSection(&g_vsLock);
-	auto it = g_psSun.find(ps);
-	if (it != g_psSun.end())
-		reg = it->second;
-	LeaveCriticalSection(&g_vsLock);
-	float v[4];
-	if (reg < 0 || FAILED(dev->GetPixelShaderConstantF(reg, v, 1)))
-		return;
-	float len = sqrtf(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
-	if (!(len > 0.5f && len < 2.0f))
-		return;
-	for (int k = 0; k < 3; k++)
-		g_sunWorld[k] = v[k] / len;
-	if (!g_sunKnown)
-		LogInfo("Contact shadows: sun direction found (%.3f, %.3f, %.3f).", g_sunWorld[0], g_sunWorld[1], g_sunWorld[2]);
-	g_sunKnown = g_sunThisFrame = true;
-}
-
 // ---- Camera ------------------------------------------------------------------------------------
 
-struct Camera
-{
-	bool ok = false;
-	float A, B, P00, P11, P02, P12;
-	float right[3], up[3], forward[3]; // view axes in world space
-};
-static Camera g_cam;
-static bool g_camWarned = false;
-
-static bool Invert4(const double m[4][4], double out[4][4])
-{
-	double a[4][8];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 8; c++)
-			a[r][c] = c < 4 ? m[r][c] : (c - 4 == r ? 1.0 : 0.0);
-	for (int c = 0; c < 4; c++)
-	{
-		int piv = c;
-		for (int r = c + 1; r < 4; r++)
-			if (fabs(a[r][c]) > fabs(a[piv][c]))
-				piv = r;
-		if (fabs(a[piv][c]) < 1e-12)
-			return false;
-		for (int k = 0; k < 8; k++)
-		{
-			double t = a[c][k];
-			a[c][k] = a[piv][k];
-			a[piv][k] = t;
-		}
-		double inv = 1.0 / a[c][c];
-		for (int k = 0; k < 8; k++)
-			a[c][k] *= inv;
-		for (int r = 0; r < 4; r++)
-			if (r != c)
-			{
-				double f = a[r][c];
-				for (int k = 0; k < 8; k++)
-					a[r][k] -= f * a[c][k];
-			}
-	}
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			out[r][c] = a[r][c + 4];
-	return true;
-}
-
-// Camera from one draw's matrices (registers hold matrix rows: clip.x = dot(position, c[wvp])).
-static bool CameraFromMatrices(const float wvp[16], const float world[16], Camera& cam, char* why, size_t whySize)
-{
-	double M[4][4], Wm[4][4], Wi[4][4], VP[4][4];
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-		{
-			M[r][c] = wvp[r * 4 + c];
-			Wm[r][c] = world[r * 4 + c];
-		}
-	if (!Invert4(Wm, Wi))
-	{
-		snprintf(why, whySize, "world matrix not invertible");
-		return false;
-	}
-	for (int r = 0; r < 4; r++)
-		for (int c = 0; c < 4; c++)
-			VP[r][c] = M[r][0] * Wi[0][c] + M[r][1] * Wi[1][c] + M[r][2] * Wi[2][c] + M[r][3] * Wi[3][c];
-	auto dot3 = [](const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
-	double s = sqrt(dot3(VP[3], VP[3]));
-	if (fabs(s - 1.0) > 0.01)
-	{
-		snprintf(why, whySize, "not a standard perspective projection (|w row| = %g)", s);
-		return false;
-	}
-	double f[3] = { VP[3][0] / s, VP[3][1] / s, VP[3][2] / s };
-	double A = dot3(VP[2], f) / s, B = VP[2][3] - A * VP[3][3];
-	double p02 = dot3(VP[0], f) / s, p12 = dot3(VP[1], f) / s;
-	double r0[3], r1[3], res[3];
-	for (int k = 0; k < 3; k++)
-	{
-		r0[k] = VP[0][k] - p02 * VP[3][k];
-		r1[k] = VP[1][k] - p12 * VP[3][k];
-		res[k] = VP[2][k] - A * VP[3][k];
-	}
-	double p00 = sqrt(dot3(r0, r0)), p11 = sqrt(dot3(r1, r1));
-	double near_ = A != 0 ? -B / A : 0;
-	if (sqrt(dot3(res, res)) > 1e-3 * fabs(A) || !(A > 0.5) || !(B < 0) || !(near_ > 0) || p00 < 1e-3 || p11 < 1e-3 || fabs(dot3(r0, r1)) > 1e-3 * p00 * p11)
-	{
-		snprintf(why, whySize, "unexpected projection (A %g, B %g, P00 %g, P11 %g)", A, B, p00, p11);
-		return false;
-	}
-	cam.A = (float)A;
-	cam.B = (float)B;
-	cam.P00 = (float)p00;
-	cam.P11 = (float)p11;
-	cam.P02 = (float)p02;
-	cam.P12 = (float)p12;
-	for (int k = 0; k < 3; k++)
-	{
-		cam.right[k] = (float)(r0[k] / p00);
-		cam.up[k] = (float)(r1[k] / p11);
-		cam.forward[k] = (float)f[k];
-	}
-	cam.ok = true;
-	return true;
-}
-
-static void CaptureCamera(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
-{
-	if (!vs || !g_vsLockReady)
-		return;
-	VsInfo info;
-	EnterCriticalSection(&g_vsLock);
-	auto it = g_vsInfo.find(vs);
-	if (it != g_vsInfo.end())
-		info = it->second;
-	LeaveCriticalSection(&g_vsLock);
-	if (info.wvp < 0)
-		return;
-	float wvp[16], world[16];
-	if (FAILED(dev->GetVertexShaderConstantF(info.wvp, wvp, 4)) || FAILED(dev->GetVertexShaderConstantF(info.world, world, 4)))
-		return;
-	char why[160];
-	Camera cam;
-	if (CameraFromMatrices(wvp, world, cam, why, sizeof(why)))
-	{
-		static bool logged = false;
-		if (!logged)
-		{
-			logged = true;
-			LogInfo("Ambient occlusion: camera found (near %.3f m, far %.0f m, horizontal fov %.1f deg).", -cam.B / cam.A,
-				cam.B / (1.0f - cam.A), 2.0 * atan(1.0 / cam.P00) * 57.29578);
-		}
-		g_cam = cam;
-	}
-	else if (!g_camWarned)
-	{
-		g_camWarned = true;
-		LogWarn("Ambient occlusion: could not read the camera from the shader constants (%s).", why);
-	}
-}
+static bool g_camOk = false; // this frame's camera (core::Scene().rasterCamera) was found during our pass
 
 // ---- Device resources --------------------------------------------------------------------------
 
-static AoDeviceFns D;
-static const GUID kIID_Texture9 = { 0x85c31227, 0x3de5, 0x4f00, { 0x9b, 0x3a, 0xf1, 0x1a, 0xc3, 0x8c, 0x18, 0xb5 } };
-void AO_SetDeviceFns(const AoDeviceFns& fns) { D = fns; }
+static const core::DeviceFns& D = core::Orig();
 
-static IDirect3DTexture9* g_indirectTex;
-static IDirect3DSurface9* g_indirectSurf;
-static IDirect3DTexture9* g_sunTex;
-static IDirect3DSurface9* g_sunSurf;
-static IDirect3DTexture9* g_aoTex[2];
-static IDirect3DSurface9* g_aoSurf[2];
+static core::RenderTarget g_indirect, g_sun; // full size: the opaque pass's indirect and sun light
+static core::RenderTarget g_ao[2];           // half size: r = AO, g = view z, b = contact shadow
 static UINT g_w, g_h, g_hw, g_hh;
-static IDirect3DStateBlock9* g_state;
+static core::PassState g_state;
 static IDirect3DVertexShader9* g_vsFull;
 static IDirect3DPixelShader9 *g_psGtao, *g_psBlur, *g_psComposite;
 static IDirect3DVertexDeclaration9* g_decl;
@@ -353,21 +113,11 @@ static bool g_capsChecked = false;
 
 static void ReleaseTargets()
 {
-	auto rel = [](auto*& p) {
-		if (p)
-			p->Release();
-		p = nullptr;
-	};
-	rel(g_indirectSurf);
-	rel(g_indirectTex);
-	rel(g_sunSurf);
-	rel(g_sunTex);
+	g_indirect.Release();
+	g_sun.Release();
 	for (int i = 0; i < 2; i++)
-	{
-		rel(g_aoSurf[i]);
-		rel(g_aoTex[i]);
-	}
-	rel(g_state);
+		g_ao[i].Release();
+	g_state.Release();
 	g_w = g_h = 0;
 }
 
@@ -397,47 +147,36 @@ static bool EnsureResources(IDirect3DDevice9* dev, UINT w, UINT h)
 	if (!g_vsFull)
 	{
 		HRESULT hr;
-		const D3DVERTEXELEMENT9 decl[] = { { 0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 }, D3DDECL_END() };
 		if (FAILED(hr = D.CreateVertexShader(dev, kAoFullscreenVs, &g_vsFull)) || FAILED(hr = D.CreatePixelShader(dev, kAoGtaoPs, &g_psGtao)) ||
 			FAILED(hr = D.CreatePixelShader(dev, kAoBlurPs, &g_psBlur)) ||
-			FAILED(hr = D.CreatePixelShader(dev, kAoCompositePs, &g_psComposite)) || FAILED(hr = dev->CreateVertexDeclaration(decl, &g_decl)))
+			FAILED(hr = D.CreatePixelShader(dev, kAoCompositePs, &g_psComposite)) || !(g_decl = core::FullscreenDecl(dev)))
 		{
 			Fail("could not create its shaders", hr);
 			return false;
 		}
 	}
-	if (g_indirectTex && g_w == w && g_h == h)
+	if (g_indirect.tex && g_w == w && g_h == h)
 		return true;
 	ReleaseTargets();
 	HRESULT hr;
 	UINT hw = (w + 1) / 2, hh = (h + 1) / 2;
-	if (FAILED(hr = D.CreateTexture(dev, w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_indirectTex, NULL)) ||
-		FAILED(hr = g_indirectTex->GetSurfaceLevel(0, &g_indirectSurf)))
+	if (FAILED(hr = g_indirect.Create(dev, w, h, D3DFMT_A16B16G16R16F)))
 	{
 		Fail("could not create its indirect light target", hr);
 		return false;
 	}
-	if (FAILED(hr = D.CreateTexture(dev, w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_sunTex, NULL)) ||
-		FAILED(hr = g_sunTex->GetSurfaceLevel(0, &g_sunSurf)))
+	if (FAILED(hr = g_sun.Create(dev, w, h, D3DFMT_A16B16G16R16F)))
 	{
 		Fail("could not create its sun light target", hr);
 		return false;
 	}
 	for (int i = 0; i < 2; i++)
-	{
-		// r = AO, g = view z, b = contact shadow
-		if (FAILED(hr = D.CreateTexture(dev, hw, hh, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_aoTex[i], NULL)))
+		if (FAILED(hr = g_ao[i].Create(dev, hw, hh, D3DFMT_A16B16G16R16F)))
 		{
 			Fail("could not create its AO targets", hr);
 			return false;
 		}
-		if (FAILED(hr = g_aoTex[i]->GetSurfaceLevel(0, &g_aoSurf[i])))
-		{
-			Fail("could not get its AO targets", hr);
-			return false;
-		}
-	}
-	if (FAILED(hr = dev->CreateStateBlock(D3DSBT_ALL, &g_state)))
+	if (FAILED(hr = g_state.Create(dev)))
 	{
 		Fail("could not create a state block", hr);
 		return false;
@@ -454,10 +193,10 @@ void AO_OnLostDevice() { ReleaseTargets(); }
 
 // ---- Opaque pass tracking ----------------------------------------------------------------------
 
-static bool g_inPass = false;   // our target is bound as RT2
+static bool g_inPass = false;   // the opaque pass is drawing (our targets, those in use, are bound)
 static bool g_pending = false;  // the pass ended; AO is due before the next thing that draws
 static bool g_done = false;     // AO applied this frame (or skipped for good this frame)
-static bool g_cleared = false;  // indirect target cleared this frame
+static bool g_cleared = false;  // this frame's targets chosen (FrameTargets) and cleared
 static int g_passDraws = 0;
 static IDirect3DSurface9* g_depthSurf;  // the game's z/w target during the pass
 static IDirect3DSurface9* g_colourSurf; // the game's scene colour target during the pass
@@ -465,16 +204,10 @@ static IDirect3DSurface9* g_colourSurf; // the game's scene colour target during
 // The game's z/w target being bound as RT1 next to a scene colour target of the same size.
 static bool IsOpaquePass(IDirect3DSurface9* s, IDirect3DSurface9* rt0, UINT& w, UINT& h)
 {
-	if (!s || !rt0)
+	const core::ZwBinding b = core::InspectRt1(s, rt0);
+	if (!b.zw)
 		return false;
-	D3DSURFACE_DESC d = {}, c = {};
-	if (FAILED(s->GetDesc(&d)) || FAILED(rt0->GetDesc(&c)))
-		return false;
-	if (d.Format != D3DFMT_R32F || !(d.Usage & D3DUSAGE_RENDERTARGET) || d.MultiSampleType != D3DMULTISAMPLE_NONE)
-		return false;
-	if (c.Width != d.Width || c.Height != d.Height)
-		return false;
-	if (c.MultiSampleType != D3DMULTISAMPLE_NONE)
+	if (b.colourMsaa)
 	{
 		static bool warned = false;
 		if (!warned)
@@ -484,16 +217,37 @@ static bool IsOpaquePass(IDirect3DSurface9* s, IDirect3DSurface9* rt0, UINT& w, 
 		}
 		return false;
 	}
-	IDirect3DTexture9* tex = nullptr;
-	if (FAILED(s->GetContainer(kIID_Texture9, (void**)&tex)) || !tex)
+	if (!b.zwTexture)
 		return false;
-	tex->Release();
-	w = d.Width;
-	h = d.Height;
+	w = b.width;
+	h = b.height;
 	return true;
 }
 
 static void Composite(IDirect3DDevice9* dev);
+
+// Which of our targets this frame's opaque pass writes, chosen once per frame at its first batch (a
+// menu change mid-frame takes effect the next frame, so a target is never half written): the
+// indirect light for AO and its "indirect light" view, the sun light for contact shadows and the
+// "sun light" view, both for the shading normals (one octahedral component in each alpha), which
+// GTAO, contact shadows (their debug views too) and SSGI read. The AO and contact shadow views
+// themselves need neither colour.
+static bool g_useIndirect = false, g_useSun = false, g_useNormals = false;
+
+static bool FrameTargets()
+{
+	g_useNormals = g_normalsOn && (AO_Active() || CS_Active() || g_view || ssgi::GI_Active());
+	g_useIndirect = AO_Active() || g_view == 2 || g_useNormals;
+	g_useSun = CS_Active() || g_view == 4 || g_useNormals;
+	return AO_Active() || CS_Active() || g_view || g_useNormals;
+}
+
+static IDirect3DSurface9* OurTarget(DWORD index)
+{
+	if (index == 2)
+		return g_useIndirect ? g_indirect.surf : nullptr;
+	return index == 3 && g_useSun ? g_sun.surf : nullptr;
+}
 
 // Between its opaque batches the game unbinds render target 1 and also resets targets 2 and 3, so
 // only a change of render target 0 (or a draw, clear, ...) ends the pass.
@@ -507,14 +261,17 @@ bool AO_BeforeSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfa
 
 void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s, IDirect3DSurface9* rt0)
 {
-	if (!g_enabled || g_failed || index == 0)
+	if (!AO_Outputs() || g_failed || index == 0)
 		return;
 	if (index >= 2)
 	{
 		if (!g_inPass || index > 3)
 			return;
 		if (!s)
-			D.SetRenderTarget(dev, index, index == 2 ? g_indirectSurf : g_sunSurf); // the game reset the slot: keep ours bound
+		{
+			if (OurTarget(index))
+				D.SetRenderTarget(dev, index, OurTarget(index)); // the game reset the slot: keep ours bound
+		}
 		else
 		{
 			static bool warned = false;
@@ -531,17 +288,22 @@ void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 	if (s)
 	{
 		UINT w, h;
-		if (g_done || !(AO_Active() || CS_Active() || g_view) || !IsOpaquePass(s, rt0, w, h) || !EnsureResources(dev, w, h))
+		if (g_done || (!g_cleared && !FrameTargets()) || !IsOpaquePass(s, rt0, w, h) || !EnsureResources(dev, w, h))
 			return;
 		if (!g_cleared)
 		{
-			D.ColorFill(dev, g_indirectSurf, NULL, 0);
-			D.ColorFill(dev, g_sunSurf, NULL, 0);
+			// 0 everywhere: no light to remove, and no normal (the geometry prep falls back to the
+			// depth's) where nothing writes them.
+			if (g_useIndirect)
+				D.ColorFill(dev, g_indirect.surf, NULL, 0);
+			if (g_useSun)
+				D.ColorFill(dev, g_sun.surf, NULL, 0);
 			g_cleared = true;
 			g_passDraws = 0;
 		}
-		D.SetRenderTarget(dev, 2, g_indirectSurf);
-		D.SetRenderTarget(dev, 3, g_sunSurf);
+		for (DWORD i = 2; i <= 3; i++)
+			if (OurTarget(i))
+				D.SetRenderTarget(dev, i, OurTarget(i));
 		g_inPass = true;
 		g_pending = false;
 		g_depthSurf = s;
@@ -549,15 +311,16 @@ void AO_AfterSetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurfac
 	}
 	else if (g_inPass)
 	{
-		D.SetRenderTarget(dev, 2, nullptr);
-		D.SetRenderTarget(dev, 3, nullptr);
+		for (DWORD i = 2; i <= 3; i++)
+			if (OurTarget(i))
+				D.SetRenderTarget(dev, i, nullptr);
 		g_inPass = false;
 		if (g_passDraws > 0)
 			g_pending = true;
 	}
 }
 
-bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DPixelShader9* ps)
+bool AO_BeforeDraw(IDirect3DDevice9* dev)
 {
 	if (g_pending)
 	{
@@ -567,10 +330,8 @@ bool AO_BeforeDraw(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs, IDirect3DP
 	if (g_inPass)
 	{
 		g_passDraws++;
-		if (!g_cam.ok)
-			CaptureCamera(dev, vs);
-		if (!g_sunThisFrame)
-			CaptureSun(dev, ps);
+		if (!g_camOk)
+			g_camOk = core::Scene().rasterCamera.ok;
 	}
 	return false;
 }
@@ -591,31 +352,18 @@ bool AO_BeforePresent(IDirect3DDevice9* dev)
 	if (g_inPass)
 	{
 		// The pass never unbound its z/w target: leave the frame alone.
-		D.SetRenderTarget(dev, 2, nullptr);
-		D.SetRenderTarget(dev, 3, nullptr);
+		for (DWORD i = 2; i <= 3; i++)
+			if (OurTarget(i))
+				D.SetRenderTarget(dev, i, nullptr);
 		g_inPass = false;
 	}
 	g_done = g_cleared = g_pending = false;
-	g_cam.ok = false;
-	g_sunThisFrame = false;
+	g_camOk = false;
 	g_passDraws = 0;
 	return applied;
 }
 
 // ---- The AO passes -----------------------------------------------------------------------------
-
-static void Fullscreen(IDirect3DDevice9* dev)
-{
-	static const float tri[3][4] = { { -1, -1, 0, 1 }, { -1, 3, 0, 1 }, { 3, -1, 0, 1 } };
-	D.DrawPrimitiveUP(dev, D3DPT_TRIANGLELIST, 1, tri, sizeof(tri[0]));
-}
-
-static void SetTarget(IDirect3DDevice9* dev, IDirect3DSurface9* s, UINT w, UINT h)
-{
-	D.SetRenderTarget(dev, 0, s);
-	D3DVIEWPORT9 vp = { 0, 0, w, h, 0.0f, 1.0f };
-	D.SetViewport(dev, &vp);
-}
 
 static float g_lastConsts[8][4];
 static bool g_haveLastConsts = false;
@@ -639,7 +387,13 @@ static void Composite(IDirect3DDevice9* dev)
 {
 	g_pending = false;
 	g_done = true;
-	if (!g_cam.ok)
+	// The pass wrote the shading normals: the geometry prep (made next, by GTAO below or by SSGI)
+	// reads them.
+	if (g_useNormals)
+		core::Geo_SetShadingNormals(g_indirect.tex, g_sun.tex);
+	if (!(AO_Active() || CS_Active() || g_view))
+		return; // the pass ran for SSGI's normals only
+	if (!g_camOk)
 	{
 		static bool warned = false;
 		if (!warned)
@@ -649,115 +403,77 @@ static void Composite(IDirect3DDevice9* dev)
 		}
 		return;
 	}
-	if (!g_state || !g_depthSurf || !g_colourSurf)
+	if (!g_state.Ready() || !g_depthSurf || !g_colourSurf)
 		return;
 	IDirect3DTexture9* depthTex = nullptr;
-	if (FAILED(g_depthSurf->GetContainer(kIID_Texture9, (void**)&depthTex)) || !depthTex)
+	if (FAILED(g_depthSurf->GetContainer(core::kIID_Texture9, (void**)&depthTex)) || !depthTex)
 		return;
 
-	// Save everything we touch: state block for states/shaders/constants/textures/viewport, and the
-	// render targets and depth buffer by hand (state blocks don't hold them).
-	g_state->Capture();
-	IDirect3DSurface9* oldRt[4] = {};
-	IDirect3DSurface9* oldDs = nullptr;
-	for (DWORD i = 0; i < 4; i++)
-		if (FAILED(dev->GetRenderTarget(i, &oldRt[i])))
-			oldRt[i] = nullptr;
-	if (FAILED(dev->GetDepthStencilSurface(&oldDs)))
-		oldDs = nullptr;
-	// Vertex input, by hand as well: the game draws instanced geometry (foliage), and our
-	// DrawPrimitiveUP calls reset stream 0 and must run with instancing off. A stale stream or
-	// frequency on the game's next instanced draw shows up as long stretched triangles.
-	const UINT kStreams = 8;
-	IDirect3DVertexBuffer9* oldVb[kStreams] = {};
-	UINT oldOffset[kStreams] = {}, oldStride[kStreams] = {}, oldFreq[kStreams];
-	for (UINT i = 0; i < kStreams; i++)
+	g_state.Save(dev);
+	core::GpuTimer_Begin(dev, core::GT_AO);
+	g_state.BeginPasses(dev, g_decl, g_vsFull);
+	const core::CameraFloats& cam = core::Scene().rasterCamera.f; // jittered like the z/w target
+	const float noise[2] = { 0.0f, 0.0f }; // the same pattern every frame (see the top)
+	// Normals at half res, shared with SSGI (which runs next and reuses them).
+	IDirect3DTexture9* geo = core::Geo_Ensure(dev, depthTex, g_w, g_h, cam);
+	if (!geo)
 	{
-		oldFreq[i] = 1;
-		if (FAILED(dev->GetStreamSource(i, &oldVb[i], &oldOffset[i], &oldStride[i])))
-			oldVb[i] = nullptr;
-		dev->GetStreamSourceFreq(i, &oldFreq[i]);
+		core::GpuTimer_End(core::GT_AO);
+		g_state.Restore(dev);
+		depthTex->Release();
+		return;
 	}
-	IDirect3DIndexBuffer9* oldIb = nullptr;
-	if (FAILED(dev->GetIndices(&oldIb)))
-		oldIb = nullptr;
-	IDirect3DVertexDeclaration9* oldDecl = nullptr;
-	if (FAILED(dev->GetVertexDeclaration(&oldDecl)))
-		oldDecl = nullptr;
-	DWORD oldFvf = 0;
-	dev->GetFVF(&oldFvf);
-	for (UINT i = 0; i < kStreams; i++)
-		if (oldFreq[i] != 1)
-			dev->SetStreamSourceFreq(i, 1);
-
-	const DWORD rs[][2] = {
-		{ D3DRS_ZENABLE, FALSE }, { D3DRS_ZWRITEENABLE, FALSE }, { D3DRS_STENCILENABLE, FALSE }, { D3DRS_ALPHATESTENABLE, FALSE },
-		{ D3DRS_ALPHABLENDENABLE, FALSE }, { D3DRS_SEPARATEALPHABLENDENABLE, FALSE }, { D3DRS_CULLMODE, D3DCULL_NONE },
-		{ D3DRS_SCISSORTESTENABLE, FALSE }, { D3DRS_COLORWRITEENABLE, 0xF }, { D3DRS_SRGBWRITEENABLE, FALSE },
-		{ D3DRS_FOGENABLE, FALSE }, { D3DRS_CLIPPLANEENABLE, 0 }, { D3DRS_FILLMODE, D3DFILL_SOLID },
-		{ D3DRS_TWOSIDEDSTENCILMODE, FALSE }, { D3DRS_POINTSPRITEENABLE, FALSE },
-	};
-	for (const auto& r : rs)
-		dev->SetRenderState((D3DRENDERSTATETYPE)r[0], r[1]);
 	for (DWORD s = 0; s < 4; s++)
-	{
-		dev->SetSamplerState(s, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-		dev->SetSamplerState(s, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-		dev->SetSamplerState(s, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-		dev->SetSamplerState(s, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-		dev->SetSamplerState(s, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-		dev->SetSamplerState(s, D3DSAMP_SRGBTEXTURE, FALSE);
-		dev->SetSamplerState(s, D3DSAMP_MAXMIPLEVEL, 0);
-	}
-	D.SetDepthStencilSurface(dev, nullptr);
-	for (DWORD i = 1; i < 4; i++)
-		if (oldRt[i])
-			D.SetRenderTarget(dev, i, nullptr);
-	dev->SetVertexDeclaration(g_decl);
-	D.SetVertexShader(dev, g_vsFull);
+		core::SetSamplerClamp(dev, s, D3DTEXF_POINT);
 
 	const float view = (float)g_view;
-	// Sun direction in view space; contact shadows off = length 0. AO off = strength 0 (AO^0 = 1).
+	// Sun direction in view space (the scene tracker's: this frame's, else the last seen);
+	// contact shadows off = length 0. AO off = strength 0 (AO^0 = 1).
+	const core::SceneState& sc = core::Scene();
 	float sunView[3] = { 0, 0, 0 };
-	const float* axes[3] = { g_cam.right, g_cam.up, g_cam.forward };
+	const float* axes[3] = { cam.right, cam.up, cam.forward };
 	for (int k = 0; k < 3; k++)
-		sunView[k] = axes[k][0] * g_sunWorld[0] + axes[k][1] * g_sunWorld[1] + axes[k][2] * g_sunWorld[2];
-	const bool cs = CS_Active() && g_sunKnown;
+		sunView[k] = axes[k][0] * sc.sunDir[0] + axes[k][1] * sc.sunDir[1] + axes[k][2] * sc.sunDir[2];
+	const bool cs = CS_Active() && sc.sunKnown;
 	const float aoStrength = AO_Active() ? g_strength : 0.0f;
 	const float c[8][4] = {
 		{ (float)g_w, (float)g_h, 1.0f / g_w, 1.0f / g_h },
 		{ (float)g_hw, (float)g_hh, 1.0f / g_hw, 1.0f / g_hh },
-		{ g_cam.A, g_cam.B, g_cam.P00, g_cam.P11 },
-		{ g_cam.P02, g_cam.P12, 0, 0 },
-		{ g_radius, 0.5f * g_cam.P00 * g_w, 0.1f * g_h, 0.6f },
+		{ cam.A, cam.B, cam.P00, cam.P11 },
+		{ cam.P02, cam.P12, noise[0], noise[1] }, // zw: added to the slice / step noise
+		{ g_radius, 0.5f * cam.P00 * g_w, 0.1f * g_h, 0.6f },
 		{ aoStrength, view, 1, 0 },
 		{ sunView[0], sunView[1], sunView[2], cs ? g_csLength : 0.0f },
 		{ 0.05f, 0.01f, 1.0f, 0.002f }, // contact shadows: thickness base (m), thickness per metre, strength, depth bias per metre
 	};
 	dev->SetPixelShaderConstantF(0, &c[0][0], 8);
+	// The composite reads only the targets written this frame (the others hold an older frame's).
+	const float targets[4] = { g_useIndirect ? 1.0f : 0.0f, g_useSun ? 1.0f : 0.0f, 0, 0 };
+	dev->SetPixelShaderConstantF(8, targets, 1);
 	memcpy(g_lastConsts, c, sizeof(c));
 	g_haveLastConsts = true;
 
 	// GTAO -> ao[0]; blur across -> ao[1]; blur down -> ao[0]
 	D.SetTexture(dev, 0, depthTex);
-	SetTarget(dev, g_aoSurf[0], g_hw, g_hh);
+	D.SetTexture(dev, 1, geo);
+	core::SetTarget(dev, g_ao[0].surf, g_hw, g_hh);
 	D.SetPixelShader(dev, g_psGtao);
-	Fullscreen(dev);
+	core::DrawFullscreen(dev);
 	D.SetPixelShader(dev, g_psBlur);
-	SetTarget(dev, g_aoSurf[1], g_hw, g_hh);
-	D.SetTexture(dev, 1, g_aoTex[0]);
-	Fullscreen(dev);
+	core::SetTarget(dev, g_ao[1].surf, g_hw, g_hh);
+	D.SetTexture(dev, 1, g_ao[0].tex);
+	core::DrawFullscreen(dev);
 	const float down[4] = { aoStrength, view, 0, 1 };
 	dev->SetPixelShaderConstantF(5, down, 1);
-	SetTarget(dev, g_aoSurf[0], g_hw, g_hh);
-	D.SetTexture(dev, 1, g_aoTex[1]);
-	Fullscreen(dev);
+	core::SetTarget(dev, g_ao[0].surf, g_hw, g_hh);
+	D.SetTexture(dev, 1, g_ao[1].tex);
+	core::DrawFullscreen(dev);
 
 	// Composite: scene colour -= (1 - AO) x indirect + (1 - contact) x sun (colour channels only).
-	SetTarget(dev, g_colourSurf, g_w, g_h);
-	D.SetTexture(dev, 1, g_aoTex[0]);
-	D.SetTexture(dev, 2, g_indirectTex);
-	D.SetTexture(dev, 3, g_sunTex);
+	core::SetTarget(dev, g_colourSurf, g_w, g_h);
+	D.SetTexture(dev, 1, g_ao[0].tex);
+	D.SetTexture(dev, 2, g_useIndirect ? g_indirect.tex : nullptr);
+	D.SetTexture(dev, 3, g_useSun ? g_sun.tex : nullptr);
 	if (g_view == 0)
 	{
 		dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
@@ -767,35 +483,10 @@ static void Composite(IDirect3DDevice9* dev)
 		dev->SetRenderState(D3DRS_COLORWRITEENABLE, D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE);
 	}
 	D.SetPixelShader(dev, g_psComposite);
-	Fullscreen(dev);
+	core::DrawFullscreen(dev);
 
-	// Restore.
-	for (DWORD i = 0; i < 4; i++)
-		if (i == 0 || oldRt[i])
-			D.SetRenderTarget(dev, i, oldRt[i]);
-	D.SetDepthStencilSurface(dev, oldDs);
-	g_state->Apply();
-	if (oldDecl)
-		dev->SetVertexDeclaration(oldDecl);
-	else
-		dev->SetFVF(oldFvf);
-	for (UINT i = 0; i < kStreams; i++)
-	{
-		dev->SetStreamSource(i, oldVb[i], oldOffset[i], oldStride[i]);
-		dev->SetStreamSourceFreq(i, oldFreq[i]);
-		if (oldVb[i])
-			oldVb[i]->Release();
-	}
-	dev->SetIndices(oldIb);
-	if (oldIb)
-		oldIb->Release();
-	if (oldDecl)
-		oldDecl->Release();
-	for (DWORD i = 0; i < 4; i++)
-		if (oldRt[i])
-			oldRt[i]->Release();
-	if (oldDs)
-		oldDs->Release();
+	core::GpuTimer_End(core::GT_AO);
+	g_state.Restore(dev);
 	depthTex->Release();
 
 	static bool first = true;

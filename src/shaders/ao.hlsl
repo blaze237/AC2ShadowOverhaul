@@ -1,6 +1,7 @@
 // AC2ShadowOverhaul ambient occlusion and contact shadows: GTAO ("Practical Real-Time Strategies
 // for Accurate Indirect Occlusion", Jimenez et al. 2016; integration as in Intel's XeGTAO) and a
-// short ray march towards the sun, both at half resolution from the game's z/w target, a
+// short ray march towards the sun, both at half resolution from the game's z/w target (normals from
+// the geometry prep shared with SSGI, src/core/shaders/geoprep.hlsl), a
 // depth-aware blur, and a composite that removes the occluded share of the indirect light and the
 // contact-shadowed share of the sun light from the scene colour.
 //
@@ -12,14 +13,16 @@
 float4 c_Full   : register(c0); // full-res width, height, 1/width, 1/height
 float4 c_Half   : register(c1); // AO-res width, height, 1/width, 1/height
 float4 c_Proj   : register(c2); // A, B (z/w = A + B / z), P00, P11
-float4 c_Proj2  : register(c3); // P02, P12 (off-centre), 0, 0
+float4 c_Proj2  : register(c3); // P02, P12 (off-centre; with TAA's jitter folded in), noise offsets (slice, step: see PS_GTAO)
 float4 c_Params : register(c4); // radius (m), pixels per (metre / z) [0.5 * P00 * width], max radius (px), falloff share
 float4 c_Params2: register(c5); // AO strength (exponent; 0 = AO off), view mode, blur direction x, y
 float4 c_Sun    : register(c6); // direction towards the sun (view space), contact shadow length (m; 0 = off)
 float4 c_Contact: register(c7); // thickness (m) = x + y * distance, strength, depth bias per metre of distance
+float4 c_Targets: register(c8); // Composite: the indirect light (x), sun light (y) target was written this frame (1) or not (0)
 
 sampler2D s_Depth    : register(s0); // game z/w, R32F, full res (point)
-sampler2D s_AO       : register(s1); // r = AO, g = view z, b = contact shadow (point)
+sampler2D s_Geo      : register(s1); // GTAO: the shared geometry prep (core/geoprep.h): view normal, view z (point)
+sampler2D s_AO       : register(s1); // Blur / Composite: r = AO, g = view z, b = contact shadow (point)
 sampler2D s_Indirect : register(s2); // indirect light x (1 - fog), full res (point)
 sampler2D s_Sun      : register(s3); // shadowed sun light x (1 - fog), full res (point)
 
@@ -110,6 +113,22 @@ float ContactShadow(float3 P, float3 N, float z, float noise)
 // ---- GTAO + contact shadows (half res) ---------------------------------------------------------
 // Output: r = AO visibility (about 1 = open; noisy, may exceed 1), g = view z of the full-res pixel,
 // b = contact shadow (1 = lit).
+//
+// Why AO isn't taken from SSGI's trace when SSGI is on (it would save this slice loop: 3 x 6 x 2
+// depth fetches per pixel). It would fit - an extra "newly covered share within the AO radius" sum
+// in PS_Trace compiles to 30 of 32 temps, 386 slots - but:
+//  - order: the AO must be in the scene before SSGI reads the lit colour, so that the bounce comes
+//    from occluded light; AO from this frame's trace would only exist after that read (and last
+//    frame's, reprojected, would trail behind moving objects);
+//  - contact shadows need this pass anyway (the position, normal and their own march), and they
+//    are on by default, so the pass would stay;
+//  - density: with SSGI's defaults (10 m radius, 8 steps per side, t^2 spacing) about 3 samples
+//    per side and slice fall within 1.5 m, against GTAO's 6, and they move with SSGI's settings;
+//  - the occlusion differs: SSGI's sector mask gives every sample a finite thickness (0.5 m) and
+//    bridges between samples, GTAO's horizon treats everything in front as solid;
+//  - SSGI's history and blur carry light + frame count in all four channels; AO would need
+//    another target through the temporal and blur passes.
+// So the traces stay separate and share only the geometry prep.
 
 float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 {
@@ -123,20 +142,17 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 	float3 P = ViewPos(px, z);
 	float3 V = normalize(-P);
 
-	// Normal from the neighbouring pixels: on each axis the side with the smaller depth step, so
-	// silhouettes don't bend it.
-	float3 pl = ViewPos(px - float2(1, 0), FetchZ(px - float2(1, 0)));
-	float3 pr = ViewPos(px + float2(1, 0), FetchZ(px + float2(1, 0)));
-	float3 pu = ViewPos(px - float2(0, 1), FetchZ(px - float2(0, 1)));
-	float3 pd = ViewPos(px + float2(0, 1), FetchZ(px + float2(0, 1)));
-	float3 dx = abs(pr.z - P.z) < abs(P.z - pl.z) ? pr - P : P - pl;
-	float3 dy = abs(pd.z - P.z) < abs(P.z - pu.z) ? pd - P : P - pu;
-	float3 N = normalize(cross(dx, dy));
-	N = dot(N, V) < 0 ? -N : N;
+	// The normal from the shared geometry prep (the same full-res pixel 2 x vpos, the same
+	// reconstruction this pass used to do itself). The position stays from the full-precision z/w
+	// target: the prep's half-float z is off by up to 1/2048 of the distance, which next to the
+	// full-precision depths of the samples would tilt the horizons on distant surfaces.
+	float3 N = tex2Dlod(s_Geo, float4((vpos + 0.5) * c_Half.zw, 0, 0)).xyz;
 
 	// Per-pixel rotation and step offset (interleaved gradient noise; the blur removes the pattern).
-	float noiseA = frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715))));
-	float noiseB = frac(52.9829189 * frac(dot(vpos + float2(17.0, 31.0), float2(0.06711056, 0.00583715))));
+	// c_Proj2.zw is added to them: always 0 now (the same pattern every frame, as the blur expects;
+	// frac(n + 0) = n). It was a per-frame R2 sequence while TAA ran: ao.cpp's top says why it isn't.
+	float noiseA = frac(frac(52.9829189 * frac(dot(vpos, float2(0.06711056, 0.00583715)))) + c_Proj2.z);
+	float noiseB = frac(frac(52.9829189 * frac(dot(vpos + float2(17.0, 31.0), float2(0.06711056, 0.00583715)))) + c_Proj2.w);
 
 	float contact = ContactShadow(P, N, z, noiseB);
 
@@ -194,17 +210,19 @@ float4 PS_GTAO(VPOS_T vposIn : VPOS) : COLOR
 
 // ---- Depth-aware blur (half res, one direction per pass) ---------------------------------------
 
-float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
+// Gaussian weights of the taps 1..4 texels from the centre (the centre weighs 1).
+static const float kGauss2[5] = { 1.0, 0.8825, 0.6065, 0.3247, 0.1353 }; // sigma 2
+static const float kGauss1[5] = { 1.0, 0.6065, 0.1353, 0.0111, 0.0 };    // sigma 1
+
+float4 Blur(float2 vpos, const float gauss[5], int taps)
 {
-	float2 vpos = PIXEL(vposIn);
 	float2 uv = (vpos + 0.5) * c_Half.zw;
 	float3 centre = tex2Dlod(s_AO, float4(uv, 0, 0)).xyz;
 	float2 stepUv = c_Params2.zw * c_Half.zw;
 	float tolerance = 1.0 / (0.08 * centre.y);
 	float sum = centre.x, wsum = 1.0;
 	float csSum = centre.z;
-	const float gauss[5] = { 1.0, 0.8825, 0.6065, 0.3247, 0.1353 }; // sigma 2
-	[unroll] for (int i = 1; i <= 4; i++)
+	[unroll] for (int i = 1; i <= taps; i++)
 	{
 		float3 a = tex2Dlod(s_AO, float4(uv + stepUv * i, 0, 0)).xyz;
 		float3 b = tex2Dlod(s_AO, float4(uv - stepUv * i, 0, 0)).xyz;
@@ -217,6 +235,21 @@ float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
 	return float4(sum / wsum, centre.y, csSum / wsum, 0);
 }
 
+float4 PS_Blur(VPOS_T vposIn : VPOS) : COLOR
+{
+	return Blur(PIXEL(vposIn), kGauss2, 4);
+}
+
+// The narrow blur, for a noise pattern that changes every frame. Not used any more (ao.cpp's top says
+// why); kept so shaders_gen.h matches this file. On tests/ao_warp_test's scene, one frame of it is as close to what GTAO
+// converges to as one frame of the sigma 2 blur (it leaves more noise but less spread), and 16
+// frames averaged are 30 % closer; the contact shadows' error is mostly the wide blur's spread of
+// their edge, which no averaging removes.
+float4 PS_BlurNarrow(VPOS_T vposIn : VPOS) : COLOR
+{
+	return Blur(PIXEL(vposIn), kGauss1, 3);
+}
+
 // ---- Composite (full res) ----------------------------------------------------------------------
 // Blended onto the scene with "destination - source": returns the light to remove.
 // View modes (no blending): 1 = AO, 2 = the indirect light buffer, 3 = contact shadows, 4 = the sun
@@ -227,8 +260,13 @@ float4 PS_Composite(VPOS_T vposIn : VPOS) : COLOR
 	float2 vpos = PIXEL(vposIn);
 	float2 uv = (vpos + 0.5) * c_Full.zw;
 	float d = tex2Dlod(s_Depth, float4(uv, 0, 0)).x;
-	float3 indirect = tex2Dlod(s_Indirect, float4(uv, 0, 0)).rgb;
-	float3 sun = tex2Dlod(s_Sun, float4(uv, 0, 0)).rgb;
+	// A target the opaque pass didn't write this frame (ao.cpp binds only what something reads) holds
+	// an older frame's light, or nothing defined: not read, no light removed.
+	float3 indirect = 0, sun = 0;
+	[branch] if (c_Targets.x > 0.5)
+		indirect = tex2Dlod(s_Indirect, float4(uv, 0, 0)).rgb;
+	[branch] if (c_Targets.y > 0.5)
+		sun = tex2Dlod(s_Sun, float4(uv, 0, 0)).rgb;
 	float view = c_Params2.y;
 	if (view > 3.5)
 		return float4(sun, 1);

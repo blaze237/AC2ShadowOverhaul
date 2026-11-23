@@ -15,7 +15,13 @@
 #include "common.h"
 #include "softshadows.h"
 #include "ao.h"
+#include "litshader.h"
+#include "features.h"
 #include "shaders_gen.h"
+#include "core/shaderinfo.h"
+#include "core/scene.h"
+#include "core/fxpass.h"
+#include "core/geoprep.h"
 #include <d3d9.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -37,6 +43,7 @@ enum
 	DEV_CreateTexture = 23,
 	DEV_CreateRenderTarget = 28,
 	DEV_CreateDepthStencilSurface = 29,
+	DEV_GetRenderTargetData = 32,
 	DEV_StretchRect = 34,
 	DEV_ColorFill = 35,
 	DEV_SetRenderTarget = 37,
@@ -46,12 +53,14 @@ enum
 	DEV_Clear = 43,
 	DEV_SetViewport = 47,
 	DEV_SetTexture = 65,
+	DEV_SetSamplerState = 69,
 	DEV_DrawPrimitive = 81,
 	DEV_DrawIndexedPrimitive = 82,
 	DEV_DrawPrimitiveUP = 83,
 	DEV_DrawIndexedPrimitiveUP = 84,
 	DEV_CreateVertexShader = 91,
 	DEV_SetVertexShader = 92,
+	DEV_SetVertexShaderConstantF = 94,
 	DEV_CreatePixelShader = 106,
 	DEV_SetPixelShader = 107,
 };
@@ -280,19 +289,25 @@ static std::string SurfName(IDirect3DSurface9* s, bool full)
 static std::unordered_map<void*, uint32_t> g_psHash;
 static std::unordered_map<void*, uint32_t> g_vsHash;
 // Soft shadows: shader handed to the game (rewritten) -> the game's original shader, used when
-// soft shadows are toggled off and for exporting the original bytecode.
+// soft shadows are toggled off and for exporting the original bytecode, and the other variants
+// the menu switches to.
 struct SoftSet
 {
 	IDirect3DPixelShader9* original = nullptr; // owned
-	IDirect3DPixelShader9* byWidth[5] = {};    // owned, except byWidth[returned] (the game's)
-	int returned = 0;                          // width of the shader handed to the game
+	IDirect3DPixelShader9* byWidth[5] = {};    // owned, except the one handed to the game
+	IDirect3DPixelShader9* pcss = nullptr;     // contact hardening; owned, except when handed to the game
+	IDirect3DPixelShader9* handed = nullptr;   // the shader the game holds (not owned)
+	int pcssVersion = 0;                       // the contact hardening settings `pcss` was built with
+	std::vector<DWORD> code;                   // the game's bytecode, to rebuild `pcss` (menu only)
 	void Release()
 	{
 		if (original)
 			original->Release();
 		for (int w = 1; w <= 4; w++)
-			if (byWidth[w] && w != returned)
+			if (byWidth[w] && byWidth[w] != handed)
 				byWidth[w]->Release();
+		if (pcss && pcss != handed)
+			pcss->Release();
 	}
 };
 static std::unordered_map<void*, SoftSet> g_softOriginal;
@@ -914,6 +929,9 @@ ORIG(EndScene, HRESULT)
 ORIG(Clear, HRESULT, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD)
 ORIG(SetViewport, HRESULT, const D3DVIEWPORT9*)
 ORIG(SetTexture, HRESULT, DWORD, IDirect3DBaseTexture9*)
+ORIG(GetRenderTargetData, HRESULT, IDirect3DSurface9*, IDirect3DSurface9*)
+ORIG(SetSamplerState, HRESULT, DWORD, D3DSAMPLERSTATETYPE, DWORD)
+ORIG(SetVertexShaderConstantF, HRESULT, UINT, const float*, UINT)
 ORIG(DrawPrimitive, HRESULT, D3DPRIMITIVETYPE, UINT, UINT)
 ORIG(DrawIndexedPrimitive, HRESULT, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT)
 ORIG(DrawPrimitiveUP, HRESULT, D3DPRIMITIVETYPE, UINT, const void*, UINT)
@@ -922,6 +940,11 @@ ORIG(CreateVertexShader, HRESULT, const DWORD*, IDirect3DVertexShader9**)
 ORIG(SetVertexShader, HRESULT, IDirect3DVertexShader9*)
 ORIG(CreatePixelShader, HRESULT, const DWORD*, IDirect3DPixelShader9**)
 ORIG(SetPixelShader, HRESULT, IDirect3DPixelShader9*)
+
+// Text overlays (menus, warnings) draw through the device vtable: pass their calls straight on.
+#define FX_PASSTHROUGH(name, ...) \
+	if (g_fxPassthrough) \
+	return o_##name(dev, ##__VA_ARGS__)
 
 
 // Reads level 0 of an R32F / R16F render-target texture into floats.
@@ -1231,75 +1254,6 @@ static std::string CompareDepth(const std::vector<float>& dv, const DepthUse& us
 	return result;
 }
 
-// ---- Shader constant tables --------------------------------------------------------------------
-
-struct CtabEntry
-{
-	std::string name;
-	int set = 0, reg = 0, count = 0, cls = 0, rows = 0, cols = 0;
-};
-
-// Reads the constant table (names of uniforms and their registers) the HLSL compiler embeds.
-static std::vector<CtabEntry> ReadCtab(const DWORD* code, size_t count)
-{
-	std::vector<CtabEntry> out;
-	for (size_t i = 1; i < count;)
-	{
-		DWORD tok = code[i];
-		if (tok == 0x0000FFFF)
-			break;
-		if ((tok & 0xFFFF) != 0xFFFE)
-		{
-			i += 1 + ((tok >> 24) & 0xF);
-			continue;
-		}
-		size_t len = (tok >> 16) & 0x7FFF;
-		if (len < 8 || i + 1 + len > count || code[i + 1] != MAKEFOURCC('C', 'T', 'A', 'B'))
-		{
-			i += 1 + len;
-			continue;
-		}
-		const unsigned char* base = (const unsigned char*)&code[i + 2];
-		size_t size = (len - 1) * 4;
-		auto rd32 = [&](size_t off) -> DWORD {
-			DWORD v = 0;
-			if (off + 4 <= size)
-				memcpy(&v, base + off, 4);
-			return v;
-		};
-		auto rd16 = [&](size_t off) -> int {
-			WORD v = 0;
-			if (off + 2 <= size)
-				memcpy(&v, base + off, 2);
-			return v;
-		};
-		DWORD constants = rd32(12), info = rd32(16);
-		for (DWORD c = 0; c < constants && c < 4096; c++)
-		{
-			size_t e = info + (size_t)c * 20;
-			if (e + 20 > size)
-				break;
-			CtabEntry ce;
-			DWORD nameOff = rd32(e), type = rd32(e + 12);
-			ce.set = rd16(e + 4);
-			ce.reg = rd16(e + 6);
-			ce.count = rd16(e + 8);
-			for (size_t p = nameOff; p < size && base[p]; p++)
-				ce.name += (char)base[p];
-			if (type + 8 <= size)
-			{
-				ce.cls = rd16(type);
-				ce.rows = rd16(type + 4);
-				ce.cols = rd16(type + 6);
-			}
-			out.push_back(ce);
-		}
-		break;
-	}
-	return out;
-}
-
-
 // Writes every vertex / pixel shader drawn this capture: bytecode (<base>_allshaders\vs_ / ps_<hash>.cso)
 // and, in <base>_vs.txt / <base>_ps.txt, the value of each named constant at the shader's first draw
 // followed by its disassembly.
@@ -1339,7 +1293,9 @@ static void ExportShaderSnaps(const char* base)
 			text += line;
 			text += "Constants at the first draw:\n";
 			int regs = vertex ? kVsConsts : kPsConsts;
-			for (const CtabEntry& ce : ReadCtab(code.data(), code.size()))
+			core::ConstantTable table;
+			core::ReadConstantTable(code.data(), table, code.size());
+			for (const core::ShaderConstant& ce : table.constants)
 			{
 				snprintf(line, sizeof(line), "  %s %s  %s%d..%d  %s%s\n", ce.set < 4 ? kSet[ce.set] : "?", ce.name.c_str(),
 					ce.set == 3 ? "s" : ce.set == 2 ? "c" : ce.set == 1 ? "i" : "b", ce.reg, ce.reg + ce.count - 1,
@@ -1516,6 +1472,7 @@ static void AfterDeviceReady(IDirect3DDevice9* dev)
 	IDirect3DSurface9 *bb, *ds;
 	RegisterSwapChain(dev, &bb, &ds);
 	ResetTrackedState(bb, ds);
+	core::Scene_OnDeviceReady(bb);
 }
 
 // Ambient occlusion runs inside the hooks below (right after the opaque pass); dumps note where.
@@ -1530,7 +1487,9 @@ static void NoteAO(bool applied)
 
 static void BeforeDraw(IDirect3DDevice9* dev)
 {
-	NoteAO(AO_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps));
+	core::Scene_BeforeDraw(dev, (IDirect3DVertexShader9*)g_vs, (IDirect3DPixelShader9*)g_ps);
+	NoteAO(AO_BeforeDraw(dev));
+	Fx_BeforeDraw(dev);
 	if (AO_InPass() && g_ps)
 	{
 		static int logged = 0;
@@ -1552,13 +1511,15 @@ static void BeforeDraw(IDirect3DDevice9* dev)
 static HRESULT __stdcall h_Reset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
 {
 	LogInfo("Device Reset: %s", DescribePresent(pp).c_str());
-	Tuning_OnLostDevice();
+	core::Scene_OnLostDevice();
+	core::Geo_OnLostDevice();
 	AO_OnLostDevice();
+	Fx_OnLostDevice();
 	HRESULT hr = o_Reset(dev, pp);
 	if (SUCCEEDED(hr))
 	{
 		AfterDeviceReady(dev);
-		Tuning_OnResetDevice();
+		Fx_OnResetDevice(dev, pp);
 	}
 	else
 		LogWarn("Device Reset failed: 0x%08lX", hr);
@@ -1574,6 +1535,8 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 		LogInfo("First Present seen%s.", g_dumpEnabled ? "; frame dump available from the menu" : "");
 	}
 	NoteAO(AO_BeforePresent(dev));
+	Fx_BeforePresent(dev);
+	core::Scene_EndFrame(); // after every effect used this frame's camera
 	if (g_capturing)
 	{
 		bool done;
@@ -1586,8 +1549,14 @@ static HRESULT __stdcall h_Present(IDirect3DDevice9* dev, const RECT* a, const R
 			EndCapture(dev);
 	}
 
-	if (!g_capturing && Tuning_Enabled())
-		Tuning_OnPresent(dev, g_bbW, g_bbH);
+	if (!g_capturing)
+	{
+		g_fxPassthrough = true;
+		if (Tuning_Enabled())
+			Tuning_OnPresent(dev);
+		Fx_DrawOverlays(dev);
+		g_fxPassthrough = false;
+	}
 	HRESULT hr = o_Present(dev, a, b, w, r);
 
 	static bool keyWas = false;
@@ -1683,17 +1652,20 @@ static HRESULT __stdcall h_CreateDepthStencilSurface(IDirect3DDevice9* dev, UINT
 static HRESULT __stdcall h_StretchRect(IDirect3DDevice9* dev, IDirect3DSurface9* src, const RECT* sr, IDirect3DSurface9* dst,
 	const RECT* dr, D3DTEXTUREFILTERTYPE filter)
 {
+	FX_PASSTHROUGH(StretchRect, src, sr, dst, dr, filter);
 	if (g_capturing)
 	{
 		Lock l;
 		Event("StretchRect " + SurfName(src, true) + " -> " + SurfName(dst, true), CALLER);
 	}
 	NoteAO(AO_BeforeOther(dev));
+	Fx_BeforeCopyFrom(dev, src, true);
 	return o_StretchRect(dev, src, sr, dst, dr, filter);
 }
 
 static HRESULT __stdcall h_ColorFill(IDirect3DDevice9* dev, IDirect3DSurface9* s, const RECT* r, D3DCOLOR c)
 {
+	FX_PASSTHROUGH(ColorFill, s, r, c);
 	if (g_capturing)
 	{
 		Lock l;
@@ -1702,13 +1674,18 @@ static HRESULT __stdcall h_ColorFill(IDirect3DDevice9* dev, IDirect3DSurface9* s
 		Event("ColorFill " + SurfName(s, true) + buf, CALLER);
 	}
 	NoteAO(AO_BeforeOther(dev));
+	Fx_BeforeOther(dev);
 	return o_ColorFill(dev, s, r, c);
 }
 
 static HRESULT __stdcall h_SetRenderTarget(IDirect3DDevice9* dev, DWORD index, IDirect3DSurface9* s)
 {
+	FX_PASSTHROUGH(SetRenderTarget, index, s);
 	NoteAO(AO_BeforeSetRenderTarget(dev, index, s));
+	Fx_BeforeSetRenderTarget(dev, index, s);
 	HRESULT hr = o_SetRenderTarget(dev, index, s);
+	if (SUCCEEDED(hr))
+		core::Scene_AfterSetRenderTarget(index, s);
 	if (SUCCEEDED(hr) && index < 4)
 	{
 		bool changed = g_rt[index] != s;
@@ -1733,11 +1710,14 @@ static HRESULT __stdcall h_SetRenderTarget(IDirect3DDevice9* dev, DWORD index, I
 		}
 		AO_AfterSetRenderTarget(dev, index, s, g_rt[0]);
 	}
+	if (SUCCEEDED(hr))
+		Fx_AfterSetRenderTarget(dev, index, s, index < 4 ? g_rt[0] : nullptr);
 	return hr;
 }
 
 static HRESULT __stdcall h_SetDepthStencilSurface(IDirect3DDevice9* dev, IDirect3DSurface9* s)
 {
+	FX_PASSTHROUGH(SetDepthStencilSurface, s);
 	HRESULT hr = o_SetDepthStencilSurface(dev, s);
 	if (SUCCEEDED(hr))
 	{
@@ -1753,6 +1733,7 @@ static HRESULT __stdcall h_SetDepthStencilSurface(IDirect3DDevice9* dev, IDirect
 
 static HRESULT __stdcall h_BeginScene(IDirect3DDevice9* dev)
 {
+	FX_PASSTHROUGH(BeginScene);
 	if (g_capturing)
 	{
 		Lock l;
@@ -1763,17 +1744,20 @@ static HRESULT __stdcall h_BeginScene(IDirect3DDevice9* dev)
 
 static HRESULT __stdcall h_EndScene(IDirect3DDevice9* dev)
 {
+	FX_PASSTHROUGH(EndScene);
 	if (g_capturing)
 	{
 		Lock l;
 		Event("EndScene", CALLER);
 	}
 	NoteAO(AO_BeforeOther(dev));
+	Fx_BeforeOther(dev);
 	return o_EndScene(dev);
 }
 
 static HRESULT __stdcall h_Clear(IDirect3DDevice9* dev, DWORD count, const D3DRECT* rects, DWORD flags, D3DCOLOR c, float z, DWORD stencil)
 {
+	FX_PASSTHROUGH(Clear, count, rects, flags, c, z, stencil);
 	if (g_capturing)
 	{
 		Lock l;
@@ -1783,11 +1767,13 @@ static HRESULT __stdcall h_Clear(IDirect3DDevice9* dev, DWORD count, const D3DRE
 		Event(buf + Bindings(), CALLER);
 	}
 	NoteAO(AO_BeforeOther(dev));
+	Fx_BeforeOther(dev);
 	return o_Clear(dev, count, rects, flags, c, z, stencil);
 }
 
 static HRESULT __stdcall h_SetViewport(IDirect3DDevice9* dev, const D3DVIEWPORT9* vp)
 {
+	FX_PASSTHROUGH(SetViewport, vp);
 	HRESULT hr = o_SetViewport(dev, vp);
 	if (SUCCEEDED(hr) && vp)
 	{
@@ -1799,12 +1785,14 @@ static HRESULT __stdcall h_SetViewport(IDirect3DDevice9* dev, const D3DVIEWPORT9
 			Event(buf, CALLER);
 		}
 		g_vp = *vp;
+		core::Scene_AfterSetViewport(vp);
 	}
 	return hr;
 }
 
 static HRESULT __stdcall h_SetTexture(IDirect3DDevice9* dev, DWORD stage, IDirect3DBaseTexture9* tex)
 {
+	FX_PASSTHROUGH(SetTexture, stage, tex);
 	int slot = -1;
 	if (stage < 16)
 		slot = (int)stage;
@@ -1812,11 +1800,37 @@ static HRESULT __stdcall h_SetTexture(IDirect3DDevice9* dev, DWORD stage, IDirec
 		slot = 16 + (int)(stage - D3DVERTEXTEXTURESAMPLER0);
 	if (slot >= 0)
 		g_tex[slot] = tex;
-	return o_SetTexture(dev, stage, tex);
+	Fx_BeforeSetTexture(stage, tex);
+	HRESULT hr = o_SetTexture(dev, stage, tex);
+	if (SUCCEEDED(hr))
+		Fx_AfterSetTexture(stage, tex);
+	return hr;
+}
+
+static HRESULT __stdcall h_SetSamplerState(IDirect3DDevice9* dev, DWORD sampler, D3DSAMPLERSTATETYPE type, DWORD value)
+{
+	FX_PASSTHROUGH(SetSamplerState, sampler, type, value);
+	return o_SetSamplerState(dev, sampler, type, Fx_SamplerState(sampler, type, value));
+}
+
+static HRESULT __stdcall h_SetVertexShaderConstantF(IDirect3DDevice9* dev, UINT start, const float* v, UINT count)
+{
+	HRESULT hr = o_SetVertexShaderConstantF(dev, start, v, count);
+	if (!g_fxPassthrough)
+		Fx_AfterVertexConstants(dev, start, count);
+	return hr;
+}
+
+static HRESULT __stdcall h_GetRenderTargetData(IDirect3DDevice9* dev, IDirect3DSurface9* src, IDirect3DSurface9* dst)
+{
+	FX_PASSTHROUGH(GetRenderTargetData, src, dst);
+	Fx_BeforeCopyFrom(dev, src, false);
+	return o_GetRenderTargetData(dev, src, dst);
 }
 
 static HRESULT __stdcall h_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT start, UINT count)
 {
+	FX_PASSTHROUGH(DrawPrimitive, t, start, count);
 	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawPrimitive(dev, t, start, count);
@@ -1824,6 +1838,7 @@ static HRESULT __stdcall h_DrawPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE
 
 static HRESULT __stdcall h_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, INT base, UINT minIdx, UINT numV, UINT start, UINT count)
 {
+	FX_PASSTHROUGH(DrawIndexedPrimitive, t, base, minIdx, numV, start, count);
 	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawIndexedPrimitive(dev, t, base, minIdx, numV, start, count);
@@ -1831,6 +1846,7 @@ static HRESULT __stdcall h_DrawIndexedPrimitive(IDirect3DDevice9* dev, D3DPRIMIT
 
 static HRESULT __stdcall h_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT count, const void* data, UINT stride)
 {
+	FX_PASSTHROUGH(DrawPrimitiveUP, t, count, data, stride);
 	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawPrimitiveUP(dev, t, count, data, stride);
@@ -1839,45 +1855,100 @@ static HRESULT __stdcall h_DrawPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETY
 static HRESULT __stdcall h_DrawIndexedPrimitiveUP(IDirect3DDevice9* dev, D3DPRIMITIVETYPE t, UINT minIdx, UINT numV, UINT count,
 	const void* idx, D3DFORMAT idxFmt, const void* data, UINT stride)
 {
+	FX_PASSTHROUGH(DrawIndexedPrimitiveUP, t, minIdx, numV, count, idx, idxFmt, data, stride);
 	BeforeDraw(dev);
 	OnDraw(dev, count);
 	return o_DrawIndexedPrimitiveUP(dev, t, minIdx, numV, count, idx, idxFmt, data, stride);
 }
 
-// Creates a pixel shader with the AO output added when the shader is part of the main opaque
-// pass (it writes the z/w target as oC1); otherwise as given. kind: 0 unchanged, 1 AO output = 0,
-// 2 AO output = indirect light.
+// Creates a pixel shader with what the effects need added to it when it is part of the main opaque
+// pass (it writes the z/w target as oC1): the AO / contact shadow outputs and the SSGI bounce light,
+// both from one rewrite (litshader.h); otherwise as given. kind: 0 no AO output, 1 AO output = 0,
+// 2 AO output = indirect light. If the driver rejects the shader with both parts, each is tried on
+// its own before the game's code.
 static LONG g_aoMatched = 0, g_aoZero = 0, g_aoFailed = 0;
 static HRESULT CreatePs(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out, int* kind, std::string* why)
 {
 	if (kind)
 		*kind = 0;
-	if (AO_Enabled())
+	LitParts want;
+	want.ao = AO_Outputs();
+	want.gi = Fx_GiShaders();
+	if (!want.ao && !want.gi)
+		return o_CreatePixelShader(dev, code, out);
+	const uint32_t hash = HashShader(code);
+	LitParts tries[3] = { want, want, want };
+	tries[1].gi = false; // AO only
+	tries[2].ao = false; // SSGI only
+	std::string giWhy;
+	for (int t = 0; t < 3; t++)
 	{
-		std::vector<DWORD> ao;
-		bool matched = false;
-		std::string reason;
-		if (AO_RewritePS(code, ao, matched, reason))
+		std::vector<DWORD> lit;
+		LitRewriteResult r;
+		if (!Lit_RewritePS(code, tries[t], lit, r))
 		{
-			HRESULT hr = o_CreatePixelShader(dev, ao.data(), out);
-			if (SUCCEEDED(hr))
-			{
-				if (kind)
-					*kind = matched ? 2 : 1;
-				if (why)
-					*why = reason;
-				return hr;
-			}
-			LONG n = InterlockedIncrement(&g_aoFailed);
-			if (n <= 10)
-				LogWarn("Ambient occlusion: the driver rejected the AO output for shader %08X (0x%08lX); using it without.", HashShader(code), hr);
+			if (t == 0)
+				giWhy = r.giWhy;
+			break;
 		}
+		if (t == 0)
+			giWhy = r.giWhy;
+		HRESULT hr = o_CreatePixelShader(dev, lit.data(), out);
+		if (SUCCEEDED(hr))
+		{
+			if (kind)
+				*kind = r.ao ? (r.aoMatched ? 2 : 1) : 0;
+			if (why)
+				*why = r.aoWhy;
+			if (want.gi)
+				Fx_NoteGiRewrite(hash, r.gi, giWhy);
+			return hr;
+		}
+		if (r.gi)
+		{
+			static LONG failed = 0;
+			if (InterlockedIncrement(&failed) <= 10)
+				LogWarn("SSGI: the driver rejected rewritten shader %08X (0x%08lX).", hash, hr);
+		}
+		else if (InterlockedIncrement(&g_aoFailed) <= 10)
+			LogWarn("Ambient occlusion: the driver rejected the AO output for shader %08X (0x%08lX); using it without.", hash, hr);
+		if (t == 0 && !(r.ao && r.gi))
+			break; // only one part applied: nothing smaller to try
+		if (t == 0)
+			giWhy = "the driver rejected it";
 	}
+	if (want.gi)
+		Fx_NoteGiRewrite(hash, false, giWhy);
 	return o_CreatePixelShader(dev, code, out);
+}
+
+// The contact hardening variant of a shader the plain soft shadow rewrite took, or null (it then
+// keeps the plain filter, which the menu falls back to).
+static LONG g_pcssSkipped = 0;
+static IDirect3DPixelShader9* CreatePcss(IDirect3DDevice9* dev, const DWORD* code, const SoftShadowsPcss& p, int* kind, std::string* why)
+{
+	std::vector<DWORD> v;
+	std::string reason;
+	if (!SoftShadows_RewritePcss(code, p, v, reason))
+	{
+		if (InterlockedIncrement(&g_pcssSkipped) <= 10)
+			LogInfo("Contact hardening: shader %08X keeps the plain soft shadow filter (%s).", HashShader(code), reason.c_str());
+		return nullptr;
+	}
+	IDirect3DPixelShader9* ps = nullptr;
+	HRESULT hr = CreatePs(dev, v.data(), &ps, kind, why);
+	if (FAILED(hr) || !ps)
+	{
+		if (InterlockedIncrement(&g_pcssSkipped) <= 10)
+			LogWarn("Contact hardening: the driver rejected shader %08X (0x%08lX); it keeps the plain soft shadow filter.", HashShader(code), hr);
+		return nullptr;
+	}
+	return ps;
 }
 
 static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DPixelShader9** out)
 {
+	FX_PASSTHROUGH(CreatePixelShader, code, out);
 	SoftSet set;
 	bool haveSet = false;
 	HRESULT hr = E_FAIL;
@@ -1900,8 +1971,32 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 			else
 			{
 				haveSet = true;
-				set.returned = width;
+				set.handed = *out;
 				set.byWidth[width] = *out;
+				// Contact hardening: handed to the game instead when on at start (the plain width
+				// variant stays, for the menu and as the fallback), built too when the menu can switch
+				// to it; the menu's settings changes rebuild it from the game's code.
+				if (SoftShadows_ContactHardeningAtStart() || SoftShadows_BuildAllWidths())
+				{
+					SoftShadowsPcss p;
+					set.pcssVersion = SoftShadows_PcssBuilt(&p);
+					int pcssKind = 0;
+					std::string pcssWhy;
+					set.pcss = CreatePcss(dev, code, p, &pcssKind, &pcssWhy);
+					if (set.pcss && SoftShadows_ContactHardeningAtStart())
+					{
+						set.handed = *out = set.pcss;
+						aoKind = pcssKind;
+						aoWhy = pcssWhy;
+					}
+					if (set.pcss && SoftShadows_BuildAllWidths())
+						for (size_t i = 0; i < (1u << 20); i++)
+						{
+							set.code.push_back(code[i]);
+							if (code[i] == 0x0000FFFF)
+								break;
+						}
+				}
 				// The game's filter (F6) and the debug menu's other widths. Each gets the AO output too,
 				// as any of them may be drawn in the opaque pass.
 				if (FAILED(CreatePs(dev, code, &set.original, nullptr, nullptr)))
@@ -1955,7 +2050,8 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 		}
 		g_gameCode.erase(*out);
 		g_aoOutput[*out] = aoKind != 0;
-		AO_OnCreatePixelShader(*out, code);
+		core::Scene_OnCreatePixelShader(*out, code);
+		Fx_OnCreatePixelShader(*out, code);
 		if (haveSet)
 		{
 			g_softOriginal[*out] = set;
@@ -1977,7 +2073,23 @@ static HRESULT __stdcall h_CreatePixelShader(IDirect3DDevice9* dev, const DWORD*
 
 static HRESULT __stdcall h_CreateVertexShader(IDirect3DDevice9* dev, const DWORD* code, IDirect3DVertexShader9** out)
 {
-	HRESULT hr = o_CreateVertexShader(dev, code, out);
+	FX_PASSTHROUGH(CreateVertexShader, code, out);
+	// TAA: shaders that transform geometry get the sub-pixel jitter added to their position.
+	std::vector<DWORD> jittered;
+	HRESULT hr = E_FAIL;
+	if (Fx_RewriteVS(code, jittered))
+	{
+		hr = o_CreateVertexShader(dev, jittered.data(), out);
+		static bool warned = false;
+		if (FAILED(hr) && !warned)
+		{
+			warned = true;
+			LogWarn("TAA: the driver rejected a jittered vertex shader (0x%08lX); using the original (logged once).", hr);
+		}
+	}
+	if (FAILED(hr))
+		hr = o_CreateVertexShader(dev, code, out);
+	Fx_OnCreateVertexShader(SUCCEEDED(hr) && out ? *out : nullptr, code);
 	if (SUCCEEDED(hr) && code && out && *out)
 	{
 		uint32_t h = HashShader(code);
@@ -1985,33 +2097,77 @@ static HRESULT __stdcall h_CreateVertexShader(IDirect3DDevice9* dev, const DWORD
 			Lock l;
 			g_vsHash[*out] = h;
 		}
-		AO_OnCreateVertexShader(*out, code);
+		core::Scene_OnCreateVertexShader(*out, code);
 	}
 	return hr;
 }
 
 static HRESULT __stdcall h_SetVertexShader(IDirect3DDevice9* dev, IDirect3DVertexShader9* vs)
 {
+	FX_PASSTHROUGH(SetVertexShader, vs);
 	g_vs = vs;
-	return o_SetVertexShader(dev, vs);
+	HRESULT hr = o_SetVertexShader(dev, vs);
+	if (SUCCEEDED(hr))
+		Fx_AfterSetVertexShader(vs);
+	return hr;
 }
 
 static HRESULT __stdcall h_SetPixelShader(IDirect3DDevice9* dev, IDirect3DPixelShader9* ps)
 {
+	FX_PASSTHROUGH(SetPixelShader, ps);
 	g_ps = ps;
+	Fx_AfterSetPixelShader(ps);
 	if (ps && g_softAny)
 	{
 		bool active = SoftShadows_Active();
 		int width = SoftShadows_LiveWidth();
-		if (!active || width != SoftShadows_Width())
+		bool ch = SoftShadows_ContactHardening();
+		int version = ch ? SoftShadows_PcssBuilt(nullptr) : 0;
+		if (!active || width != SoftShadows_Width() || ch != SoftShadows_ContactHardeningAtStart() || version != 0)
 		{
-			Lock l;
-			auto it = g_softOriginal.find(ps);
-			if (it != g_softOriginal.end())
+			std::vector<DWORD> rebuild;
 			{
-				IDirect3DPixelShader9* sub = active ? it->second.byWidth[width] : it->second.original;
-				if (sub)
-					ps = sub;
+				Lock l;
+				auto it = g_softOriginal.find(ps);
+				if (it != g_softOriginal.end())
+				{
+					SoftSet& set = it->second;
+					if (active && ch && set.pcssVersion != version && !set.code.empty())
+						rebuild = set.code;
+					else
+					{
+						IDirect3DPixelShader9* sub = !active ? set.original : ch && set.pcss ? set.pcss : set.byWidth[width];
+						if (sub)
+							ps = sub;
+					}
+				}
+			}
+			if (!rebuild.empty())
+			{
+				// The contact hardening settings changed in the menu: this shader's variant is rebuilt
+				// when it is first drawn with them (outside the lock: it creates shaders).
+				SoftShadowsPcss p;
+				version = SoftShadows_PcssBuilt(&p);
+				IDirect3DPixelShader9* fresh = CreatePcss(dev, rebuild.data(), p, nullptr, nullptr);
+				Lock l;
+				auto it = g_softOriginal.find(ps);
+				if (it != g_softOriginal.end())
+				{
+					SoftSet& set = it->second;
+					if (fresh)
+					{
+						if (set.pcss && set.pcss != set.handed)
+							set.pcss->Release();
+						set.pcss = fresh;
+						fresh = nullptr;
+					}
+					set.pcssVersion = version; // also when it failed: keep the old variant, don't retry every draw
+					IDirect3DPixelShader9* sub = set.pcss ? set.pcss : set.byWidth[width];
+					if (sub)
+						ps = sub;
+				}
+				if (fresh)
+					fresh->Release();
 			}
 		}
 	}
@@ -2045,6 +2201,9 @@ static void HookDevice(IDirect3DDevice9* dev)
 	H(Clear);
 	H(SetViewport);
 	H(SetTexture);
+	H(GetRenderTargetData);
+	H(SetSamplerState);
+	H(SetVertexShaderConstantF);
 	H(DrawPrimitive);
 	H(DrawIndexedPrimitive);
 	H(DrawPrimitiveUP);
@@ -2054,19 +2213,24 @@ static void HookDevice(IDirect3DDevice9* dev)
 	H(CreatePixelShader);
 	H(SetPixelShader);
 #undef H
-	AoDeviceFns fns;
-	fns.SetRenderTarget = o_SetRenderTarget;
-	fns.SetDepthStencilSurface = o_SetDepthStencilSurface;
-	fns.SetViewport = o_SetViewport;
-	fns.SetTexture = o_SetTexture;
-	fns.DrawPrimitiveUP = o_DrawPrimitiveUP;
-	fns.SetVertexShader = o_SetVertexShader;
-	fns.SetPixelShader = o_SetPixelShader;
-	fns.CreatePixelShader = o_CreatePixelShader;
-	fns.CreateVertexShader = o_CreateVertexShader;
-	fns.CreateTexture = o_CreateTexture;
-	fns.ColorFill = o_ColorFill;
-	AO_SetDeviceFns(fns);
+	// The effects draw their passes through these, below the hooks.
+	core::DeviceFns fx;
+	fx.Reset = o_Reset;
+	fx.CreateTexture = o_CreateTexture;
+	fx.StretchRect = o_StretchRect;
+	fx.ColorFill = o_ColorFill;
+	fx.SetRenderTarget = o_SetRenderTarget;
+	fx.SetDepthStencilSurface = o_SetDepthStencilSurface;
+	fx.SetViewport = o_SetViewport;
+	fx.SetTexture = o_SetTexture;
+	fx.SetSamplerState = o_SetSamplerState;
+	fx.DrawPrimitiveUP = o_DrawPrimitiveUP;
+	fx.CreateVertexShader = o_CreateVertexShader;
+	fx.SetVertexShader = o_SetVertexShader;
+	fx.SetVertexShaderConstantF = o_SetVertexShaderConstantF;
+	fx.CreatePixelShader = o_CreatePixelShader;
+	fx.SetPixelShader = o_SetPixelShader;
+	core::SetDeviceFns(fx);
 }
 
 // ---- IDirect3D9 hooks --------------------------------------------------------------------------
@@ -2116,6 +2280,7 @@ static HRESULT __stdcall h_CreateDevice(IDirect3D9* d3d, UINT adapter, D3DDEVTYP
 	LogInfo("%s", buf);
 	HookDevice(*out);
 	AfterDeviceReady(*out);
+	Fx_OnDeviceCreated(d3d, adapter, *out, flags, pp);
 	return hr;
 }
 

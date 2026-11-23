@@ -16,6 +16,25 @@
 // exactly over the point-sampled map: (width+1)^2 taps, interior weight 1, edge rows/columns
 // weighted by the fractional position. width = 1 reproduces the game's filter. Taps are clamped
 // to the cascade's quarter of the atlas so they never read a neighbouring cascade.
+//
+// Contact hardening (PCSS, its own variant; the plain one above is unchanged by it). The box's
+// width follows how far the shadow's caster is from the receiver, so a shadow is sharp where an
+// object meets the ground and widens with distance from it, as a real sun shadow does:
+//   1. the 5 x 5 texels around the sample (the footprint of the widest box, 4 texels) are read
+//      once; texels closer to the light than the receiver are the blockers, and their mean depth
+//      difference to the receiver, / |g_ShadowNearFar.x|, is the blocker distance in metres along
+//      the light. Blockers outside that footprint can't change the filter result anyway, and with
+//      none inside it the pixel is fully lit at any width (no branch needed).
+//   2. penumbra (metres) = blocker distance * PenumbraScale. It becomes texels with the scale of
+//      this pixel's cascade (the g_ShadowScalesX entry whose g_ShadowOffsetsX lies in the same
+//      quarter of the atlas), so it is the same width in metres on either side of a cascade
+//      boundary. It is then clamped to [MinWidth, MaxWidth] texels (at most 4, the grid).
+//   3. the box of that (continuous) width, centred as above, over the same 25 texels: each
+//      column's weight is how much of it the box covers, sat(hi - i) - sat(lo - i), likewise each
+//      row, and the result is 1 - (blocked weight) / width^2. At a whole width N this is the plain
+//      box of width N. Taps are clamped to the cascade's tile as in the plain filter.
+// Its settings are compiled into the shader (constants defined in it, so the game's own constant
+// uploads can never change them); changing one in the menu rebuilds these variants.
 
 #include "softshadows.h"
 #include "common.h"
@@ -30,56 +49,54 @@ SoftShadowsLayout g_softShadowsLastLayout;
 struct CtabInfo
 {
 	int shadowSampler = -1, shadowMapSize = -1;
+	int scalesX = -1, offsetsX = -1, nearFar = -1; // for contact hardening
 	bool usedFloat[256] = {};
 };
 
-static bool ReadCtab(const DWORD* code, const std::vector<Inst>& insts, CtabInfo& info)
+static bool ReadCtab(const DWORD* code, CtabInfo& info)
 {
-	for (const Inst& in : insts)
-	{
-		if (in.op != OP_COMMENT || in.len < 8 || code[in.pos + 1] != 0x42415443) // 'CTAB'
-			continue;
-		const uint8_t* base = (const uint8_t*)&code[in.pos + 2];
-		size_t size = (in.len - 1) * 4;
-		auto rd32 = [&](size_t o) -> DWORD { return o + 4 <= size ? *(const DWORD*)(base + o) : 0; };
-		auto rd16 = [&](size_t o) -> WORD { return o + 2 <= size ? *(const WORD*)(base + o) : 0; };
-		DWORD count = rd32(12), infoOff = rd32(16);
-		for (DWORD k = 0; k < count && infoOff + 20 * (k + 1) <= size; k++)
-		{
-			size_t e = infoOff + 20 * k;
-			DWORD nameOff = rd32(e);
-			WORD set = rd16(e + 4), index = rd16(e + 6), regCount = rd16(e + 8);
-			char name[64] = {};
-			for (size_t c = 0; c < sizeof(name) - 1 && nameOff + c < size && base[nameOff + c]; c++)
-				name[c] = (char)base[nameOff + c];
-			if (set == 3 && strcmp(name, "g_ShadowSampler") == 0)
-				info.shadowSampler = index;
-			if (set == 2)
-			{
-				if (strcmp(name, "g_ShadowMapSize") == 0)
-					info.shadowMapSize = index;
-				for (int r = index; r < index + regCount && r < 256; r++)
-					info.usedFloat[r] = true;
-			}
-		}
-		return true;
-	}
-	return false;
+	core::ConstantTable t;
+	if (!core::ReadConstantTable(code, t))
+		return false;
+	info.shadowSampler = t.Register("g_ShadowSampler", core::RS_SAMPLER);
+	info.shadowMapSize = t.Register("g_ShadowMapSize", core::RS_FLOAT4);
+	info.scalesX = t.Register("g_ShadowScalesX", core::RS_FLOAT4);
+	info.offsetsX = t.Register("g_ShadowOffsetsX", core::RS_FLOAT4);
+	info.nearFar = t.Register("g_ShadowNearFar", core::RS_FLOAT4);
+	for (const core::ShaderConstant& c : t.constants)
+		if (c.set == core::RS_FLOAT4)
+			for (int r = c.reg; r < c.reg + c.count && r < 256; r++)
+				info.usedFloat[r] = true;
+	return true;
 }
 
-// ---- Rewrite -----------------------------------------------------------------------------------
+// ---- Analysis ----------------------------------------------------------------------------------
 
-bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& result, std::string& reason)
+// What both filters need to know about a shader: where the game's filter is and what it reads.
+struct Analysis
 {
 	std::vector<Inst> insts;
 	size_t endPos = 0;
+	CtabInfo ctab;
+	int S = 0, K = 0;              // shadow sampler, g_ShadowMapSize
+	size_t first = 0, lrpI = 0;    // first shadow tap, the filter's final lrp (indices into insts)
+	int uvReg = -1, uvComp[2] = {};
+	int depthType = -1, depthReg = -1, depthComp = -1;
+	int T = 0;                     // first free temp
+	bool constUsed[256] = {};
+};
+
+static bool Analyse(const DWORD* code, Analysis& a, std::string& reason)
+{
+	std::vector<Inst>& insts = a.insts;
+	size_t& endPos = a.endPos;
 	if (!code || !Parse(code, insts, endPos))
 	{
 		reason = "not ps_3_0";
 		return false;
 	}
-	CtabInfo ctab;
-	if (!ReadCtab(code, insts, ctab) || ctab.shadowSampler < 0)
+	CtabInfo& ctab = a.ctab;
+	if (!ReadCtab(code, ctab) || ctab.shadowSampler < 0)
 	{
 		reason = "no shadow sampler";
 		return false;
@@ -257,8 +274,8 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& resul
 
 	// Free registers: temps above the highest used, float constants not used or defined.
 	int maxTemp = -1;
-	bool constUsed[256] = {};
-	memcpy(constUsed, ctab.usedFloat, sizeof(constUsed));
+	bool* constUsed = a.constUsed;
+	memcpy(constUsed, ctab.usedFloat, sizeof(a.constUsed));
 	for (const Inst& in : insts)
 	{
 		if (in.op == OP_COMMENT)
@@ -281,17 +298,76 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& resul
 				break; // only the destination token is a register
 		}
 	}
-	const int T = maxTemp + 1;
+	a.S = S;
+	a.K = K;
+	a.first = first;
+	a.lrpI = lrpI;
+	a.uvReg = uvReg;
+	a.uvComp[0] = uvComp[0];
+	a.uvComp[1] = uvComp[1];
+	a.depthType = depthType;
+	a.depthReg = depthReg;
+	a.depthComp = depthComp;
+	a.T = maxTemp + 1;
+	return true;
+}
+
+// `count` free float constants, highest first (from c223 down).
+static bool FreeConsts(const Analysis& a, int* cregs, int count)
+{
+	int nc = 0;
+	for (int r = 223; r >= 0 && nc < count; r--)
+		if (!a.constUsed[r])
+			cregs[nc++] = r;
+	return nc == count;
+}
+
+static void FillLayout(const DWORD* code, const Analysis& a, size_t insertAt, bool pcss)
+{
+	const Inst& lrp = a.insts[a.lrpI];
+	DWORD lrpDst = code[lrp.pos + 1];
+	SoftShadowsLayout& L = g_softShadowsLastLayout;
+	L = SoftShadowsLayout();
+	L.insertAt = insertAt;
+	L.outputAt = lrp.pos;
+	L.tempBase = a.T;
+	L.outReg = RegNum(lrpDst);
+	L.outComp = DstMask(lrpDst) == X ? 0 : DstMask(lrpDst) == Y ? 1 : DstMask(lrpDst) == Z ? 2 : 3;
+	L.sampler = a.S;
+	L.sizeConst = a.K;
+	L.uvReg = a.uvReg;
+	L.uvComp[0] = a.uvComp[0];
+	L.uvComp[1] = a.uvComp[1];
+	L.depthReg = a.depthReg;
+	L.depthType = a.depthType;
+	L.depthComp = a.depthComp;
+	L.pcss = pcss;
+	L.scalesX = a.ctab.scalesX;
+	L.offsetsX = a.ctab.offsetsX;
+	L.nearFar = a.ctab.nearFar;
+}
+
+// ---- Rewrite -----------------------------------------------------------------------------------
+
+bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& result, std::string& reason)
+{
+	Analysis an;
+	if (!Analyse(code, an, reason))
+		return false;
+	const std::vector<Inst>& insts = an.insts;
+	const size_t endPos = an.endPos;
+	const int S = an.S, K = an.K, uvReg = an.uvReg;
+	const int* uvComp = an.uvComp;
+	const int depthType = an.depthType, depthReg = an.depthReg, depthComp = an.depthComp;
+	const size_t first = an.first, lrpI = an.lrpI;
+	const int T = an.T;
 	if (T + 10 > 32)
 	{
 		reason = "not enough free temp registers";
 		return false;
 	}
-	int cregs[3], nc = 0;
-	for (int r = 223; r >= 0 && nc < 3; r--)
-		if (!constUsed[r])
-			cregs[nc++] = r;
-	if (nc < 3)
+	int cregs[3];
+	if (!FreeConsts(an, cregs, 3))
 	{
 		reason = "no free constant registers";
 		return false;
@@ -421,22 +497,254 @@ bool SoftShadows_Rewrite(const DWORD* code, int width, std::vector<DWORD>& resul
 	e.I(OP_MOV, { lrpDst, t(T9, Rep(0)) });
 	out.insert(out.end(), code + afterLrp, code + endPos + 1); // includes the end token
 
-	SoftShadowsLayout& L = g_softShadowsLastLayout;
-	L = SoftShadowsLayout();
-	L.insertAt = insertAt;
-	L.outputAt = lrp.pos;
-	L.tempBase = T;
-	L.outReg = RegNum(lrpDst);
-	L.outComp = DstMask(lrpDst) == X ? 0 : DstMask(lrpDst) == Y ? 1 : DstMask(lrpDst) == Z ? 2 : 3;
-	L.sampler = S;
-	L.sizeConst = K;
-	L.uvReg = uvReg;
-	L.uvComp[0] = uvComp[0];
-	L.uvComp[1] = uvComp[1];
-	L.depthReg = depthReg;
-	L.depthType = depthType;
-	L.depthComp = depthComp;
+	FillLayout(code, an, insertAt, false);
+	result.swap(out);
+	reason.clear();
+	return true;
+}
 
+// Instruction slots a ps_3_0 program uses, roughly as the compiler counts them (the macros that
+// expand to several instructions counted as such), for keeping the variants within 512.
+int SoftShadows_InstructionSlots(const std::vector<DWORD>& code)
+{
+	std::vector<Inst> insts;
+	size_t endPos = 0;
+	if (code.empty() || !Parse(code.data(), insts, endPos))
+		return 0;
+	int n = 0;
+	for (const Inst& in : insts)
+	{
+		switch (in.op)
+		{
+		case OP_COMMENT:
+		case OP_DCL:
+		case OP_DEF:
+		case OP_DEFI:
+		case OP_DEFB:
+			break;
+		case OP_LRP:
+		case OP_CRS:
+		case OP_TEXLDL:
+			n += 2;
+			break;
+		case OP_TEXLDD:
+			n += 3;
+			break;
+		case OP_NRM:
+		case OP_POW:
+			n += 3;
+			break;
+		case OP_SINCOS:
+			n += 8;
+			break;
+		default:
+			n++;
+			break;
+		}
+	}
+	return n;
+}
+
+// Contact hardening temps: 10, like the plain filter, and the 3 the lighting rewrite (AO, SSGI,
+// litshader.cpp) adds on top of it are left free, so those effects never lose a shader to it.
+static const int kPcssTemps = 10, kLitTemps = 3;
+// The lighting rewrite adds a few dozen instructions on top; keep room for them.
+static const int kPcssMaxSlots = 512 - 48;
+
+bool SoftShadows_RewritePcss(const DWORD* code, const SoftShadowsPcss& params, std::vector<DWORD>& result, std::string& reason)
+{
+	Analysis an;
+	if (!Analyse(code, an, reason))
+		return false;
+	if (an.ctab.scalesX < 0 || an.ctab.offsetsX < 0 || an.ctab.nearFar < 0)
+	{
+		reason = "no g_ShadowScalesX / g_ShadowOffsetsX / g_ShadowNearFar";
+		return false;
+	}
+	const int T = an.T;
+	if (T + kPcssTemps + kLitTemps > 32)
+	{
+		reason = "not enough free temp registers";
+		return false;
+	}
+	int cregs[4];
+	if (!FreeConsts(an, cregs, 4))
+	{
+		reason = "no free constant registers";
+		return false;
+	}
+	SoftShadowsPcss p = SoftShadows_ClampPcss(params);
+	const float minW = p.minWidth < p.maxWidth ? p.minWidth : p.maxWidth;
+
+	const std::vector<Inst>& insts = an.insts;
+	const int S = an.S, K = an.K, uvReg = an.uvReg;
+	const int CA = cregs[0], CB = cregs[1], CC = cregs[2], CD = cregs[3];
+	const int SX = an.ctab.scalesX, OX = an.ctab.offsetsX, NF = an.ctab.nearFar;
+
+	std::vector<DWORD> out;
+	out.reserve(an.endPos + 900);
+	Emitter e{ out };
+	const size_t firstReal = FirstRealInstruction(insts, an.endPos);
+	out.insert(out.end(), code, code + firstReal);
+	// CA = (-1.5, 1/8, 0.5, 4), CB = (0.25, 1, 0, -), CC = (0, 1, 2, 3), CD = (scale, min, max, -).
+	// (One constant register per instruction at most, as the shader models allow.)
+	e.I(OP_DEF, { Dst(REG_CONST, CA, 0xF), FloatBits(-1.5f), FloatBits(0.125f), FloatBits(0.5f), FloatBits(4.0f) });
+	e.I(OP_DEF, { Dst(REG_CONST, CB, 0xF), FloatBits(0.25f), FloatBits(1.0f), FloatBits(0.0f), FloatBits(0.0f) });
+	e.I(OP_DEF, { Dst(REG_CONST, CC, 0xF), FloatBits(0.0f), FloatBits(1.0f), FloatBits(2.0f), FloatBits(3.0f) });
+	e.I(OP_DEF, { Dst(REG_CONST, CD, 0xF), FloatBits(p.penumbraScale), FloatBits(minW), FloatBits(p.maxWidth), FloatBits(0.0f) });
+	const size_t insertAt = insts[an.first].pos;
+	out.insert(out.end(), code + firstReal, code + insertAt);
+
+	// A, U, V, F scratch; P[j] = row j of the grid, columns 0-3; Q = column 4, rows 0-3; F.x the
+	// last texel (4, 4). The result ends in Q.x (= tempBase + 9, as in the plain filter).
+	const int A = T, U = T + 1, V = T + 2, F = T + 3, P0 = T + 4, Q = T + 9;
+	auto t = [](int r, int swz = kIdentity, bool neg = false) { return Src(REG_TEMP, r, swz, neg); };
+	auto c = [](int r, int swz = kIdentity, bool neg = false) { return Src(REG_CONST, r, swz, neg); };
+	auto d = [](int r, int mask, bool sat = false) { return Dst(REG_TEMP, r, mask) | (sat ? (1u << 20) : 0u); };
+	const DWORD uv = t(uvReg, Swz(an.uvComp[0], an.uvComp[1], an.uvComp[1], an.uvComp[1]));
+	const DWORD uvX = t(uvReg, Rep(an.uvComp[0]));
+	const DWORD depthSrc = Src(an.depthType, an.depthReg, Rep(an.depthComp), true);
+	const DWORD zero = c(CB, Rep(2)), one = c(CB, Rep(1));
+
+	// Grid origin: V.xy = (floor(uv * size - 1.5) + 0.5) / size; F.zw = 1 / size.
+	e.I(OP_MUL, { d(V, X | Y), uv, c(K) });
+	e.I(OP_ADD, { d(V, X | Y), t(V), c(CA, Rep(0)) });
+	e.I(OP_FRC, { d(F, X | Y), t(V) });
+	e.I(OP_ADD, { d(V, X | Y), t(V), t(F, kIdentity, true) });
+	e.I(OP_ADD, { d(V, X | Y), t(V), c(CA, Rep(2)) });
+	e.I(OP_RCP, { d(F, Z), c(K, Rep(0)) });
+	e.I(OP_RCP, { d(F, W), c(K, Rep(1)) });
+	e.I(OP_MUL, { d(V, X | Y), t(V), t(F, Swz(2, 3, 2, 3)) });
+	// The cascade's tile in u, as in the plain filter: A.z = lo, A.w = hi.
+	e.I(OP_MUL, { d(A, X), uvX, c(CA, Rep(3)) });
+	e.I(OP_FRC, { d(A, Y), t(A, Rep(0)) });
+	e.I(OP_ADD, { d(A, X), t(A, Rep(0)), t(A, Rep(1), true) });
+	e.I(OP_MUL, { d(A, X), t(A, Rep(0)), c(CB, Rep(0)) });
+	e.I(OP_MAD, { d(A, Z), t(F, Rep(2)), c(CA, Rep(2)), t(A, Rep(0)) });
+	e.I(OP_ADD, { d(A, W), t(A, Rep(0)), c(CB, Rep(0)) });
+	e.I(OP_MAD, { d(A, W), t(F, Rep(2)), c(CA, Rep(2), true), t(A, Rep(3)) });
+	// Column u coordinates, clamped to the tile: U = columns 0-3, A.x = column 4. Then A.y = row 0's
+	// v, A.z = 1 / height.
+	e.I(OP_MAD, { d(U, 0xF), t(F, Rep(2)), c(CC), t(V, Rep(0)) });
+	e.I(OP_MAX, { d(U, 0xF), t(U), t(A, Rep(2)) });
+	e.I(OP_MIN, { d(U, 0xF), t(U), t(A, Rep(3)) });
+	e.I(OP_MAD, { d(A, X), t(F, Rep(2)), c(CA, Rep(3)), t(V, Rep(0)) });
+	e.I(OP_MAX, { d(A, X), t(A, Rep(0)), t(A, Rep(2)) });
+	e.I(OP_MIN, { d(A, X), t(A, Rep(0)), t(A, Rep(3)) });
+	e.I(OP_MOV, { d(A, Y), t(V, Rep(1)) });
+	e.I(OP_MOV, { d(A, Z), t(F, Rep(3)) });
+	e.I(OP_MOV, { d(V, Z | W), zero });
+	// The 25 texels: stored depth - receiver depth (>= 0 lit, < 0 a blocker). Plain texld, as the
+	// game's own taps (the atlas has one mip level and is point sampled; texldl takes 2 slots).
+	for (int j = 0; j <= 4; j++)
+	{
+		e.I(OP_MAD, { d(V, Y), t(A, Rep(2)), j < 4 ? c(CC, Rep(j)) : c(CA, Rep(3)), t(A, Rep(1)) });
+		for (int i = 0; i <= 4; i++)
+		{
+			e.I(OP_MOV, { d(V, X), i < 4 ? t(U, Rep(i)) : t(A, Rep(0)) });
+			e.I(OP_TEXLD, { d(F, 0xF), t(V), Src(REG_SAMPLER, S, kIdentity) });
+			DWORD dst = i < 4 ? d(P0 + j, 1 << i) : j < 4 ? d(Q, 1 << j) : d(F, X);
+			e.I(OP_ADD, { dst, t(F, Rep(0)), depthSrc });
+		}
+	}
+	// Blocker search: A = sum of the (negative) differences of the blockers, V = their count; each
+	// texel's difference becomes 1 if it is a blocker, else 0.
+	for (int k = 0; k < 6; k++)
+	{
+		const int Xr = k < 5 ? P0 + k : Q;
+		if (k == 0)
+			e.I(OP_MIN, { d(A, 0xF), t(Xr), zero });
+		else
+		{
+			e.I(OP_MIN, { d(U, 0xF), t(Xr), zero });
+			e.I(OP_ADD, { d(A, 0xF), t(A), t(U) });
+		}
+		e.I(OP_CMP, { d(Xr, 0xF), t(Xr), zero, one });
+		if (k == 0)
+			e.I(OP_MOV, { d(V, 0xF), t(Xr) });
+		else
+			e.I(OP_ADD, { d(V, 0xF), t(V), t(Xr) });
+	}
+	e.I(OP_MIN, { d(U, X), t(F, Rep(0)), zero });
+	e.I(OP_ADD, { d(A, X), t(A, Rep(0)), t(U, Rep(0)) });
+	e.I(OP_CMP, { d(F, X), t(F, Rep(0)), zero, one });
+	e.I(OP_ADD, { d(V, X), t(V, Rep(0)), t(F, Rep(0)) });
+	e.I(OP_DP4, { d(A, X), t(A), one });
+	e.I(OP_DP4, { d(A, Y), t(V), one });
+	// Blocker distance in metres along the light: mean difference / |g_ShadowNearFar.x| -> A.x.
+	// (No blocker: 0, and then every texel is lit, whatever the width.)
+	e.I(OP_MAX, { d(A, Y), t(A, Rep(1)), one });
+	e.I(OP_RCP, { d(A, Y), t(A, Rep(1)) });
+	e.I(OP_MUL, { d(A, X), t(A, Rep(0), true), t(A, Rep(1)) });
+	e.I(OP_MUL, { d(A, Z), c(NF, Rep(0)), c(NF, Rep(0)) });
+	e.I(OP_RSQ, { d(A, Z), t(A, Rep(2)) });
+	e.I(OP_MUL, { d(A, X), t(A, Rep(0)), t(A, Rep(2)) });
+	// Texels per metre in this pixel's cascade: |g_ShadowScalesX[k]| * width for the cascade k whose
+	// g_ShadowOffsetsX lies in the same quarter of the atlas as the sample (floor(offset * 4 + 1/8)
+	// is the tile index whether the offset is the tile's centre or its start) -> A.y.
+	e.I(OP_MUL, { d(A, Y), uvX, c(CA, Rep(3)) });
+	e.I(OP_FRC, { d(A, Z), t(A, Rep(1)) });
+	e.I(OP_ADD, { d(A, Y), t(A, Rep(1)), t(A, Rep(2), true) });
+	e.I(OP_MOV, { d(V, 0xF), c(OX) });
+	e.I(OP_MAD, { d(V, 0xF), t(V), c(CA, Rep(3)), c(CA, Rep(1)) });
+	e.I(OP_FRC, { d(U, 0xF), t(V) });
+	e.I(OP_ADD, { d(V, 0xF), t(V), t(U, kIdentity, true) });
+	e.I(OP_ADD, { d(V, 0xF), t(V), t(A, Rep(1), true) });
+	e.I(OP_MUL, { d(V, 0xF), t(V), t(V) });
+	e.I(OP_CMP, { d(V, 0xF), t(V, kIdentity, true), one, zero });
+	e.I(OP_DP4, { d(A, Y), t(V), c(SX) });
+	e.I(OP_MAX, { d(A, Y), t(A, Rep(1)), t(A, Rep(1), true) });
+	e.I(OP_MUL, { d(A, Y), t(A, Rep(1)), c(K, Rep(0)) });
+	// Width in texels: metres * scale * texels per metre, clamped -> A.x; F.y = width^2.
+	e.I(OP_MUL, { d(A, X), t(A, Rep(0)), t(A, Rep(1)) });
+	e.I(OP_MUL, { d(A, X), t(A, Rep(0)), c(CD, Rep(0)) });
+	e.I(OP_MAX, { d(A, X), t(A, Rep(0)), c(CD, Rep(1)) });
+	e.I(OP_MIN, { d(A, X), t(A, Rep(0)), c(CD, Rep(2)) });
+	e.I(OP_MUL, { d(F, Y), t(A, Rep(0)), t(A, Rep(0)) });
+	// The box's edges in grid cells: lo = frc(uv * size - 1.5) + 2 - width / 2, hi = lo + width.
+	// U = (lo.x, lo.y, hi.x, hi.y).
+	e.I(OP_MUL, { d(U, X | Y), uv, c(K) });
+	e.I(OP_ADD, { d(U, X | Y), t(U), c(CA, Rep(0)) });
+	e.I(OP_FRC, { d(U, X | Y), t(U) });
+	e.I(OP_MAD, { d(U, X | Y), t(A, Rep(0)), c(CA, Rep(2), true), t(U) });
+	e.I(OP_ADD, { d(U, X | Y), t(U), c(CC, Rep(2)) });
+	e.I(OP_ADD, { d(U, Z | W), t(U, Swz(0, 1, 0, 1)), t(A, Rep(0)) });
+	// Cell weights, sat(hi - i) - sat(lo - i): F.z, F.w = column 4 and row 4, V = columns 0-3,
+	// A = rows 0-3.
+	e.I(OP_ADD, { d(F, Z | W, true), t(U), c(CA, Rep(3), true) });
+	e.I(OP_ADD, { d(A, X | Y, true), t(U), c(CA, Rep(3), true) });
+	e.I(OP_ADD, { d(F, Z | W), t(F), t(A, Swz(0, 1, 0, 1), true) });
+	e.I(OP_ADD, { d(V, 0xF, true), t(U, Rep(2)), c(CC, kIdentity, true) });
+	e.I(OP_ADD, { d(A, 0xF, true), t(U, Rep(0)), c(CC, kIdentity, true) });
+	e.I(OP_ADD, { d(V, 0xF), t(V), t(A, kIdentity, true) });
+	e.I(OP_ADD, { d(A, 0xF, true), t(U, Rep(3)), c(CC, kIdentity, true) });
+	e.I(OP_ADD, { d(U, 0xF, true), t(U, Rep(1)), c(CC, kIdentity, true) });
+	e.I(OP_ADD, { d(A, 0xF), t(A), t(U, kIdentity, true) });
+	// Blocked weight -> U.x; lit = 1 - blocked / width^2 -> Q.x.
+	for (int j = 0; j < 4; j++)
+		e.I(OP_DP4, { d(U, 1 << j), t(P0 + j), t(V) });
+	e.I(OP_MAD, { d(U, 0xF), t(Q), t(F, Rep(2)), t(U) });
+	e.I(OP_DP4, { d(U, X), t(U), t(A) });
+	e.I(OP_DP4, { d(U, Y), t(P0 + 4), t(V) });
+	e.I(OP_MAD, { d(U, Y), t(F, Rep(0)), t(F, Rep(2)), t(U, Rep(1)) });
+	e.I(OP_MAD, { d(U, X), t(U, Rep(1)), t(F, Rep(3)), t(U, Rep(0)) });
+	e.I(OP_RCP, { d(U, Y), t(F, Rep(1)) });
+	e.I(OP_MAD, { d(Q, X, true), t(U, Rep(0), true), t(U, Rep(1)), one });
+
+	// Original code up to and including the game's lrp, then overwrite its result.
+	const Inst& lrp = insts[an.lrpI];
+	size_t afterLrp = lrp.pos + 1 + lrp.len;
+	out.insert(out.end(), code + insertAt, code + afterLrp);
+	e.I(OP_MOV, { code[lrp.pos + 1], t(Q, Rep(0)) });
+	out.insert(out.end(), code + afterLrp, code + an.endPos + 1); // includes the end token
+
+	int slots = SoftShadows_InstructionSlots(out);
+	if (slots > kPcssMaxSlots)
+	{
+		reason = "too long with contact hardening (" + std::to_string(slots) + " instruction slots)";
+		return false;
+	}
+	FillLayout(code, an, insertAt, true);
 	result.swap(out);
 	reason.clear();
 	return true;
@@ -457,6 +765,57 @@ void SoftShadows_SetLiveWidth(int width) { g_liveWidth = width < 1 ? 1 : width >
 void SoftShadows_SetBuildAllWidths(bool all) { g_allWidths = all; }
 bool SoftShadows_BuildAllWidths() { return g_allWidths; }
 
+// Contact hardening: on at start / now; the settings as the menu shows them, and as the variants
+// were last built with (the menu's changes are taken once they have settled, so holding a key
+// doesn't rebuild the shaders on every repeat).
+static bool g_chStart = false;
+static volatile bool g_ch = false;
+static SoftShadowsPcss g_pcss, g_pcssBuilt;
+static int g_pcssVersion = 0;
+static bool g_pcssPending = false;
+static DWORD g_pcssChangedAt = 0;
+static const DWORD kPcssSettleMs = 300;
+
+SoftShadowsPcss SoftShadows_ClampPcss(const SoftShadowsPcss& in)
+{
+	auto clamp = [](float v, float lo, float hi) { return v != v ? lo : v < lo ? lo : v > hi ? hi : v; }; // NaN -> lo
+	SoftShadowsPcss p;
+	p.penumbraScale = clamp(in.penumbraScale, 0.005f, 0.5f);
+	p.minWidth = clamp(in.minWidth, 1.0f, 4.0f);
+	p.maxWidth = clamp(in.maxWidth, 1.0f, 4.0f);
+	return p;
+}
+
+bool SoftShadows_ContactHardeningAtStart() { return g_chStart; }
+bool SoftShadows_ContactHardening() { return g_ch; }
+void SoftShadows_SetContactHardening(bool on) { g_ch = on; }
+SoftShadowsPcss SoftShadows_Pcss() { return g_pcss; }
+
+void SoftShadows_SetPcss(const SoftShadowsPcss& p)
+{
+	g_pcss = SoftShadows_ClampPcss(p);
+	g_pcssPending = true;
+	g_pcssChangedAt = GetTickCount();
+}
+
+int SoftShadows_PcssBuilt(SoftShadowsPcss* p)
+{
+	if (g_pcssPending && GetTickCount() - g_pcssChangedAt >= kPcssSettleMs)
+	{
+		g_pcssPending = false;
+		if (memcmp(&g_pcss, &g_pcssBuilt, sizeof(g_pcss)) != 0)
+		{
+			g_pcssBuilt = g_pcss;
+			g_pcssVersion++;
+			LogInfo("Contact hardening: shaders rebuilt for penumbra %.3f m per m, width %.2f to %.2f texels.", g_pcssBuilt.penumbraScale,
+				g_pcssBuilt.minWidth, g_pcssBuilt.maxWidth);
+		}
+	}
+	if (p)
+		*p = g_pcssBuilt;
+	return g_pcssVersion;
+}
+
 bool SoftShadows_Init()
 {
 	const char* S = "SoftShadows";
@@ -473,5 +832,15 @@ bool SoftShadows_Init()
 		LogInfo("Soft shadows: filter width %d texels (%d taps).", g_width, (g_width + 1) * (g_width + 1));
 	else
 		LogInfo("Soft shadows: off (FilterWidth=0); the game's own filter is used.");
+
+	g_chStart = g_ch = IniInt(S, "ContactHardening", 0) != 0;
+	SoftShadowsPcss p;
+	p.penumbraScale = IniFloat(S, "PenumbraScale", p.penumbraScale);
+	p.minWidth = IniFloat(S, "MinWidth", p.minWidth);
+	p.maxWidth = IniFloat(S, "MaxWidth", p.maxWidth);
+	g_pcss = g_pcssBuilt = SoftShadows_ClampPcss(p);
+	if (g_chStart)
+		LogInfo("Contact hardening: on (penumbra %.3f m per metre from the caster, %.2f to %.2f texels wide).", g_pcss.penumbraScale,
+			g_pcss.minWidth, g_pcss.maxWidth);
 	return true;
 }

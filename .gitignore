@@ -29,3 +29,13 @@ __pycache__/
 /addon/
 /tests/abi/
 /tools/gen_depthcopy_ps.c
+
+# Test run folders (built exe, mock d3d9.dll, the .asi, the ini and log each test writes)
+/tests/ssgi/e2e/
+/tests/vol/e2e/
+/tests/taa/e2e/
+/tests/mb/e2e/
+/tests/combined/
+/tests/run_tests.out
+/tests/taa/menu_test.ini
+/tests/core/menu_test.ini
